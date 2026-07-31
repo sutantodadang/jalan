@@ -222,14 +222,40 @@ fn cleanupServicesAndNetwork(alloc: std.mem.Allocator, c: client.Client, service
 /// `"healthy"` logs a warning and is left running rather than failing the
 /// job (some images take longer than 60s, or never report healthy under a
 /// constrained CI runner — that's a warning, not a hard failure).
+///
+/// A transient inspect error (e.g. a momentary daemon hiccup) does NOT abort
+/// the wait — it's treated as "keep polling", same as an unhealthy status,
+/// since bailing out on the first API blip would silently skip the health
+/// gate. Logged once (not once per attempt, to avoid spamming up to 60
+/// identical lines) via `warned_error`; the 60-attempt timeout branch stays
+/// the terminal warning either way.
 fn waitForHealth(alloc: std.mem.Allocator, c: client.Client, id: []const u8, name: []const u8, log: ?backend_iface.LogFn) void {
-    var err: ?[]const u8 = null;
+    var warned_error = false;
     var attempt: usize = 0;
     while (attempt < 60) : (attempt += 1) {
-        const status = client.containerInspectHealth(alloc, c, id, &err) catch return;
-        if (status == null) return;
-        if (std.mem.eql(u8, status.?, "healthy")) return;
-        std.Thread.sleep(std.time.ns_per_s);
+        // `err` is scoped per-attempt so a stale error from a prior failed
+        // attempt can't be mistaken for the current attempt's outcome.
+        var err: ?[]const u8 = null;
+        var had_error = false;
+        const status = client.containerInspectHealth(alloc, c, id, &err) catch blk: {
+            had_error = true;
+            break :blk null;
+        };
+        if (had_error) {
+            if (!warned_error) {
+                warned_error = true;
+                if (log) |l| {
+                    if (std.fmt.allocPrint(alloc, "service '{s}' health inspect error \xe2\x80\x94 retrying", .{name}) catch null) |msg| l(msg);
+                }
+            }
+        } else if (status == null) {
+            // Succeeded, and no `State.Health` object at all (image has no
+            // HEALTHCHECK) -> nothing to wait for.
+            return;
+        } else if (std.mem.eql(u8, status.?, "healthy")) {
+            return;
+        }
+        if (attempt + 1 < 60) std.Thread.sleep(std.time.ns_per_s);
     }
     if (log) |l| {
         const msg = std.fmt.allocPrint(alloc, "service '{s}' not healthy after 60s \xe2\x80\x94 continuing", .{name}) catch return;
@@ -466,6 +492,25 @@ test "buildContainerCreateSpec includes NetworkMode and Aliases when network_id 
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"Cmd\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"Binds\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"WorkingDir\"") == null);
+}
+
+test "buildContainerCreateSpec: job container with services sets both Binds and NetworkMode" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const workspace = "/home/user/proj";
+    const spec = try buildContainerCreateSpec(a, "node:20-bookworm-slim", &.{ "sleep", "infinity" }, &.{"CI=true"}, workspace, "net123", &.{});
+    const raw_bind = try std.fmt.allocPrint(a, "{s}:/github/workspace", .{try toBindSource(a, workspace)});
+    var escaped: std.ArrayList(u8) = .empty;
+    for (raw_bind) |c| {
+        if (c == '\\') try escaped.appendSlice(a, "\\\\") else try escaped.append(a, c);
+    }
+    const expected_bind = try escaped.toOwnedSlice(a);
+    try std.testing.expect(std.mem.indexOf(u8, spec, expected_bind) != null);
+    try std.testing.expect(std.mem.indexOf(u8, spec, "\"NetworkMode\":\"net123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, spec, "\"WorkingDir\":\"/github/workspace\"") != null);
+    // job container itself has no service alias.
+    try std.testing.expect(std.mem.indexOf(u8, spec, "\"NetworkingConfig\"") == null);
 }
 
 test "parseOutputs parses k=v lines, ignores blanks and malformed lines" {
