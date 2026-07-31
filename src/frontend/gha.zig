@@ -153,6 +153,28 @@ test "matrix expands cartesian product with display names" {
     try std.testing.expectEqualStrings("linux", p.jobs[0].matrix[0].value);
 }
 
+test "empty matrix axis is a hard diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    strategy:
+        \\      matrix:
+        \\        os: []
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    try std.testing.expectError(error.ParseFailed, parseWorkflow(a, "m.yml", src, &diags));
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "matrix axis 'os' has no values") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "matrixMatches filters combos" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -355,6 +377,10 @@ fn readMatrix(alloc: std.mem.Allocator, jn: yaml.Node, diags: *yaml.Diags) ![]Ax
                     .scalar => |s| try vals.append(alloc, s),
                     .map => try diags.add(e.value_ptr.line, e.value_ptr.col, "matrix axis '{s}' must be a list", .{axis_name}),
                 }
+                if (vals.items.len == 0) {
+                    try diags.add(e.value_ptr.line, e.value_ptr.col, "matrix axis '{s}' has no values", .{axis_name});
+                    continue;
+                }
                 try axes.append(alloc, .{ .name = axis_name, .values = try vals.toOwnedSlice(alloc) });
             }
         },
@@ -368,8 +394,10 @@ fn appendExpanded(alloc: std.mem.Allocator, jobs: *std.ArrayList(ir.Job), base: 
         try jobs.append(alloc, base);
         return;
     }
+    // readMatrix never appends an axis with 0 values (empty axes are a hard
+    // diagnostic), so plain lengths are safe here — no @max(...,1) needed.
     var total: usize = 1;
-    for (axes) |ax| total *= @max(ax.values.len, 1);
+    for (axes) |ax| total *= ax.values.len;
     var combo_idx: usize = 0;
     while (combo_idx < total) : (combo_idx += 1) {
         var combo: std.ArrayList(ir.EnvPair) = .empty;
@@ -377,9 +405,9 @@ fn appendExpanded(alloc: std.mem.Allocator, jobs: *std.ArrayList(ir.Job), base: 
         var rem = combo_idx;
         var stride: usize = total;
         for (axes) |ax| {
-            stride /= @max(ax.values.len, 1);
-            const v = ax.values[(rem / @max(stride, 1)) % @max(ax.values.len, 1)];
-            rem %= @max(stride, 1);
+            stride /= ax.values.len;
+            const v = ax.values[(rem / stride) % ax.values.len];
+            rem %= stride;
             try combo.append(alloc, .{ .name = ax.name, .value = v });
             try names.append(alloc, v);
         }
