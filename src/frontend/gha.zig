@@ -85,6 +85,28 @@ test "unknown job key warns but does not fail parsing" {
     try std.testing.expect(found);
 }
 
+test "dropped x-jalan-nix-packages key warns with migration hint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    x-jalan-nix-packages: nodejs_20,git
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 1), p.jobs.len);
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "was removed in phase 2") != null and
+            std.mem.indexOf(u8, d.msg, "setup-node") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "unknown step key warns but does not fail parsing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -552,7 +574,7 @@ fn condText(alloc: std.mem.Allocator, raw: []const u8, line: u32, diags: *yaml.D
 //   anything else        -> genuinely unknown key; "not supported in phase 1" warning.
 const workflow_supported_keys = [_][]const u8{ "name", "on", "env", "defaults", "jobs" };
 const workflow_known_unsupported_keys = [_][]const u8{ "permissions", "concurrency", "run-name" };
-const job_supported_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults", "container", "services" };
+const job_supported_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults", "container", "services", "x-jalan-nix-packages" };
 const job_known_unsupported_keys = [_][]const u8{ "if", "outputs", "continue-on-error", "timeout-minutes", "environment", "concurrency", "permissions" };
 // 'with' is added conditionally by lowerStep: supported on `uses` steps only.
 const step_supported_keys = [_][]const u8{ "name", "id", "run", "uses", "shell", "env", "if", "working-directory", "continue-on-error", "timeout-minutes" };
@@ -739,6 +761,14 @@ fn lowerJob(
     } else try diags.add(jn.line, jn.col, "job '{s}' has no steps", .{job_id});
 
     try checkKeys(diags, jn, "job", &job_supported_keys, &job_known_unsupported_keys);
+
+    // Spec'd per-job override `x-jalan-nix-packages` was dropped in phase 2 in
+    // favor of `uses: actions/setup-*` interception on the nix backend — say
+    // so explicitly instead of the generic unknown-key warning, so a workflow
+    // carrying the old extension key is never silently misled.
+    if (jn.get("x-jalan-nix-packages") != null) {
+        try addWarn(diags, jn.line, 1, "job key 'x-jalan-nix-packages' was removed in phase 2 — use 'uses: actions/setup-node|setup-python|setup-go' to add nix packages instead", .{});
+    }
 
     const container_image = if (jn.get("container")) |c| switch (c.data) {
         .scalar => |s| s,
