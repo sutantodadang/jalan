@@ -44,7 +44,7 @@ pub const Node = struct {
 
 pub const ParseError = error{ ParseFailed, OutOfMemory };
 
-const Line = struct { indent: u32, text: []const u8, no: u32 };
+const Line = struct { indent: u32, text: []const u8, raw: []const u8, no: u32 };
 
 const Parser = struct {
     alloc: std.mem.Allocator,
@@ -96,7 +96,8 @@ const Parser = struct {
             } else if (findKeyColon(rest) != null or std.mem.startsWith(u8, rest, "-")) {
                 // Re-enter the item's remainder as a virtual deeper line so
                 // `- key: v` merges with following lines indented past the dash.
-                self.lines[self.idx] = .{ .indent = base_indent + 2, .text = rest, .no = ln.no };
+                const raw_rest = std.mem.trim(u8, ln.raw[1..], " ");
+                self.lines[self.idx] = .{ .indent = base_indent + 2, .text = rest, .raw = raw_rest, .no = ln.no };
                 try items.append(self.alloc, try self.parseBlock(base_indent + 1));
             } else {
                 // Plain scalar item: `- build` (no colon, no nested seq).
@@ -124,7 +125,7 @@ const Parser = struct {
             const keep = if (ln.indent >= content_indent.?) ln.indent - content_indent.? else 0;
             var buf: std.ArrayList(u8) = .empty;
             try buf.appendNTimes(self.alloc, ' ', keep);
-            try buf.appendSlice(self.alloc, ln.text);
+            try buf.appendSlice(self.alloc, ln.raw);
             try parts.append(self.alloc, try buf.toOwnedSlice(self.alloc));
             self.idx += 1;
         }
@@ -251,9 +252,10 @@ pub fn parse(alloc: std.mem.Allocator, source: []const u8, diags: *Diags) ParseE
                 break;
             } else break;
         }
-        const text = stripComment(line[indent..]);
+        const raw_text = line[indent..];
+        const text = stripComment(raw_text);
         if (text.len == 0 or text[0] == '#') continue;
-        try lines.append(alloc, .{ .indent = indent, .text = text, .no = no });
+        try lines.append(alloc, .{ .indent = indent, .text = text, .raw = raw_text, .no = no });
     }
     var p = Parser{ .alloc = alloc, .lines = lines.items, .diags = diags };
     const root = try p.parseBlock(0);
@@ -370,6 +372,18 @@ test "literal block scalar preserves newlines" {
         \\  echo two
     , &diags);
     try std.testing.expectEqualStrings("echo one\necho two", root.get("run").?.data.scalar);
+}
+
+test "literal block scalar preserves a hash comment in content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a,
+        \\run: |
+        \\  echo one # keep me
+    , &diags);
+    try std.testing.expectEqualStrings("echo one # keep me", root.get("run").?.data.scalar);
 }
 
 test "folded block scalar joins with spaces" {
