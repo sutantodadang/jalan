@@ -162,6 +162,68 @@ test "independent jobs run concurrently" {
     }
 }
 
+test "parallel spawn failures do not race: each job gets correctly attributed stderr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  a:
+        \\    steps:
+        \\      - run: echo unreachable
+        \\        shell: nosuchshell
+        \\  b:
+        \\    steps:
+        \\      - run: echo unreachable
+        \\        shell: nosuchshell
+    );
+    const report = try run(a, p, .{ .max_parallel = 2 });
+    try std.testing.expect(!report.ok());
+    for (report.jobs) |j| {
+        try std.testing.expectEqual(JobStatus.failed, j.status);
+        try std.testing.expectEqual(StepStatus.failed, j.steps[0].status);
+        try std.testing.expect(std.mem.indexOf(u8, j.steps[0].stderr, "unknown shell 'nosuchshell'") != null);
+    }
+}
+
+test "workflow-level env value interpolates matrix context" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\env:
+        \\  TAG: ${{ matrix.os }}
+        \\jobs:
+        \\  build:
+        \\    strategy:
+        \\      matrix:
+        \\        os: [linux]
+        \\    steps:
+        \\      - run: echo "$TAG"
+        \\        shell: sh
+    );
+    const report = try run(a, p, .{});
+    try std.testing.expect(report.ok());
+    try std.testing.expect(std.mem.indexOf(u8, report.jobs[0].steps[0].stdout, "linux") != null);
+}
+
+test "script interpolation failure fails the step without spawning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - run: echo ${{ format('{9}', 'x') }}
+    );
+    const report = try run(a, p, .{});
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqual(JobStatus.failed, report.jobs[0].status);
+    try std.testing.expectEqual(StepStatus.failed, report.jobs[0].steps[0].status);
+    try std.testing.expectEqual(@as(usize, 0), report.jobs[0].steps[0].stdout.len);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -356,6 +418,17 @@ fn runJob(
     var merged_env: std.ArrayList(ir.EnvPair) = .empty;
     try merged_env.appendSlice(alloc, job.env);
     try merged_env.appendSlice(alloc, opts.extra_env);
+    // Interpolate workflow/job-level env values against the github/matrix/secrets
+    // context built above. NOTE: env entries cannot reference other env entries
+    // (this is a single pass, not iterative resolution) — only github.*, matrix.*,
+    // and secrets.* are available here.
+    for (merged_env.items) |*e| {
+        e.value = expr.interpolate(alloc, e.value, &env) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            logJob(opts, alloc, job, try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, job failed", .{e.name}));
+            return .{ .job_index = index, .display_name = job.display_name, .status = .failed, .steps = steps };
+        };
+    }
     for (merged_env.items) |e| try env.put(alloc, try key2(alloc, "env", e.name), e.value);
     {
         // shared.job_outputs is read here and written post-step below; other
@@ -375,17 +448,19 @@ fn runJob(
     }
 
     var job_status: JobStatus = .success;
-    for (job.steps, 0..) |step, si| {
+    step_loop: for (job.steps, 0..) |step, si| {
         if (opts.step_filter) |f| if (!std.mem.eql(u8, f, step.id)) continue;
         if (job_status == .failed) break;
         const t0 = std.time.milliTimestamp();
 
         if (step.cond) |cond| {
-            const ast = expr.parseExpr(alloc, cond) catch {
+            const ast = expr.parseExpr(alloc, cond) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 logLine(opts, alloc, job, step, "warning: bad if expression, step skipped");
                 continue;
             };
-            const v = expr.eval(alloc, ast, &env) catch {
+            const v = expr.eval(alloc, ast, &env) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
                 logLine(opts, alloc, job, step, "warning: if evaluation failed, step skipped");
                 continue;
             };
@@ -401,25 +476,45 @@ fn runJob(
             continue;
         }
 
-        // Interpolate script, env values, workdir.
-        const script = expr.interpolate(alloc, step.script, &env) catch step.script;
+        // Interpolate script, env values, workdir. Any expression error here means
+        // the step would otherwise run un-interpolated (raw `${{ ... }}` text) —
+        // instead we fail the step loudly and never spawn it.
+        const script = expr.interpolate(alloc, step.script, &env) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const msg = "warning: expression error in script, step failed";
+            logLine(opts, alloc, job, step, msg);
+            steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+            if (!step.continue_on_error) job_status = .failed;
+            continue;
+        };
         var spawn_env: std.ArrayList(ir.EnvPair) = .empty;
         try spawn_env.appendSlice(alloc, merged_env.items);
         for (step.env) |e| {
-            const val = expr.interpolate(alloc, e.value, &env) catch e.value;
+            const val = expr.interpolate(alloc, e.value, &env) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                const msg = try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, step failed", .{e.name});
+                logLine(opts, alloc, job, step, msg);
+                steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+                if (!step.continue_on_error) job_status = .failed;
+                continue :step_loop;
+            };
             try spawn_env.append(alloc, .{ .name = e.name, .value = val });
             try env.put(alloc, try key2(alloc, "env", e.name), val);
         }
         var patched = step;
         patched.script = script;
-        const workdir = if (step.workdir) |w| expr.interpolate(alloc, w, &env) catch w else null;
+        const workdir = if (step.workdir) |w| expr.interpolate(alloc, w, &env) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            const msg = "warning: expression error in working-directory, step failed";
+            logLine(opts, alloc, job, step, msg);
+            steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+            if (!step.continue_on_error) job_status = .failed;
+            continue;
+        } else null;
 
-        // last_spawn_error_msg may race under parallel spawn failures — message may be
-        // misattributed, or, in worst case, reference invalid memory (torn ptr/len);
-        // status is not affected. runStep itself blocks for the step's duration, so
-        // the mutex is never held across this call.
-        const outcome = native.runStep(alloc, patched, spawn_env.items, workdir) catch {
-            steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = native.last_spawn_error_msg orelse "spawn failed" };
+        var err_msg: ?[]const u8 = null;
+        const outcome = native.runStep(alloc, patched, spawn_env.items, workdir, &err_msg) catch {
+            steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
             if (!step.continue_on_error) job_status = .failed;
             continue;
         };
@@ -457,6 +552,13 @@ fn key2(alloc: std.mem.Allocator, root: []const u8, name: []const u8) ![]const u
 fn logLine(opts: RunOptions, alloc: std.mem.Allocator, job: ir.Job, step: ir.Step, msg: []const u8) void {
     if (opts.log) |f| {
         const line = std.fmt.allocPrint(alloc, "[{s}/{s}] {s}", .{ job.display_name, step.name, msg }) catch return;
+        f(line);
+    }
+}
+
+fn logJob(opts: RunOptions, alloc: std.mem.Allocator, job: ir.Job, msg: []const u8) void {
+    if (opts.log) |f| {
+        const line = std.fmt.allocPrint(alloc, "[{s}] {s}", .{ job.display_name, msg }) catch return;
         f(line);
     }
 }

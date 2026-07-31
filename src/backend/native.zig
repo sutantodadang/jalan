@@ -12,8 +12,6 @@ pub const StepOutcome = struct {
 
 pub const RunError = error{ SpawnFailed, OutOfMemory };
 
-pub var last_spawn_error_msg: ?[]const u8 = null;
-
 const Shell = struct { name: []const u8, ext: []const u8, argv_prefix: []const []const u8 };
 
 fn shellTable(name: []const u8) ?Shell {
@@ -60,17 +58,18 @@ pub fn runStep(
     step: ir.Step,
     env: []const ir.EnvPair,
     workdir: ?[]const u8,
+    err_msg: *?[]const u8,
 ) RunError!StepOutcome {
     const shell = if (step.shell) |name|
         shellTable(name) orelse {
-            last_spawn_error_msg = std.fmt.allocPrint(alloc, "unknown shell '{s}'", .{name}) catch null;
+            err_msg.* = std.fmt.allocPrint(alloc, "unknown shell '{s}'", .{name}) catch null;
             return error.SpawnFailed;
         }
     else
         defaultShell(alloc);
 
     std.fs.cwd().makePath(".jalan/tmp") catch {
-        last_spawn_error_msg = "cannot create .jalan/tmp";
+        err_msg.* = "cannot create .jalan/tmp";
         return error.SpawnFailed;
     };
     var rand_buf: [8]u8 = undefined;
@@ -79,7 +78,7 @@ pub fn runStep(
     const script_path = std.fmt.allocPrint(alloc, ".jalan/tmp/step-{s}{s}", .{ tag, shell.ext }) catch return error.OutOfMemory;
     const output_path = std.fmt.allocPrint(alloc, ".jalan/tmp/out-{s}.txt", .{tag}) catch return error.OutOfMemory;
     std.fs.cwd().writeFile(.{ .sub_path = script_path, .data = step.script }) catch {
-        last_spawn_error_msg = "cannot write step script";
+        err_msg.* = "cannot write step script";
         return error.SpawnFailed;
     };
     std.fs.cwd().writeFile(.{ .sub_path = output_path, .data = "" }) catch {};
@@ -92,7 +91,7 @@ pub fn runStep(
     env_map.put("GITHUB_ACTIONS", "true") catch return error.OutOfMemory;
     env_map.put("JALAN", "true") catch return error.OutOfMemory;
     const abs_output = std.fs.cwd().realpathAlloc(alloc, output_path) catch |e| {
-        last_spawn_error_msg = std.fmt.allocPrint(
+        err_msg.* = std.fmt.allocPrint(
             alloc,
             "cannot resolve output path '{s}': {s}",
             .{ output_path, @errorName(e) },
@@ -104,7 +103,7 @@ pub fn runStep(
     var argv: std.ArrayList([]const u8) = .empty;
     argv.appendSlice(alloc, shell.argv_prefix) catch return error.OutOfMemory;
     const abs_script = std.fs.cwd().realpathAlloc(alloc, script_path) catch |e| {
-        last_spawn_error_msg = std.fmt.allocPrint(
+        err_msg.* = std.fmt.allocPrint(
             alloc,
             "cannot resolve script path '{s}': {s}",
             .{ script_path, @errorName(e) },
@@ -120,7 +119,7 @@ pub fn runStep(
         .env_map = &env_map,
         .max_output_bytes = 16 * 1024 * 1024,
     }) catch |e| {
-        last_spawn_error_msg = std.fmt.allocPrint(
+        err_msg.* = std.fmt.allocPrint(
             alloc,
             "{s} not found or failed to spawn ({s}) — install it or set shell:",
             .{ shell.name, @errorName(e) },
@@ -158,7 +157,8 @@ test "run echo step captures stdout and exit code" {
     defer arena.deinit();
     const a = arena.allocator();
     const step = ir.Step{ .id = "s", .name = "s", .kind = .run, .script = "echo hello-jalan" };
-    const out = try runStep(a, step, &.{}, null);
+    var err_msg: ?[]const u8 = null;
+    const out = try runStep(a, step, &.{}, null, &err_msg);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "hello-jalan") != null);
 }
@@ -168,7 +168,8 @@ test "failing step returns nonzero exit code" {
     defer arena.deinit();
     const a = arena.allocator();
     const step = ir.Step{ .id = "s", .name = "s", .kind = .run, .script = "exit 3" };
-    const out = try runStep(a, step, &.{}, null);
+    var err_msg: ?[]const u8 = null;
+    const out = try runStep(a, step, &.{}, null, &err_msg);
     try std.testing.expectEqual(@as(i32, 3), out.exit_code);
 }
 
@@ -182,7 +183,8 @@ test "step outputs parsed from GITHUB_OUTPUT" {
         "echo \"ver=1.2\" >> \"$GITHUB_OUTPUT\"";
     const shell: ?[]const u8 = if (builtin.os.tag == .windows) "cmd" else null;
     const step = ir.Step{ .id = "s", .name = "s", .kind = .run, .script = script, .shell = shell };
-    const out = try runStep(a, step, &.{}, null);
+    var err_msg: ?[]const u8 = null;
+    const out = try runStep(a, step, &.{}, null, &err_msg);
     try std.testing.expectEqualStrings("ver", out.outputs[0].name);
     try std.testing.expectEqualStrings("1.2", std.mem.trim(u8, out.outputs[0].value, " "));
 }
@@ -193,7 +195,8 @@ test "step with workdir set resolves script and output paths correctly" {
     const a = arena.allocator();
     try std.fs.cwd().makePath(".jalan/tmp/wdtest");
     const step = ir.Step{ .id = "s", .name = "s", .kind = .run, .script = "echo from-workdir" };
-    const out = try runStep(a, step, &.{}, ".jalan/tmp/wdtest");
+    var err_msg: ?[]const u8 = null;
+    const out = try runStep(a, step, &.{}, ".jalan/tmp/wdtest", &err_msg);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "from-workdir") != null);
 }

@@ -24,6 +24,7 @@ pub const Step = struct {
     continue_on_error: bool = false,
     timeout_minutes: ?u32 = null,
     input_hash: ?[]const u8 = null,
+    src_line: u32 = 0,
 };
 
 pub const Job = struct {
@@ -34,6 +35,7 @@ pub const Job = struct {
     env: []EnvPair = &.{},
     matrix: []EnvPair = &.{},
     steps: []Step,
+    src_line: u32 = 0,
 };
 
 pub const Pipeline = struct {

@@ -71,6 +71,27 @@ pub fn lintMain(alloc: std.mem.Allocator, path: []const u8, json: bool, strict: 
     return 0;
 }
 
+const LintArgs = struct { json: bool = false, strict: bool = false, file: ?[]const u8 = null };
+
+/// Bad-args detection for `jalan lint`: any `-`/`--`-prefixed token that
+/// isn't a recognized flag is rejected rather than silently treated as a
+/// (nonexistent) positional file path — mirrors parseRunArgs.
+fn parseLintArgs(args: []const []const u8) error{BadArgs}!LintArgs {
+    var r = LintArgs{};
+    for (args) |a2| {
+        if (std.mem.eql(u8, a2, "--json")) {
+            r.json = true;
+        } else if (std.mem.eql(u8, a2, "--strict")) {
+            r.strict = true;
+        } else if (std.mem.startsWith(u8, a2, "-") and a2.len > 1) {
+            return error.BadArgs;
+        } else {
+            r.file = a2;
+        }
+    }
+    return r;
+}
+
 fn printDiags(alloc: std.mem.Allocator, path: []const u8, diags: *const yaml.Diags, out: *std.ArrayList(u8)) !void {
     for (diags.list.items) |d|
         try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s}:{d}:{d}: {s}\n", .{ path, d.line, d.col, d.msg }));
@@ -175,6 +196,22 @@ pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs
     return r;
 }
 
+fn anyJobRan(jobs: []const engine.JobResult) bool {
+    for (jobs) |j| if (j.status != .skipped) return true;
+    return false;
+}
+
+fn anyStepRan(jobs: []const engine.JobResult) bool {
+    for (jobs) |j| for (j.steps) |s| if (s.status != .skipped) return true;
+    return false;
+}
+
+fn formatMatrixFilter(alloc: std.mem.Allocator, matrix: []const ir.EnvPair) ![]const u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    for (matrix) |m| try parts.append(alloc, try std.fmt.allocPrint(alloc, "{s}={s}", .{ m.name, m.value }));
+    return std.mem.join(alloc, ",", parts.items);
+}
+
 fn splitPair(s: []const u8) ?ir.EnvPair {
     const eq = std.mem.indexOfScalar(u8, s, '=') orelse return null;
     if (eq == 0) return null;
@@ -198,18 +235,16 @@ pub fn main(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help")) return help();
     if (std.mem.eql(u8, cmd, "version")) return print("jalan 0.1.0\n");
     if (std.mem.eql(u8, cmd, "lint")) {
-        var json = false;
-        var strict = false;
-        var file: ?[]const u8 = null;
-        for (args[1..]) |a2| {
-            if (std.mem.eql(u8, a2, "--json")) json = true else if (std.mem.eql(u8, a2, "--strict")) strict = true else file = a2;
-        }
-        const path = file orelse (try findDefaultWorkflow(alloc)) orelse {
+        const la = parseLintArgs(args[1..]) catch {
+            _ = try print("error: bad arguments (see 'jalan help')\n");
+            return 2;
+        };
+        const path = la.file orelse (try findDefaultWorkflow(alloc)) orelse {
             _ = try print("error: no workflow found in .github/workflows\n");
             return 2;
         };
         var out: std.ArrayList(u8) = .empty;
-        const code = try lintMain(alloc, path, json, strict, &out);
+        const code = try lintMain(alloc, path, la.json, la.strict, &out);
         _ = try print(out.items);
         return code;
     }
@@ -227,6 +262,17 @@ pub fn main(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
 fn print(s: []const u8) !u8 {
     try std.fs.File.stdout().writeAll(s);
     return 0;
+}
+
+var stderr_log_mutex: std.Thread.Mutex = .{};
+
+// Thread-safe per RunOptions.log contract: called from worker threads under
+// parallel job execution.
+fn logToStderr(line: []const u8) void {
+    stderr_log_mutex.lock();
+    defer stderr_log_mutex.unlock();
+    std.fs.File.stderr().writeAll(line) catch return;
+    std.fs.File.stderr().writeAll("\n") catch return;
 }
 
 fn help() !u8 {
@@ -307,6 +353,7 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         .extra_env = ra.env,
         .secrets = secrets,
         .matrix_filter = ra.matrix,
+        .log = &logToStderr,
     }) catch |e| switch (e) {
         error.InternalError => {
             _ = try print("internal error: engine failed\n");
@@ -314,6 +361,23 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         },
         error.OutOfMemory => return error.OutOfMemory,
     };
+
+    if (ra.job != null or ra.matrix.len > 0) {
+        if (!anyJobRan(report.jobs)) {
+            if (ra.job) |jf| {
+                _ = try print(try std.fmt.allocPrint(alloc, "error: no job matching '{s}'\n", .{jf}));
+            } else {
+                _ = try print(try std.fmt.allocPrint(alloc, "error: no job matching '{s}'\n", .{try formatMatrixFilter(alloc, ra.matrix)}));
+            }
+            return 2;
+        }
+    }
+    if (ra.step) |sf| {
+        if (!anyStepRan(report.jobs)) {
+            _ = try print(try std.fmt.allocPrint(alloc, "error: no step matching '{s}'\n", .{sf}));
+            return 2;
+        }
+    }
 
     const use_color = colorsEnabled(alloc, ra);
     var out: std.ArrayList(u8) = .empty;
@@ -393,6 +457,34 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
 
     _ = try print(out.items);
     return if (report.ok()) 0 else 1;
+}
+
+// NOTE: runMain()/main() write directly to real process stdout via print().
+// Under `zig build test`'s --listen=- IPC protocol, stdout IS the test-result
+// channel — calling these from a test corrupts the protocol and aborts the
+// whole test binary (observed: "the following command exited with code 1"
+// instead of a normal per-test failure). So I5/M2 are covered here only at
+// the pure-logic level (anyJobRan/anyStepRan/parseLintArgs); the full
+// runMain/main CLI behavior is verified by the manual smoke tests in the
+// fix-wave report instead.
+test "anyJobRan / anyStepRan: false when every job or step is skipped" {
+    var steps_a = [_]engine.StepResult{.{ .name = "s", .status = .skipped, .exit_code = 0, .duration_ms = 0, .stdout = "", .stderr = "" }};
+    var jobs_all_skipped = [_]engine.JobResult{.{ .job_index = 0, .display_name = "a", .status = .skipped, .steps = &steps_a }};
+    try std.testing.expect(!anyJobRan(&jobs_all_skipped));
+    try std.testing.expect(!anyStepRan(&jobs_all_skipped));
+
+    var steps_b = [_]engine.StepResult{.{ .name = "s", .status = .success, .exit_code = 0, .duration_ms = 0, .stdout = "", .stderr = "" }};
+    var jobs_ran = [_]engine.JobResult{.{ .job_index = 0, .display_name = "a", .status = .success, .steps = &steps_b }};
+    try std.testing.expect(anyJobRan(&jobs_ran));
+    try std.testing.expect(anyStepRan(&jobs_ran));
+}
+
+test "parseLintArgs rejects unrecognized flags but accepts known flags and file" {
+    try std.testing.expectError(error.BadArgs, parseLintArgs(&[_][]const u8{"--bogus"}));
+    const la = try parseLintArgs(&[_][]const u8{ "--json", "--strict", "wf.yml" });
+    try std.testing.expect(la.json);
+    try std.testing.expect(la.strict);
+    try std.testing.expectEqualStrings("wf.yml", la.file.?);
 }
 
 test "detect provider by path and content" {

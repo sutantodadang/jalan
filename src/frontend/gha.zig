@@ -108,7 +108,7 @@ test "unknown step key warns but does not fail parsing" {
     try std.testing.expect(found);
 }
 
-test "known-but-unsupported keys (strategy, with) do not warn" {
+test "strategy is silent; outputs/if are recognized-but-not-simulated warnings" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -118,16 +118,80 @@ test "known-but-unsupported keys (strategy, with) do not warn" {
         \\  build:
         \\    strategy:
         \\      fail-fast: false
+        \\    outputs:
+        \\      foo: bar
+        \\    if: true
         \\    steps:
         \\      - uses: actions/checkout@v4
         \\        with:
         \\          ref: main
     ;
-    _ = try parseWorkflow(a, "x.yml", src, &diags);
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 1), p.jobs.len);
+    var strategy_warned = false;
+    var with_warned = false;
+    var outputs_warned = false;
+    var if_warned = false;
     for (diags.list.items) |d| {
-        try std.testing.expect(std.mem.indexOf(u8, d.msg, "job key") == null);
-        try std.testing.expect(std.mem.indexOf(u8, d.msg, "step key") == null);
+        if (std.mem.indexOf(u8, d.msg, "'strategy'") != null) strategy_warned = true;
+        if (std.mem.indexOf(u8, d.msg, "'with'") != null) with_warned = true;
+        if (std.mem.indexOf(u8, d.msg, "'outputs'") != null) {
+            outputs_warned = true;
+            try std.testing.expect(std.mem.indexOf(u8, d.msg, "recognized but not simulated") != null);
+        }
+        if (std.mem.indexOf(u8, d.msg, "'if'") != null) {
+            if_warned = true;
+            try std.testing.expect(std.mem.indexOf(u8, d.msg, "recognized but not simulated") != null);
+        }
     }
+    try std.testing.expect(!strategy_warned);
+    try std.testing.expect(!with_warned);
+    try std.testing.expect(outputs_warned);
+    try std.testing.expect(if_warned);
+}
+
+test "'with' on a run step is an unknown-key warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    steps:
+        \\      - run: echo hi
+        \\        with:
+        \\          ref: main
+    ;
+    _ = try parseWorkflow(a, "x.yml", src, &diags);
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "'with'") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "validation diagnostics carry real source line numbers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  a:
+        \\    needs: ghost
+        \\    steps:
+        \\      - run: echo a
+    ;
+    _ = parseWorkflow(a, "v.yml", src, &diags) catch {};
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "needs unknown job 'ghost'") != null) {
+            try std.testing.expect(d.line > 0);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "matrix expands cartesian product with display names" {
@@ -314,29 +378,45 @@ fn condText(alloc: std.mem.Allocator, raw: []const u8, line: u32, diags: *yaml.D
     return t;
 }
 
-const workflow_known_keys = [_][]const u8{ "name", "on", "env", "defaults", "jobs", "permissions", "concurrency", "run-name" };
-const job_known_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults", "if", "outputs", "permissions", "timeout-minutes", "continue-on-error", "concurrency", "environment" };
-const step_known_keys = [_][]const u8{ "name", "id", "run", "uses", "with", "shell", "env", "if", "working-directory", "continue-on-error", "timeout-minutes" };
+// Keys split three ways per map:
+//   supported          -> actually implemented, no warning.
+//   known_unsupported   -> real GHA keys jalan recognizes but does not simulate
+//                          in phase 1; explicit "recognized but not simulated" warning.
+//   anything else        -> genuinely unknown key; "not supported in phase 1" warning.
+const workflow_supported_keys = [_][]const u8{ "name", "on", "env", "defaults", "jobs" };
+const workflow_known_unsupported_keys = [_][]const u8{ "permissions", "concurrency", "run-name" };
+const job_supported_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults" };
+const job_known_unsupported_keys = [_][]const u8{ "if", "outputs", "continue-on-error", "timeout-minutes", "environment", "concurrency", "permissions" };
+// 'with' is added conditionally by lowerStep: supported on `uses` steps only.
+const step_supported_keys = [_][]const u8{ "name", "id", "run", "uses", "shell", "env", "if", "working-directory", "continue-on-error", "timeout-minutes" };
+const step_known_unsupported_keys = [_][]const u8{};
 
-/// Warn on any map key not present in `allowed`. Never a hard error —
-/// unsupported-but-known GHA keys and genuinely unknown keys are both
-/// reported the same way: explicit, never a silent skip.
-fn warnUnknownKeys(diags: *yaml.Diags, node: ?yaml.Node, comptime kind: []const u8, allowed: []const []const u8) !void {
+fn containsStr(list: []const []const u8, key: []const u8) bool {
+    for (list) |k| if (std.mem.eql(u8, k, key)) return true;
+    return false;
+}
+
+/// Warn on any map key not present in `supported`. Never a hard error —
+/// known-but-unimplemented GHA keys and genuinely unknown keys are both
+/// reported (with different wording), never silently skipped.
+fn checkKeys(
+    diags: *yaml.Diags,
+    node: ?yaml.Node,
+    comptime kind: []const u8,
+    supported: []const []const u8,
+    known_unsupported: []const []const u8,
+) !void {
     const n = node orelse return;
     switch (n.data) {
         .map => |m| {
             var it = m.iterator();
             while (it.next()) |e| {
                 const key = e.key_ptr.*;
-                var known = false;
-                for (allowed) |ak| {
-                    if (std.mem.eql(u8, ak, key)) {
-                        known = true;
-                        break;
-                    }
-                }
-                if (!known) {
-                    const v = e.value_ptr.*;
+                if (containsStr(supported, key)) continue;
+                const v = e.value_ptr.*;
+                if (containsStr(known_unsupported, key)) {
+                    try addWarn(diags, v.line, v.col, kind ++ " key '{s}' is recognized but not simulated in phase 1 (ignored)", .{key});
+                } else {
                     try addWarn(diags, v.line, v.col, kind ++ " key '{s}' is not supported in phase 1 (ignored)", .{key});
                 }
             }
@@ -366,7 +446,7 @@ pub fn parseWorkflow(
         error.ParseFailed => return error.ParseFailed,
         error.OutOfMemory => return error.OutOfMemory,
     };
-    try warnUnknownKeys(diags, root, "workflow", &workflow_known_keys);
+    try checkKeys(diags, root, "workflow", &workflow_supported_keys, &workflow_known_unsupported_keys);
     const wf_env = try envPairs(alloc, root.get("env"));
     const wf_defaults = readDefaults(root.get("defaults"));
     const name = if (root.get("name")) |n| n.scalarOr(source_path) else source_path;
@@ -421,19 +501,19 @@ fn validate(alloc: std.mem.Allocator, jobs: []const ir.Job, diags: *yaml.Diags) 
         const j = firstJobWithId(jobs, id) orelse continue;
         for (j.needs) |n| {
             if (!ids.contains(n))
-                try diags.add(0, 0, "job '{s}' needs unknown job '{s}'", .{ j.id, n });
+                try diags.add(j.src_line, 1, "job '{s}' needs unknown job '{s}'", .{ j.id, n });
         }
         var step_ids: std.StringArrayHashMapUnmanaged(void) = .empty;
         for (j.steps) |s| {
             if (step_ids.contains(s.id))
-                try diags.add(0, 0, "duplicate step id '{s}' in job '{s}'", .{ s.id, j.id });
+                try diags.add(s.src_line, 1, "duplicate step id '{s}' in job '{s}'", .{ s.id, j.id });
             try step_ids.put(alloc, s.id, {});
             if (s.shell) |sh| {
                 var ok = false;
                 for (known_shells) |k| {
                     if (std.mem.eql(u8, k, sh)) ok = true;
                 }
-                if (!ok) try addWarn(diags, 0, 0, "unknown shell '{s}'", .{sh});
+                if (!ok) try addWarn(diags, s.src_line, 1, "unknown shell '{s}'", .{sh});
             }
         }
     }
@@ -453,7 +533,8 @@ fn validate(alloc: std.mem.Allocator, jobs: []const ir.Job, diags: *yaml.Diags) 
         fn dfs(self: @This(), id: []const u8) !void {
             const c = self.color.get(id) orelse return;
             if (c == .grey) {
-                try self.diags.add(0, 0, "dependency cycle involving job '{s}'", .{id});
+                const line = if (firstJobWithId(self.jobs, id)) |jj| jj.src_line else 0;
+                try self.diags.add(line, 1, "dependency cycle involving job '{s}'", .{id});
                 return;
             }
             if (c == .black) return;
@@ -490,7 +571,7 @@ fn lowerJob(
         else => try diags.add(sn.line, sn.col, "'steps' must be a sequence", .{}),
     } else try diags.add(jn.line, jn.col, "job '{s}' has no steps", .{job_id});
 
-    try warnUnknownKeys(diags, jn, "job", &job_known_keys);
+    try checkKeys(diags, jn, "job", &job_supported_keys, &job_known_unsupported_keys);
 
     return .{
         .id = job_id,
@@ -499,6 +580,7 @@ fn lowerJob(
         .needs = try needsList(alloc, jn.get("needs")),
         .env = try env.toOwnedSlice(alloc),
         .steps = try steps.toOwnedSlice(alloc),
+        .src_line = jn.line,
     };
 }
 
@@ -583,9 +665,18 @@ fn lowerStep(
     workdir_default: ?[]const u8,
     diags: *yaml.Diags,
 ) !ir.Step {
-    try warnUnknownKeys(diags, n, "step", &step_known_keys);
     const run_node = n.get("run");
     const uses_node = n.get("uses");
+    // 'with' is only meaningful (and only accepted silently) on `uses` steps;
+    // on a `run` step it is an unknown key.
+    if (uses_node != null) {
+        var allowed: [step_supported_keys.len + 1][]const u8 = undefined;
+        @memcpy(allowed[0..step_supported_keys.len], &step_supported_keys);
+        allowed[step_supported_keys.len] = "with";
+        try checkKeys(diags, n, "step", &allowed, &step_known_unsupported_keys);
+    } else {
+        try checkKeys(diags, n, "step", &step_supported_keys, &step_known_unsupported_keys);
+    }
     if (run_node == null and uses_node == null)
         try diags.add(n.line, n.col, "step needs 'run' or 'uses'", .{});
     if (uses_node != null)
@@ -616,5 +707,6 @@ fn lowerStep(
         .cond = if (n.get("if")) |c| try condText(alloc, c.scalarOr(""), c.line, diags) else null,
         .continue_on_error = if (n.get("continue-on-error")) |c| std.mem.eql(u8, c.scalarOr(""), "true") else false,
         .timeout_minutes = timeout,
+        .src_line = n.line,
     };
 }
