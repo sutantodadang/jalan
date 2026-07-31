@@ -279,6 +279,30 @@ pub const Env = struct {
     }
 };
 
+const ir = @import("ir.zig");
+
+/// Serialize the env into sorted `{name, value}` pairs (sorted by name so
+/// manifest JSON is deterministic — the map's iteration order is not).
+pub fn envToPairs(alloc: std.mem.Allocator, env: *const Env) ![]ir.EnvPair {
+    var pairs: std.ArrayList(ir.EnvPair) = .empty;
+    var it = env.vars.iterator();
+    while (it.next()) |e| try pairs.append(alloc, .{ .name = e.key_ptr.*, .value = e.value_ptr.* });
+    std.mem.sort(ir.EnvPair, pairs.items, {}, struct {
+        fn lt(_: void, x: ir.EnvPair, y: ir.EnvPair) bool {
+            return std.mem.lessThan(u8, x.name, y.name);
+        }
+    }.lt);
+    return pairs.toOwnedSlice(alloc);
+}
+
+/// Rebuild an env from serialized pairs (keys re-lowercase through `put`,
+/// matching normal construction).
+pub fn envFromPairs(alloc: std.mem.Allocator, pairs: []const ir.EnvPair) !Env {
+    var env = Env{};
+    for (pairs) |p| try env.put(alloc, p.name, p.value);
+    return env;
+}
+
 pub const EvalError = error{ EvalFailed, OutOfMemory };
 
 pub fn eval(alloc: std.mem.Allocator, ast: Ast, env: *const Env) EvalError!Value {
