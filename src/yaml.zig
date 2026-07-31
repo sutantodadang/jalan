@@ -44,7 +44,7 @@ pub const Node = struct {
 
 pub const ParseError = error{ ParseFailed, OutOfMemory };
 
-const Line = struct { indent: u32, text: []const u8, raw: []const u8, no: u32 };
+const Line = struct { indent: u32, text: []const u8, raw: []const u8, no: u32, comment_only: bool = false };
 
 const Parser = struct {
     alloc: std.mem.Allocator,
@@ -75,7 +75,19 @@ const Parser = struct {
         return .{ .line = no, .col = col, .data = .{ .scalar = t } };
     }
 
+    /// Comment-only lines carry content for block scalars but must be
+    /// invisible to every other consumer of `lines` — skip past any run of
+    /// them regardless of indent so they never get mistaken for a key,
+    /// sequence item, or an out-dent that would end a block.
+    fn skipComments(self: *Parser) void {
+        while (self.peek()) |ln| {
+            if (!ln.comment_only) break;
+            self.idx += 1;
+        }
+    }
+
     fn parseBlock(self: *Parser, min_indent: u32) ParseError!Node {
+        self.skipComments();
         const first = self.peek() orelse
             return .{ .line = 0, .col = 0, .data = .{ .scalar = "" } };
         if (std.mem.startsWith(u8, first.text, "- ") or std.mem.eql(u8, first.text, "-"))
@@ -87,6 +99,10 @@ const Parser = struct {
         var items: std.ArrayList(Node) = .empty;
         const start = self.peek().?;
         while (self.peek()) |ln| {
+            if (ln.comment_only) {
+                self.idx += 1;
+                continue;
+            }
             if (ln.indent != base_indent or ln.indent < min_indent) break;
             if (!std.mem.startsWith(u8, ln.text, "-")) break;
             const rest = std.mem.trim(u8, ln.text[1..], " ");
@@ -138,6 +154,10 @@ const Parser = struct {
         var m: Map = .empty;
         const start = self.peek().?;
         while (self.peek()) |ln| {
+            if (ln.comment_only) {
+                self.idx += 1;
+                continue;
+            }
             if (ln.indent < base_indent or ln.indent < min_indent) break;
             if (ln.indent > base_indent) {
                 try self.diags.add(ln.no, ln.indent + 1, "unexpected indentation", .{});
@@ -166,7 +186,10 @@ const Parser = struct {
                 } else {
                     value = try self.parseValueText(rest, ln.no, value_col);
                 }
-            } else if (self.peek()) |next| {
+            } else if (blk: {
+                self.skipComments();
+                break :blk self.peek();
+            }) |next| {
                 if (next.indent > base_indent) {
                     value = try self.parseBlock(base_indent + 1);
                     // Anchor the nested block's position to its "key:" line,
@@ -254,8 +277,11 @@ pub fn parse(alloc: std.mem.Allocator, source: []const u8, diags: *Diags) ParseE
         }
         const raw_text = line[indent..];
         const text = stripComment(raw_text);
-        if (text.len == 0 or text[0] == '#') continue;
-        try lines.append(alloc, .{ .indent = indent, .text = text, .raw = raw_text, .no = no });
+        // A comment-only line (raw text starts with `#`) strips to empty.
+        // It must still enter `lines` — block scalars need it verbatim as
+        // content — but flagged so map/seq walkers skip over it instead of
+        // trying to parse it as a key or item.
+        try lines.append(alloc, .{ .indent = indent, .text = text, .raw = raw_text, .no = no, .comment_only = text.len == 0 });
     }
     var p = Parser{ .alloc = alloc, .lines = lines.items, .diags = diags };
     const root = try p.parseBlock(0);
@@ -384,6 +410,35 @@ test "literal block scalar preserves a hash comment in content" {
         \\  echo one # keep me
     , &diags);
     try std.testing.expectEqualStrings("echo one # keep me", root.get("run").?.data.scalar);
+}
+
+test "literal block scalar preserves a comment-only interior line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a,
+        \\run: |
+        \\  echo one
+        \\  # note
+        \\  echo two
+    , &diags);
+    try std.testing.expectEqualStrings("echo one\n# note\necho two", root.get("run").?.data.scalar);
+}
+
+test "comment-only line between mapping keys does not break the mapping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a,
+        \\a: 1
+        \\# c
+        \\b: 2
+    , &diags);
+    try std.testing.expectEqualStrings("1", root.get("a").?.data.scalar);
+    try std.testing.expectEqualStrings("2", root.get("b").?.data.scalar);
+    try std.testing.expectEqual(@as(usize, 0), diags.list.items.len);
 }
 
 test "folded block scalar joins with spaces" {
