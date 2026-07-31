@@ -87,7 +87,11 @@ const Parser = struct {
             self.idx += 1;
             var value: Node = undefined;
             if (rest.len > 0) {
-                value = try self.parseValueText(rest, ln.no, ln.indent + @as(u32, @intCast(colon)) + 2);
+                const after_colon = ln.text[colon + 1 ..];
+                var off: usize = 0;
+                while (off < after_colon.len and after_colon[off] == ' ') off += 1;
+                const value_col = ln.indent + @as(u32, @intCast(colon)) + 1 + @as(u32, @intCast(off)) + 1;
+                value = try self.parseValueText(rest, ln.no, value_col);
             } else if (self.peek()) |next| {
                 if (next.indent > base_indent) {
                     value = try self.parseBlock(base_indent + 1);
@@ -178,6 +182,32 @@ test "parse nested mapping tracks line numbers" {
     const build = root.get("jobs").?.get("build").?;
     try std.testing.expectEqualStrings("Build it", build.get("name").?.data.scalar);
     try std.testing.expectEqual(@as(u32, 2), build.line);
+}
+
+test "inline scalar column points at the value, not the separator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a,
+        \\name: CI
+    , &diags);
+    const name = root.get("name").?;
+    try std.testing.expectEqualStrings("CI", name.data.scalar);
+    try std.testing.expectEqual(@as(u32, 7), name.col);
+}
+
+test "inline scalar column accounts for extra spaces after colon" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a,
+        \\name:  CI
+    , &diags);
+    const name = root.get("name").?;
+    try std.testing.expectEqualStrings("CI", name.data.scalar);
+    try std.testing.expectEqual(@as(u32, 8), name.col);
 }
 
 test "tab indentation is a diagnostic" {
