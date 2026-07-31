@@ -1,9 +1,15 @@
 //! CLI: lint command and provider detection.
 const std = @import("std");
+const builtin = @import("builtin");
 const yaml = @import("yaml.zig");
 const ir = @import("ir.zig");
 const gha = @import("frontend/gha.zig");
 const engine = @import("engine.zig");
+const config = @import("config.zig");
+const backend = @import("backend.zig");
+const docker_backend = @import("backend/docker.zig");
+const nix_backend = @import("backend/nix.zig");
+const client = @import("docker/client.zig");
 
 pub const Provider = enum { gha, unknown };
 
@@ -71,18 +77,30 @@ pub fn lintMain(alloc: std.mem.Allocator, path: []const u8, json: bool, strict: 
     return 0;
 }
 
-const LintArgs = struct { json: bool = false, strict: bool = false, file: ?[]const u8 = null };
+const LintArgs = struct { json: bool = false, strict: bool = false, file: ?[]const u8 = null, backend: []const u8 = "auto" };
 
 /// Bad-args detection for `jalan lint`: any `-`/`--`-prefixed token that
 /// isn't a recognized flag is rejected rather than silently treated as a
 /// (nonexistent) positional file path — mirrors parseRunArgs.
+///
+/// `--backend` is parsed and validated but otherwise unused by lint itself:
+/// the `container:`/`services:` diagnostics it might once have suppressed
+/// were removed from the gha frontend in Tasks 7-8 (they're real features
+/// now, not warnings), so there's no stale suppression logic to gate here.
 fn parseLintArgs(args: []const []const u8) error{BadArgs}!LintArgs {
     var r = LintArgs{};
-    for (args) |a2| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a2 = args[i];
         if (std.mem.eql(u8, a2, "--json")) {
             r.json = true;
         } else if (std.mem.eql(u8, a2, "--strict")) {
             r.strict = true;
+        } else if (std.mem.eql(u8, a2, "--backend")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            if (!isValidBackendName(args[i])) return error.BadArgs;
+            r.backend = args[i];
         } else if (std.mem.startsWith(u8, a2, "-") and a2.len > 1) {
             return error.BadArgs;
         } else {
@@ -108,6 +126,8 @@ pub const RunArgs = struct {
     env: []ir.EnvPair = &.{},
     matrix: []ir.EnvPair = &.{},
     secret_file: ?[]const u8 = null,
+    backend: []const u8 = "auto",
+    pull: bool = false,
 };
 
 test "parse run args" {
@@ -134,6 +154,65 @@ test "unknown single-dash flag is an error, not a positional file" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     try std.testing.expectError(error.BadArgs, parseRunArgs(arena.allocator(), &[_][]const u8{"-x"}));
+}
+
+test "parseRunArgs accepts --backend nix and --pull" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const args = [_][]const u8{ "wf.yml", "--backend", "nix", "--pull" };
+    const r = try parseRunArgs(a, &args);
+    try std.testing.expectEqualStrings("nix", r.backend);
+    try std.testing.expect(r.pull);
+}
+
+test "parseRunArgs defaults backend to auto and pull to false" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const r = try parseRunArgs(arena.allocator(), &[_][]const u8{"wf.yml"});
+    try std.testing.expectEqualStrings("auto", r.backend);
+    try std.testing.expect(!r.pull);
+}
+
+test "parseRunArgs rejects an unknown --backend value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadArgs, parseRunArgs(arena.allocator(), &[_][]const u8{ "--backend", "bogus" }));
+}
+
+test "parseRunArgs rejects --backend with no value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadArgs, parseRunArgs(arena.allocator(), &[_][]const u8{"--backend"}));
+}
+
+test "resolveBackendChoice: explicit CLI non-auto beats config beats auto" {
+    // 1. explicit CLI wins even when config also has an explicit value.
+    try std.testing.expectEqualStrings("docker", resolveBackendChoice("docker", "nix"));
+    // 2. explicit CLI wins when config is auto.
+    try std.testing.expectEqualStrings("docker", resolveBackendChoice("docker", "auto"));
+    // 3. CLI auto defers to a non-auto config value.
+    try std.testing.expectEqualStrings("nix", resolveBackendChoice("auto", "nix"));
+    // 4. both auto -> auto.
+    try std.testing.expectEqualStrings("auto", resolveBackendChoice("auto", "auto"));
+}
+
+test "pickBackend(\"native\") returns a working backend through the vtable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const picked = try pickBackend(a, "native", .{}, null);
+    try std.testing.expectEqualStrings("native", picked.desc);
+    try std.testing.expectEqual(backend.Kind.native, picked.b.kind);
+
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var handle = try picked.b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    defer picked.b.teardownJob(a, &handle);
+    var err_msg: ?[]const u8 = null;
+    const step = ir.Step{ .id = "s", .name = "s", .kind = .run, .script = "echo via-pickbackend" };
+    const out = try picked.b.runStep(a, &handle, step, &.{}, null, &err_msg);
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "via-pickbackend") != null);
 }
 
 test "secrets file parses k=v with comments" {
@@ -183,6 +262,13 @@ pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs
             i += 1;
             if (i >= args.len) return error.BadArgs;
             r.secret_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--backend")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            if (!isValidBackendName(args[i])) return error.BadArgs;
+            r.backend = args[i];
+        } else if (std.mem.eql(u8, arg, "--pull")) {
+            r.pull = true;
         } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
             // Any other `-`/`--`-prefixed token (single-dash unknowns included,
             // e.g. `-x`) is an unrecognized flag, not a positional file path.
@@ -194,6 +280,111 @@ pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs
     r.env = try env.toOwnedSlice(alloc);
     r.matrix = try matrix.toOwnedSlice(alloc);
     return r;
+}
+
+const backend_names = [_][]const u8{ "native", "docker", "podman", "nix", "auto" };
+
+fn isValidBackendName(name: []const u8) bool {
+    for (backend_names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// Pure precedence for the effective `--backend` choice: an explicit
+/// non-"auto" CLI flag always wins; otherwise a non-"auto" config value
+/// wins; otherwise "auto" (pickBackend probes docker at run time).
+pub fn resolveBackendChoice(cli_choice: []const u8, cfg_backend: []const u8) []const u8 {
+    if (!std.mem.eql(u8, cli_choice, "auto")) return cli_choice;
+    if (!std.mem.eql(u8, cfg_backend, "auto")) return cfg_backend;
+    return "auto";
+}
+
+pub const PickedBackend = struct { b: backend.Backend, desc: []const u8 };
+
+fn dockerDefaultSocket() []const u8 {
+    return if (builtin.os.tag == .windows) "\\\\.\\pipe\\docker_engine" else "/var/run/docker.sock";
+}
+
+/// Ordered podman socket candidates: an explicit config override first, then
+/// podman's own XDG-runtime-dir and system-wide sockets, then the plain
+/// docker default as a last resort (podman also speaks the docker-compatible
+/// API, sometimes exposed there).
+fn podmanCandidates(alloc: std.mem.Allocator, cfg: config.Config) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    if (cfg.docker_socket) |s| try list.append(alloc, s);
+    if (std.process.getEnvVarOwned(alloc, "XDG_RUNTIME_DIR") catch null) |xdg| {
+        try list.append(alloc, try std.fmt.allocPrint(alloc, "{s}/podman/podman.sock", .{xdg}));
+    }
+    try list.append(alloc, "/run/podman/podman.sock");
+    try list.append(alloc, dockerDefaultSocket());
+    return list.toOwnedSlice(alloc);
+}
+
+/// Resolves `choice` ("native"|"docker"|"podman"|"nix"|"auto") into a live
+/// `backend.Backend` plus a human-readable description for the "backend:
+/// <desc>" line runMain prints. On failure (docker/podman socket
+/// unreachable, nix missing) prints an actionable `error: ...` line itself
+/// and returns `error.BackendUnavailable` — callers just map that to exit 3.
+///
+/// Docker/nix backend instances are allocated via `alloc.create` rather than
+/// held on the stack, so the vtable's `ctx` pointer stays valid for the
+/// whole run: `alloc` must be an arena (or otherwise outlive the returned
+/// `Backend`), matching how `runMain` is invoked from `main()`.
+pub fn pickBackend(alloc: std.mem.Allocator, choice: []const u8, cfg: config.Config, log: ?backend.LogFn) !PickedBackend {
+    if (std.mem.eql(u8, choice, "native")) {
+        return .{ .b = backend.native(), .desc = "native" };
+    }
+    if (std.mem.eql(u8, choice, "docker")) {
+        const socket = client.detectSocket(alloc, cfg).?;
+        const cl = client.Client{ .socket_path = socket };
+        if (!client.ping(alloc, cl)) {
+            _ = try print(try std.fmt.allocPrint(alloc, "error: docker socket not reachable at {s} \xe2\x80\x94 is Docker running? (or pass --backend native)\n", .{socket}));
+            return error.BackendUnavailable;
+        }
+        const db = try alloc.create(docker_backend.DockerBackend);
+        db.* = .{ .client = cl, .cfg = cfg };
+        return .{ .b = db.backend(), .desc = try std.fmt.allocPrint(alloc, "docker ({s})", .{socket}) };
+    }
+    if (std.mem.eql(u8, choice, "podman")) {
+        const candidates = try podmanCandidates(alloc, cfg);
+        for (candidates) |socket| {
+            const cl = client.Client{ .socket_path = socket };
+            if (client.ping(alloc, cl)) {
+                const db = try alloc.create(docker_backend.DockerBackend);
+                db.* = .{ .client = cl, .cfg = cfg };
+                return .{ .b = db.backend(), .desc = try std.fmt.allocPrint(alloc, "podman ({s})", .{socket}) };
+            }
+        }
+        _ = try print("error: podman socket not reachable \xe2\x80\x94 is Podman running? (or pass --backend native)\n");
+        return error.BackendUnavailable;
+    }
+    if (std.mem.eql(u8, choice, "nix")) {
+        if (!nix_backend.nixAvailable(alloc)) {
+            const wsl_hint = if (builtin.os.tag == .windows) " \xe2\x80\x94 Nix requires WSL2 on Windows" else "";
+            _ = try print(try std.fmt.allocPrint(alloc, "error: nix not found on PATH \xe2\x80\x94 is Nix installed?{s} (or pass --backend native)\n", .{wsl_hint}));
+            return error.BackendUnavailable;
+        }
+        const nb = try alloc.create(nix_backend.NixBackend);
+        nb.* = .{ .cfg = cfg };
+        return .{ .b = nb.backend(), .desc = "nix" };
+    }
+    if (std.mem.eql(u8, choice, "auto")) {
+        const socket = client.detectSocket(alloc, cfg).?;
+        const cl = client.Client{ .socket_path = socket };
+        if (client.ping(alloc, cl)) {
+            if (log) |l| l("auto: docker available, using docker");
+            const db = try alloc.create(docker_backend.DockerBackend);
+            db.* = .{ .client = cl, .cfg = cfg };
+            return .{ .b = db.backend(), .desc = try std.fmt.allocPrint(alloc, "docker ({s})", .{socket}) };
+        }
+        if (log) |l| l("auto: docker unavailable, using native");
+        return .{ .b = backend.native(), .desc = "native" };
+    }
+    // Unreachable via the CLI — parseRunArgs/parseLintArgs validate
+    // `--backend` before it ever gets here — but a `.jalan/config` file's
+    // `backend=` value isn't validated on load, so a stray typo there must
+    // fail safely rather than silently picking an unintended backend.
+    _ = try print(try std.fmt.allocPrint(alloc, "error: unknown backend '{s}' (want native|docker|podman|nix|auto)\n", .{choice}));
+    return error.BackendUnavailable;
 }
 
 fn anyJobRan(jobs: []const engine.JobResult) bool {
@@ -280,10 +471,10 @@ fn help() !u8 {
         \\jalan — local CI simulator
         \\
         \\usage:
-        \\  jalan lint [file] [--json] [--strict]
+        \\  jalan lint [file] [--json] [--strict] [--backend <name>]
         \\  jalan run [file] [-j <job>] [--step <id>] [--dry-run] [--env K=V]...
         \\            [--secret-file <path>] [--matrix k=v]... [--max-parallel N]
-        \\            [--strict] [--no-color]
+        \\            [--strict] [--no-color] [--backend <name>] [--pull]
         \\  jalan version
         \\  jalan help
         \\
@@ -331,6 +522,14 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
     }
     if (ra.strict and diags.list.items.len > 0) return 2;
 
+    const cfg = try config.load(alloc);
+    const backend_choice = resolveBackendChoice(ra.backend, cfg.backend);
+    const picked = pickBackend(alloc, backend_choice, cfg, &logToStderr) catch |e| switch (e) {
+        error.BackendUnavailable => return 3, // message already printed by pickBackend
+        else => return e,
+    };
+    _ = try print(try std.fmt.allocPrint(alloc, "backend: {s}\n", .{picked.desc}));
+
     var secrets: []ir.EnvPair = &.{};
     if (ra.secret_file) |sf| {
         const text = std.fs.cwd().readFileAlloc(alloc, sf, 1024 * 1024) catch {
@@ -354,6 +553,8 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         .secrets = secrets,
         .matrix_filter = ra.matrix,
         .log = &logToStderr,
+        .exec_backend = picked.b,
+        .force_pull = ra.pull,
     }) catch |e| switch (e) {
         error.InternalError => {
             _ = try print("internal error: engine failed\n");
@@ -485,6 +686,14 @@ test "parseLintArgs rejects unrecognized flags but accepts known flags and file"
     try std.testing.expect(la.json);
     try std.testing.expect(la.strict);
     try std.testing.expectEqualStrings("wf.yml", la.file.?);
+}
+
+test "parseLintArgs accepts --backend, validates the name, defaults to auto" {
+    const la = try parseLintArgs(&[_][]const u8{ "--backend", "docker", "wf.yml" });
+    try std.testing.expectEqualStrings("docker", la.backend);
+    try std.testing.expectEqualStrings("auto", (try parseLintArgs(&[_][]const u8{"wf.yml"})).backend);
+    try std.testing.expectError(error.BadArgs, parseLintArgs(&[_][]const u8{ "--backend", "bogus" }));
+    try std.testing.expectError(error.BadArgs, parseLintArgs(&[_][]const u8{"--backend"}));
 }
 
 test "detect provider by path and content" {
