@@ -48,13 +48,11 @@ test "lower workflow to pipeline IR" {
     try std.testing.expectEqualStrings("github.ref == 'refs/heads/main'", build.steps[1].cond.?);
     // needs scalar form
     try std.testing.expectEqualStrings("build", p.jobs[1].needs[0]);
-    // uses step lowered with warning
+    // uses step lowered without a warning — phase 2 executes uses steps
     try std.testing.expectEqual(ir.StepKind.uses, p.jobs[1].steps[0].kind);
-    var warned = false;
     for (diags.list.items) |d| {
-        if (std.mem.startsWith(u8, d.msg, "warning: ")) warned = true;
+        try std.testing.expect(!std.mem.startsWith(u8, d.msg, "warning: "));
     }
-    try std.testing.expect(warned);
 }
 
 test "bad if expression is a hard diagnostic" {
@@ -856,8 +854,6 @@ fn lowerStep(
     }
     if (run_node == null and uses_node == null)
         try diags.add(n.line, n.col, "step needs 'run' or 'uses'", .{});
-    if (uses_node != null)
-        try addWarn(diags, n.line, n.col, "'uses' actions are not executed in phase 1 (skipped at runtime)", .{});
 
     const script = if (run_node) |r| r.scalarOr("") else "";
     const uses_ref = if (uses_node) |u| u.scalarOr("") else "";
