@@ -206,14 +206,14 @@ fn runUsesDepth(
 
     // `actions/setup-node`/`setup-python`/`setup-go` on the nix backend are
     // intercepted the same way builtins are — before ref resolution/network
-    // — since nix's default package set (or `Config.nix_packages`) already
-    // covers what these actions would otherwise install. On other backends
-    // they fall through to the normal node-action path below (and are
-    // subject to the container JS cut there, same as any other JS action).
+    // — appending the mapped nix package to `handle.nix_packages` so
+    // `NixBackend.run` actually picks it up for subsequent steps (see
+    // `nixSetupIntercept`). On other backends they fall through to the
+    // normal node-action path below (and are subject to the container JS
+    // cut there, same as any other JS action).
     if (b.kind == .nix) {
-        if (nixSetupActionKind(step.uses_ref)) |_| {
-            if (opts_log) |l| l("setup action mapped to nix packages");
-            return .{ .exit_code = 0, .stdout = "", .stderr = "", .outputs = &.{} };
+        if (nixSetupMatch(step.uses_ref)) |m| {
+            return nixSetupIntercept(alloc, handle, m, opts_log);
         }
     }
 
@@ -255,23 +255,54 @@ fn runUsesDepth(
             break :blk runDockerImageAction(alloc, meta.image["docker://".len..], with, meta.input_defaults, b, handle, opts_log, err_msg);
         },
         else => blk: {
-            err_msg.* = try std.fmt.allocPrint(alloc, "action type '{s}' lands in Task 12", .{meta.using});
+            err_msg.* = try std.fmt.allocPrint(alloc, "unsupported action type '{s}'", .{meta.using});
             break :blk error.SpawnFailed;
         },
     };
 }
 
+const NixSetupMatch = struct { short_name: []const u8, package: []const u8 };
+
 /// Matches a `uses:` ref (before the `@ref` suffix) against the setup-*
-/// actions jalan intercepts on the nix backend. Returns the matched action
-/// path purely for callers that want it logged/tested; `null` when
+/// actions jalan intercepts on the nix backend, returning both the short
+/// display name (for logging) and the nix package it maps to. `null` when
 /// `uses_ref` isn't one of these three.
-fn nixSetupActionKind(uses_ref: []const u8) ?[]const u8 {
+fn nixSetupMatch(uses_ref: []const u8) ?NixSetupMatch {
     const at = std.mem.indexOfScalar(u8, uses_ref, '@') orelse uses_ref.len;
     const path = uses_ref[0..at];
-    if (std.mem.eql(u8, path, "actions/setup-node")) return path;
-    if (std.mem.eql(u8, path, "actions/setup-python")) return path;
-    if (std.mem.eql(u8, path, "actions/setup-go")) return path;
+    if (std.mem.eql(u8, path, "actions/setup-node")) return .{ .short_name = "setup-node", .package = "nodejs_20" };
+    if (std.mem.eql(u8, path, "actions/setup-python")) return .{ .short_name = "setup-python", .package = "python3" };
+    if (std.mem.eql(u8, path, "actions/setup-go")) return .{ .short_name = "setup-go", .package = "go" };
     return null;
+}
+
+fn containsStr(list: []const []const u8, s: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, s)) return true;
+    return false;
+}
+
+/// Appends `m.package` to `handle.nix_packages` (per-job, arena-allocated —
+/// never touches `NixBackend.cfg`, which is shared across jobs running in
+/// parallel; see `JobHandle.nix_packages`'s doc comment) unless it's already
+/// there, and logs what actually happened so the log line is never a claim
+/// jalan didn't back up. `NixBackend.run` picks the result up via
+/// `effectivePackages` on the next step in this job.
+fn nixSetupIntercept(alloc: std.mem.Allocator, handle: *backend.JobHandle, m: NixSetupMatch, opts_log: ?backend.LogFn) !backend.StepOutcome {
+    const already = containsStr(handle.nix_packages, m.package);
+    if (!already) {
+        var list: std.ArrayList([]const u8) = .empty;
+        try list.appendSlice(alloc, handle.nix_packages);
+        try list.append(alloc, m.package);
+        handle.nix_packages = try list.toOwnedSlice(alloc);
+    }
+    if (opts_log) |l| {
+        const msg = if (already)
+            try std.fmt.allocPrint(alloc, "{s}: nix package '{s}' already present", .{ m.short_name, m.package })
+        else
+            try std.fmt.allocPrint(alloc, "{s}: added nix package '{s}' for subsequent steps", .{ m.short_name, m.package });
+        l(msg);
+    }
+    return .{ .exit_code = 0, .stdout = "", .stderr = "", .outputs = &.{} };
 }
 
 /// Builds the `INPUT_<NAME>` env pairs a node/docker-image action sees:
@@ -869,5 +900,38 @@ test "setup-node is intercepted on the nix backend without needing nix installed
     const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(Capture.msg != null);
-    try std.testing.expectEqualStrings("setup action mapped to nix packages", Capture.msg.?);
+    try std.testing.expectEqualStrings("setup-node: added nix package 'nodejs_20' for subsequent steps", Capture.msg.?);
+    try std.testing.expectEqual(@as(usize, 1), h.nix_packages.len);
+    try std.testing.expectEqualStrings("nodejs_20", h.nix_packages[0]);
+}
+
+test "setup-python on nix actually appends to handle.nix_packages, no duplicate on repeat" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var nb = nix_backend.NixBackend{};
+    const b = nb.backend();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "actions/setup-python@v5" };
+    var env = expr.Env{};
+
+    const out1 = try runUses(a, step, &.{}, b, &h, &env, null, false, &em);
+    try std.testing.expectEqual(@as(i32, 0), out1.exit_code);
+    try std.testing.expectEqual(@as(usize, 1), h.nix_packages.len);
+    try std.testing.expect(containsStr(h.nix_packages, "python3"));
+
+    // Second interception for the same job must not duplicate the package.
+    const Capture = struct {
+        var msg: ?[]const u8 = null;
+        fn log(line: []const u8) void {
+            msg = line;
+        }
+    };
+    Capture.msg = null;
+    const out2 = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    try std.testing.expectEqual(@as(i32, 0), out2.exit_code);
+    try std.testing.expectEqual(@as(usize, 1), h.nix_packages.len);
+    try std.testing.expectEqualStrings("setup-python: nix package 'python3' already present", Capture.msg.?);
 }

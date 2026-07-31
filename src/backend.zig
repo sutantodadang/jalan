@@ -16,6 +16,14 @@ pub const JobHandle = struct {
     network_id: []const u8 = "",
     service_ids: []const []const u8 = &.{},
     workspace: []const u8 = "",
+    /// Extra nix packages this job needs on top of `NixBackend.cfg`'s own
+    /// (`Config.nix_packages`/`default_packages`) — populated by `runUses`'s
+    /// `setup-node`/`setup-python`/`setup-go` interception on the nix
+    /// backend. Per-job and arena-allocated, never written into `cfg`:
+    /// `cfg` is shared across parallel jobs (see `RunOptions.exec_backend`),
+    /// so mutating it from one job's step would leak into every other job
+    /// running concurrently.
+    nix_packages: []const []const u8 = &.{},
 };
 
 pub const LogFn = *const fn (line: []const u8) void;

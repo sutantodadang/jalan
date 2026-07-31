@@ -80,6 +80,28 @@ fn setup(_: *anyopaque, _: std.mem.Allocator, job: ir.Job, workspace_abs: []cons
 
 fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_iface.JobHandle) void {}
 
+fn containsPkg(list: []const []const u8, name: []const u8) bool {
+    for (list) |p| if (std.mem.eql(u8, p, name)) return true;
+    return false;
+}
+
+/// Pure merge: `cfg_packages` (or `default_packages` when empty) plus any
+/// `handle_packages` not already in that set — dedupes so a step that runs
+/// after two different `setup-*` interceptions (or a `setup-*` whose package
+/// happens to already be in `cfg_packages`) doesn't pass `nix shell` the
+/// same `nixpkgs#foo` argument twice. `handle_packages` come from
+/// `JobHandle.nix_packages` (see its doc comment) — kept out of `cfg` itself
+/// since `cfg` is shared across parallel jobs.
+pub fn effectivePackages(alloc: std.mem.Allocator, cfg_packages: []const []const u8, handle_packages: []const []const u8) ![]const []const u8 {
+    const base = if (cfg_packages.len > 0) cfg_packages else &default_packages;
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.appendSlice(alloc, base);
+    for (handle_packages) |p| {
+        if (!containsPkg(out.items, p)) try out.append(alloc, p);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// Mirrors `backend/native.zig`'s `runStep`: write the step script to
 /// `.jalan/tmp`, build an env map (inherited + step env + CI markers +
 /// GITHUB_OUTPUT), spawn, parse `GITHUB_OUTPUT` back into `outputs`, clean up
@@ -87,8 +109,9 @@ fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_iface.JobHandle) vo
 /// <script>` instead of a bare shell invocation) plus the experimental-
 /// features retry. ~30 lines of duplication vs. native, acceptable for phase
 /// 2 — a shared helper is a good follow-up once a third backend needs it.
-fn run(ctx: *anyopaque, alloc: std.mem.Allocator, _: *backend_iface.JobHandle, step: ir.Step, env: []const ir.EnvPair, workdir: ?[]const u8, err_msg: *?[]const u8) anyerror!backend_iface.StepOutcome {
+fn run(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHandle, step: ir.Step, env: []const ir.EnvPair, workdir: ?[]const u8, err_msg: *?[]const u8) anyerror!backend_iface.StepOutcome {
     const self: *NixBackend = @ptrCast(@alignCast(ctx));
+    const packages = effectivePackages(alloc, self.cfg.nix_packages, handle.nix_packages) catch return error.OutOfMemory;
 
     std.fs.cwd().makePath(".jalan/tmp") catch {
         err_msg.* = "cannot create .jalan/tmp";
@@ -132,7 +155,7 @@ fn run(ctx: *anyopaque, alloc: std.mem.Allocator, _: *backend_iface.JobHandle, s
     };
 
     const shell_cmd: []const []const u8 = &.{ "bash", abs_script };
-    const argv = buildArgv(alloc, self.cfg.nix_packages, shell_cmd) catch return error.OutOfMemory;
+    const argv = buildArgv(alloc, packages, shell_cmd) catch return error.OutOfMemory;
 
     var result = std.process.Child.run(.{
         .allocator = alloc,
@@ -150,7 +173,7 @@ fn run(ctx: *anyopaque, alloc: std.mem.Allocator, _: *backend_iface.JobHandle, s
     };
 
     if (code != 0 and std.mem.indexOf(u8, result.stderr, "experimental") != null) {
-        const retry_argv = buildArgvExperimental(alloc, self.cfg.nix_packages, shell_cmd) catch return error.OutOfMemory;
+        const retry_argv = buildArgvExperimental(alloc, packages, shell_cmd) catch return error.OutOfMemory;
         result = std.process.Child.run(.{
             .allocator = alloc,
             .argv = retry_argv,
@@ -222,6 +245,43 @@ test "buildArgv: empty packages fall back to default_packages" {
     try std.testing.expectEqualStrings("nixpkgs#coreutils", argv[3]);
     try std.testing.expectEqualStrings("nixpkgs#nodejs_20", argv[4]);
     try std.testing.expectEqualStrings("--command", argv[5]);
+}
+
+test "effectivePackages: cfg + handle packages merge into buildArgv, deduped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const merged = try effectivePackages(a, &.{"bash"}, &.{"python3"});
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+    try std.testing.expectEqualStrings("bash", merged[0]);
+    try std.testing.expectEqualStrings("python3", merged[1]);
+
+    const argv = try buildArgv(a, merged, &.{ "echo", "hi" });
+    var saw_bash = false;
+    var saw_python = false;
+    for (argv) |arg| {
+        if (std.mem.eql(u8, arg, "nixpkgs#bash")) saw_bash = true;
+        if (std.mem.eql(u8, arg, "nixpkgs#python3")) saw_python = true;
+    }
+    try std.testing.expect(saw_bash);
+    try std.testing.expect(saw_python);
+}
+
+test "effectivePackages: handle package already in cfg is not duplicated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const merged = try effectivePackages(a, &.{ "bash", "python3" }, &.{"python3"});
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+}
+
+test "effectivePackages: empty cfg falls back to default_packages before merging" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const merged = try effectivePackages(a, &.{}, &.{"python3"});
+    try std.testing.expectEqual(@as(usize, default_packages.len + 1), merged.len);
+    try std.testing.expectEqualStrings("python3", merged[merged.len - 1]);
 }
 
 test "setupJob warns and skips when job has services or container" {
