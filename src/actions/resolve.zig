@@ -149,6 +149,15 @@ pub fn fetch(alloc: std.mem.Allocator, gh: Ref.Github, force_pull: bool, log: ?b
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(&gz_source, .gzip, &window);
 
+    // Forced re-pull (or a leftover partial download) may leave stale files
+    // that the new tarball no longer contains; start from a clean dir so
+    // extraction reflects exactly what's in the tarball.
+    if (dirExists(dir)) {
+        std.fs.cwd().deleteTree(dir) catch |e| {
+            err_msg.* = try std.fmt.allocPrint(alloc, "clearing stale cache dir {s} failed: {s}", .{ dir, @errorName(e) });
+            return e;
+        };
+    }
     std.fs.cwd().makePath(dir) catch |e| {
         err_msg.* = try std.fmt.allocPrint(alloc, "creating cache dir {s} failed: {s}", .{ dir, @errorName(e) });
         return e;
