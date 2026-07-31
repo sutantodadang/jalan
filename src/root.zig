@@ -6,6 +6,7 @@ pub const gha = @import("frontend/gha.zig");
 pub const native = @import("backend/native.zig");
 pub const engine = @import("engine.zig");
 pub const cli = @import("cli.zig");
+pub const config = @import("config.zig");
 
 test {
     _ = yaml;
@@ -15,5 +16,6 @@ test {
     _ = native;
     _ = engine;
     _ = cli;
+    _ = config;
     _ = @import("golden_test.zig");
 }
