@@ -57,14 +57,61 @@ const Parser = struct {
     }
 
     fn parseValueText(self: *Parser, text: []const u8, no: u32, col: u32) ParseError!Node {
-        _ = self;
-        return .{ .line = no, .col = col, .data = .{ .scalar = std.mem.trim(u8, text, " ") } };
+        const t = std.mem.trim(u8, text, " ");
+        if (t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']') {
+            var items: std.ArrayList(Node) = .empty;
+            var it = std.mem.splitScalar(u8, t[1 .. t.len - 1], ',');
+            while (it.next()) |part| {
+                const p = std.mem.trim(u8, part, " ");
+                if (p.len == 0) continue;
+                try items.append(self.alloc, try self.parseValueText(p, no, col));
+            }
+            return .{ .line = no, .col = col, .data = .{ .seq = try items.toOwnedSlice(self.alloc) } };
+        }
+        if (t.len >= 2 and t[0] == '"' and t[t.len - 1] == '"')
+            return .{ .line = no, .col = col, .data = .{ .scalar = try unescapeDouble(self.alloc, t[1 .. t.len - 1]) } };
+        if (t.len >= 2 and t[0] == '\'' and t[t.len - 1] == '\'')
+            return .{ .line = no, .col = col, .data = .{ .scalar = t[1 .. t.len - 1] } };
+        return .{ .line = no, .col = col, .data = .{ .scalar = t } };
     }
 
     fn parseBlock(self: *Parser, min_indent: u32) ParseError!Node {
         const first = self.peek() orelse
             return .{ .line = 0, .col = 0, .data = .{ .scalar = "" } };
+        if (std.mem.startsWith(u8, first.text, "- ") or std.mem.eql(u8, first.text, "-"))
+            return self.parseSeqBlock(first.indent, min_indent);
         return self.parseMapBlock(first.indent, min_indent);
+    }
+
+    fn parseSeqBlock(self: *Parser, base_indent: u32, min_indent: u32) ParseError!Node {
+        var items: std.ArrayList(Node) = .empty;
+        const start = self.peek().?;
+        while (self.peek()) |ln| {
+            if (ln.indent != base_indent or ln.indent < min_indent) break;
+            if (!std.mem.startsWith(u8, ln.text, "-")) break;
+            const rest = std.mem.trim(u8, ln.text[1..], " ");
+            if (rest.len == 0) {
+                self.idx += 1;
+                try items.append(self.alloc, try self.parseBlock(base_indent + 1));
+            } else if (findKeyColon(rest) != null or std.mem.startsWith(u8, rest, "-")) {
+                // Re-enter the item's remainder as a virtual deeper line so
+                // `- key: v` merges with following lines indented past the dash.
+                self.lines[self.idx] = .{ .indent = base_indent + 2, .text = rest, .no = ln.no };
+                try items.append(self.alloc, try self.parseBlock(base_indent + 1));
+            } else {
+                // Plain scalar item: `- build` (no colon, no nested seq).
+                var off: usize = 1;
+                while (off < ln.text.len and ln.text[off] == ' ') off += 1;
+                const item_col = ln.indent + @as(u32, @intCast(off)) + 1;
+                self.idx += 1;
+                try items.append(self.alloc, try self.parseValueText(rest, ln.no, item_col));
+            }
+        }
+        return .{
+            .line = start.no,
+            .col = base_indent + 1,
+            .data = .{ .seq = try items.toOwnedSlice(self.alloc) },
+        };
     }
 
     fn parseMapBlock(self: *Parser, base_indent: u32, min_indent: u32) ParseError!Node {
@@ -110,6 +157,24 @@ const Parser = struct {
         return .{ .line = start.no, .col = start.indent + 1, .data = .{ .map = m } };
     }
 };
+
+fn unescapeDouble(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\' and i + 1 < s.len) {
+            i += 1;
+            try out.append(alloc, switch (s[i]) {
+                'n' => '\n',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                else => s[i],
+            });
+        } else try out.append(alloc, s[i]);
+    }
+    return out.toOwnedSlice(alloc);
+}
 
 /// Colon that terminates a key: first ':' followed by space/EOL, outside quotes.
 fn findKeyColon(text: []const u8) ?usize {
@@ -217,4 +282,52 @@ test "tab indentation is a diagnostic" {
     var diags = Diags.init(a);
     _ = parse(a, "jobs:\n\tbuild: x", &diags) catch {};
     try std.testing.expect(diags.list.items.len > 0);
+}
+
+test "parse block sequence of scalars" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a,
+        \\needs:
+        \\  - build
+        \\  - lint
+    , &diags);
+    const seq = root.get("needs").?.data.seq;
+    try std.testing.expectEqual(@as(usize, 2), seq.len);
+    try std.testing.expectEqualStrings("lint", seq[1].data.scalar);
+}
+
+test "parse sequence of mappings (steps shape)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a,
+        \\steps:
+        \\  - name: hello
+        \\    run: echo hi
+        \\  - run: echo two
+    , &diags);
+    const steps = root.get("steps").?.data.seq;
+    try std.testing.expectEqual(@as(usize, 2), steps.len);
+    try std.testing.expectEqualStrings("echo hi", steps[0].get("run").?.data.scalar);
+    try std.testing.expectEqualStrings("echo two", steps[1].get("run").?.data.scalar);
+}
+
+test "flow sequence and quoted scalars" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a,
+        \\os: [ubuntu-latest, "windows-latest"]
+        \\msg: "line\nbreak"
+        \\lit: 'no \n escape'
+    , &diags);
+    const os = root.get("os").?.data.seq;
+    try std.testing.expectEqualStrings("windows-latest", os[1].data.scalar);
+    try std.testing.expectEqualStrings("line\nbreak", root.get("msg").?.data.scalar);
+    try std.testing.expectEqualStrings("no \\n escape", root.get("lit").?.data.scalar);
 }
