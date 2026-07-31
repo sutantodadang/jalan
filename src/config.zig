@@ -24,8 +24,9 @@ pub fn parse(alloc: std.mem.Allocator, text: []const u8) !Config {
         const line = std.mem.trim(u8, raw, " \r\t");
         if (line.len == 0 or line[0] == '#') continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = line[0..eq];
-        const val = line[eq + 1 ..];
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (val.len == 0) continue;
         if (std.mem.eql(u8, key, "backend")) {
             c.backend = val;
         } else if (std.mem.eql(u8, key, "docker.socket")) {
@@ -75,6 +76,30 @@ test "empty text yields defaults" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const c = try parse(arena.allocator(), "");
+    try std.testing.expectEqualStrings("auto", c.backend);
+    try std.testing.expect(c.docker_socket == null);
+}
+
+test "empty value leaves field unset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const c = try parse(arena.allocator(), "docker.socket=\n");
+    try std.testing.expect(c.docker_socket == null);
+}
+
+test "whitespace around key and value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const c = try parse(arena.allocator(), "backend = docker");
+    try std.testing.expectEqualStrings("docker", c.backend);
+}
+
+test "load defaults when file missing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Attempt to delete the file to ensure it doesn't exist.
+    std.fs.cwd().deleteFile(".jalan/config") catch {};
+    const c = try load(arena.allocator());
     try std.testing.expectEqualStrings("auto", c.backend);
     try std.testing.expect(c.docker_socket == null);
 }
