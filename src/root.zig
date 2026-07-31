@@ -15,4 +15,5 @@ test {
     _ = native;
     _ = engine;
     _ = cli;
+    _ = @import("golden_test.zig");
 }

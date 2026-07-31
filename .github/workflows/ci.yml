@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: zig build test
+      - run: zig build
+      - name: jalan lints its own workflow
+        run: ./zig-out/bin/jalan lint .github/workflows/ci.yml
+        if: runner.os != 'Windows'
+      - name: jalan lints its own workflow (windows)
+        run: ./zig-out/bin/jalan.exe lint .github/workflows/ci.yml
+        if: runner.os == 'Windows'
