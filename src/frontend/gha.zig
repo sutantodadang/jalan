@@ -222,6 +222,91 @@ test "no container key leaves container_image empty" {
     try std.testing.expectEqualStrings("", p.jobs[0].container_image);
 }
 
+test "services: scalar value lowers to service image, no env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    services:
+        \\      redis: redis:7-alpine
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 1), p.jobs[0].services.len);
+    try std.testing.expectEqualStrings("redis", p.jobs[0].services[0].name);
+    try std.testing.expectEqualStrings("redis:7-alpine", p.jobs[0].services[0].image);
+    try std.testing.expectEqual(@as(usize, 0), p.jobs[0].services[0].env.len);
+}
+
+test "services: map form with image and env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    services:
+        \\      redis:
+        \\        image: redis:7-alpine
+        \\        env:
+        \\          FOO: bar
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqualStrings("redis", p.jobs[0].services[0].name);
+    try std.testing.expectEqualStrings("redis:7-alpine", p.jobs[0].services[0].image);
+    try std.testing.expectEqualStrings("FOO", p.jobs[0].services[0].env[0].name);
+    try std.testing.expectEqualStrings("bar", p.jobs[0].services[0].env[0].value);
+}
+
+test "services: map form missing image is a hard diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    services:
+        \\      redis:
+        \\        env:
+        \\          FOO: bar
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    try std.testing.expectError(error.ParseFailed, parseWorkflow(a, "x.yml", src, &diags));
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "service 'redis' has no image") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "services key is recognized, no unknown-key warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    services:
+        \\      redis: redis:7-alpine
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    _ = try parseWorkflow(a, "x.yml", src, &diags);
+    for (diags.list.items) |d| {
+        try std.testing.expect(std.mem.indexOf(u8, d.msg, "'services'") == null);
+    }
+}
+
 test "validation diagnostics carry real source line numbers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -406,6 +491,39 @@ fn envPairs(alloc: std.mem.Allocator, node: ?yaml.Node) ![]ir.EnvPair {
     return out.toOwnedSlice(alloc);
 }
 
+/// Lowers a `services:` map. Each entry's value is either a scalar (the
+/// image ref directly) or a map with a required `image:` key and optional
+/// `env:` map. A map entry with no (or empty) `image:` is a hard diagnostic
+/// — a service jalan can't start isn't worth silently dropping.
+fn lowerServices(alloc: std.mem.Allocator, node: ?yaml.Node, diags: *yaml.Diags) ![]ir.Service {
+    var out: std.ArrayList(ir.Service) = .empty;
+    if (node) |n| switch (n.data) {
+        .map => |m| {
+            var it = m.iterator();
+            while (it.next()) |e| {
+                const name = e.key_ptr.*;
+                const v = e.value_ptr.*;
+                var image: []const u8 = "";
+                var env: []ir.EnvPair = &.{};
+                switch (v.data) {
+                    .scalar => |s| image = s,
+                    .map => {
+                        image = if (v.get("image")) |img| img.scalarOr("") else "";
+                        env = try envPairs(alloc, v.get("env"));
+                    },
+                    .seq => {},
+                }
+                if (image.len == 0) {
+                    try diags.add(v.line, v.col, "service '{s}' has no image", .{name});
+                }
+                try out.append(alloc, .{ .name = name, .image = image, .env = env });
+            }
+        },
+        else => {},
+    };
+    return out.toOwnedSlice(alloc);
+}
+
 fn needsList(alloc: std.mem.Allocator, node: ?yaml.Node) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     if (node) |n| switch (n.data) {
@@ -436,7 +554,7 @@ fn condText(alloc: std.mem.Allocator, raw: []const u8, line: u32, diags: *yaml.D
 //   anything else        -> genuinely unknown key; "not supported in phase 1" warning.
 const workflow_supported_keys = [_][]const u8{ "name", "on", "env", "defaults", "jobs" };
 const workflow_known_unsupported_keys = [_][]const u8{ "permissions", "concurrency", "run-name" };
-const job_supported_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults", "container" };
+const job_supported_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults", "container", "services" };
 const job_known_unsupported_keys = [_][]const u8{ "if", "outputs", "continue-on-error", "timeout-minutes", "environment", "concurrency", "permissions" };
 // 'with' is added conditionally by lowerStep: supported on `uses` steps only.
 const step_supported_keys = [_][]const u8{ "name", "id", "run", "uses", "shell", "env", "if", "working-directory", "continue-on-error", "timeout-minutes" };
@@ -639,6 +757,7 @@ fn lowerJob(
         .steps = try steps.toOwnedSlice(alloc),
         .src_line = jn.line,
         .container_image = container_image,
+        .services = try lowerServices(alloc, jn.get("services"), diags),
     };
 }
 

@@ -216,6 +216,46 @@ pub fn networkRemove(alloc: std.mem.Allocator, c: Client, id: []const u8, err: *
     _ = try apiCall(alloc, c, .{ .method = "DELETE", .path = path }, err);
 }
 
+/// Pure parse of a `GET {prefix}/containers/{id}/json` body down to the
+/// container's health status. `null` means the image has no `HEALTHCHECK`
+/// configured (no `State.Health` object at all) — the caller should treat
+/// that as "nothing to wait for", not as an error.
+fn parseHealthStatus(alloc: std.mem.Allocator, body: []const u8) !?[]const u8 {
+    const Parsed = struct {
+        State: struct {
+            Health: ?struct { Status: []const u8 } = null,
+        } = .{},
+    };
+    const parsed = std.json.parseFromSliceLeaky(Parsed, alloc, body, .{ .ignore_unknown_fields = true }) catch return error.DockerApi;
+    if (parsed.State.Health) |h| return h.Status;
+    return null;
+}
+
+/// `GET {prefix}/containers/{id}/json`, returning just the health status
+/// (`.State.Health.Status`), or `null` if the container has no health check
+/// configured at all.
+pub fn containerInspectHealth(alloc: std.mem.Allocator, c: Client, id: []const u8, err: *?[]const u8) !?[]const u8 {
+    const path = try std.fmt.allocPrint(alloc, "{s}/containers/{s}/json", .{ api_prefix, id });
+    const resp = try apiCall(alloc, c, .{ .method = "GET", .path = path }, err);
+    return parseHealthStatus(alloc, resp.body);
+}
+
+test "parseHealthStatus: no Health object returns null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const status = try parseHealthStatus(a, "{\"State\":{\"Running\":true}}");
+    try std.testing.expectEqual(@as(?[]const u8, null), status);
+}
+
+test "parseHealthStatus: Health present returns Status" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const status = try parseHealthStatus(a, "{\"State\":{\"Health\":{\"Status\":\"healthy\"}}}");
+    try std.testing.expectEqualStrings("healthy", status.?);
+}
+
 /// `PUT {prefix}/containers/{id}/archive?path=<url-encoded>`: uploads a tar
 /// stream (see `tarSingleFile`) to be extracted at `path_in_container`.
 pub fn putArchive(alloc: std.mem.Allocator, c: Client, id: []const u8, path_in_container: []const u8, tar_bytes: []const u8, err: *?[]const u8) !void {

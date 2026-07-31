@@ -91,27 +91,82 @@ fn formatEnvPairs(alloc: std.mem.Allocator, pairs: []const ir.EnvPair, extra: []
     return out;
 }
 
-/// Builds the JSON body for `POST /containers/create`: the sleep-infinity
-/// long-lived container that job steps get exec'd into.
-fn buildContainerCreateSpec(alloc: std.mem.Allocator, image: []const u8, env: []const []const u8, workspace_abs: []const u8, network_id: ?[]const u8) ![]u8 {
-    const bind_source = try toBindSource(alloc, workspace_abs);
+/// Builds the JSON body for `POST /containers/create`. Shared by the
+/// long-lived job container (sleep-infinity, workspace bind mount, joins
+/// `network_id` with no alias of its own) and per-job service containers
+/// (image's own default command, no bind, joins `network_id` under
+/// `aliases` so the job container can reach it by service name).
+///
+/// - `cmd` null means "use the image's own ENTRYPOINT/CMD" (services);
+///   non-null overrides it (job container: `&.{"sleep","infinity"}`).
+/// - `workspace_abs` null skips the `Binds`/`WorkingDir` workspace mount
+///   (services don't need the repo checked out into them).
+/// - `network_id` non-null sets `HostConfig.NetworkMode` so the container
+///   actually joins that network at creation time.
+/// - `aliases` non-empty (only meaningful alongside `network_id`) adds
+///   `NetworkingConfig.EndpointsConfig.<network_id>.Aliases`, the DNS names
+///   other containers on the network can reach this one by.
+fn buildContainerCreateSpec(
+    alloc: std.mem.Allocator,
+    image: []const u8,
+    cmd: ?[]const []const u8,
+    env: []const []const u8,
+    workspace_abs: ?[]const u8,
+    network_id: ?[]const u8,
+    aliases: []const []const u8,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(alloc, "{\"Image\":");
     try jsonStrAppend(&out, alloc, image);
-    try out.appendSlice(alloc, ",\"Cmd\":[\"sleep\",\"infinity\"],\"Env\":[");
+    if (cmd) |c| {
+        try out.appendSlice(alloc, ",\"Cmd\":[");
+        for (c, 0..) |arg, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try jsonStrAppend(&out, alloc, arg);
+        }
+        try out.append(alloc, ']');
+    }
+    try out.appendSlice(alloc, ",\"Env\":[");
     for (env, 0..) |kv, i| {
         if (i > 0) try out.append(alloc, ',');
         try jsonStrAppend(&out, alloc, kv);
     }
-    try out.appendSlice(alloc, "],\"HostConfig\":{\"Binds\":[");
-    const bind = try std.fmt.allocPrint(alloc, "{s}:/github/workspace", .{bind_source});
-    try jsonStrAppend(&out, alloc, bind);
     try out.append(alloc, ']');
+
+    try out.appendSlice(alloc, ",\"HostConfig\":{");
+    var host_field_written = false;
+    if (workspace_abs) |ws| {
+        const bind_source = try toBindSource(alloc, ws);
+        try out.appendSlice(alloc, "\"Binds\":[");
+        const bind = try std.fmt.allocPrint(alloc, "{s}:/github/workspace", .{bind_source});
+        try jsonStrAppend(&out, alloc, bind);
+        try out.append(alloc, ']');
+        host_field_written = true;
+    }
     if (network_id) |nid| {
-        try out.appendSlice(alloc, ",\"NetworkMode\":");
+        if (host_field_written) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "\"NetworkMode\":");
         try jsonStrAppend(&out, alloc, nid);
     }
-    try out.appendSlice(alloc, "},\"WorkingDir\":\"/github/workspace\"}");
+    try out.append(alloc, '}');
+
+    if (workspace_abs != null) {
+        try out.appendSlice(alloc, ",\"WorkingDir\":\"/github/workspace\"");
+    }
+
+    if (network_id) |nid| {
+        if (aliases.len > 0) {
+            try out.appendSlice(alloc, ",\"NetworkingConfig\":{\"EndpointsConfig\":{");
+            try jsonStrAppend(&out, alloc, nid);
+            try out.appendSlice(alloc, ":{\"Aliases\":[");
+            for (aliases, 0..) |al, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try jsonStrAppend(&out, alloc, al);
+            }
+            try out.appendSlice(alloc, "]}}}");
+        }
+    }
+    try out.append(alloc, '}');
     return out.toOwnedSlice(alloc);
 }
 
@@ -144,6 +199,44 @@ const vtable = backend_iface.Backend.VTable{
     .teardownJob = teardown,
 };
 
+/// Best-effort teardown of whatever service containers + network got
+/// created before a later step in `setup` failed (or during normal
+/// `teardownJob`). Errors are swallowed — this only runs when something has
+/// already gone wrong (or the job is ending), and a cleanup failure
+/// shouldn't mask the original error or crash teardown.
+fn cleanupServicesAndNetwork(alloc: std.mem.Allocator, c: client.Client, service_ids: []const []const u8, network_id: []const u8) void {
+    for (service_ids) |sid| {
+        var e: ?[]const u8 = null;
+        client.containerRemove(alloc, c, sid, &e) catch {};
+    }
+    if (network_id.len > 0) {
+        var e: ?[]const u8 = null;
+        client.networkRemove(alloc, c, network_id, &e) catch {};
+    }
+}
+
+/// Polls a just-started service container's health status. No `HEALTHCHECK`
+/// configured (`containerInspectHealth` returns `null`) means there's
+/// nothing to wait for — proceed immediately. Otherwise polls at 1s
+/// intervals for up to 60 attempts; a container that never reports
+/// `"healthy"` logs a warning and is left running rather than failing the
+/// job (some images take longer than 60s, or never report healthy under a
+/// constrained CI runner — that's a warning, not a hard failure).
+fn waitForHealth(alloc: std.mem.Allocator, c: client.Client, id: []const u8, name: []const u8, log: ?backend_iface.LogFn) void {
+    var err: ?[]const u8 = null;
+    var attempt: usize = 0;
+    while (attempt < 60) : (attempt += 1) {
+        const status = client.containerInspectHealth(alloc, c, id, &err) catch return;
+        if (status == null) return;
+        if (std.mem.eql(u8, status.?, "healthy")) return;
+        std.Thread.sleep(std.time.ns_per_s);
+    }
+    if (log) |l| {
+        const msg = std.fmt.allocPrint(alloc, "service '{s}' not healthy after 60s \xe2\x80\x94 continuing", .{name}) catch return;
+        l(msg);
+    }
+}
+
 fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: []const u8, log: ?backend_iface.LogFn) anyerror!backend_iface.JobHandle {
     const self: *DockerBackend = @ptrCast(@alignCast(ctx));
     const image = imageFor(self.cfg, job);
@@ -164,20 +257,63 @@ fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: 
         };
     }
 
+    var network_id: []const u8 = "";
+    var service_ids: std.ArrayList([]const u8) = .empty;
+
+    if (job.services.len > 0) {
+        const net_name = try std.fmt.allocPrint(alloc, "jalan-{s}-{x:0>8}", .{ try sanitizeStepId(alloc, job.id), std.crypto.random.int(u32) });
+        network_id = client.networkCreate(alloc, self.client, net_name, &err) catch |e| {
+            if (log) |l| if (err) |m| l(m);
+            return e;
+        };
+
+        for (job.services) |svc| {
+            const svc_exists = client.imageExists(alloc, self.client, svc.image, &err) catch |e| {
+                if (log) |l| if (err) |m| l(m);
+                cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
+                return e;
+            };
+            if (!svc_exists) {
+                client.imagePull(alloc, self.client, svc.image, log, &err) catch |e| {
+                    if (log) |l| if (err) |m| l(m);
+                    cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
+                    return e;
+                };
+            }
+            const svc_env = try formatEnvPairs(alloc, svc.env, &.{});
+            const svc_spec = try buildContainerCreateSpec(alloc, svc.image, null, svc_env, null, network_id, &.{svc.name});
+            const svc_id = client.containerCreate(alloc, self.client, svc_spec, null, &err) catch |e| {
+                if (log) |l| if (err) |m| l(m);
+                cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
+                return e;
+            };
+            try service_ids.append(alloc, svc_id);
+            client.containerStart(alloc, self.client, svc_id, &err) catch |e| {
+                if (log) |l| if (err) |m| l(m);
+                cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
+                return e;
+            };
+            waitForHealth(alloc, self.client, svc_id, svc.name, log);
+        }
+    }
+
     const container_env = try formatEnvPairs(alloc, job.env, &.{ "CI=true", "GITHUB_ACTIONS=true", "JALAN=true" });
-    const spec = try buildContainerCreateSpec(alloc, image, container_env, workspace_abs, null);
+    const job_network: ?[]const u8 = if (network_id.len > 0) network_id else null;
+    const spec = try buildContainerCreateSpec(alloc, image, &.{ "sleep", "infinity" }, container_env, workspace_abs, job_network, &.{});
     const id = client.containerCreate(alloc, self.client, spec, null, &err) catch |e| {
         if (log) |l| if (err) |m| l(m);
+        cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
         return e;
     };
     client.containerStart(alloc, self.client, id, &err) catch |e| {
         if (log) |l| if (err) |m| l(m);
         var cleanup_err: ?[]const u8 = null;
         client.containerRemove(alloc, self.client, id, &cleanup_err) catch {};
+        cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
         return e;
     };
 
-    return .{ .container_id = id, .workspace = workspace_abs };
+    return .{ .container_id = id, .workspace = workspace_abs, .network_id = network_id, .service_ids = try service_ids.toOwnedSlice(alloc) };
 }
 
 fn run(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHandle, step: ir.Step, env: []const ir.EnvPair, workdir: ?[]const u8, err_msg: *?[]const u8) anyerror!backend_iface.StepOutcome {
@@ -227,10 +363,7 @@ fn teardown(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.Jo
         var err: ?[]const u8 = null;
         client.containerRemove(alloc, self.client, handle.container_id, &err) catch {};
     }
-    if (handle.network_id.len > 0) {
-        var err: ?[]const u8 = null;
-        client.networkRemove(alloc, self.client, handle.network_id, &err) catch {};
-    }
+    cleanupServicesAndNetwork(alloc, self.client, handle.service_ids, handle.network_id);
 }
 
 test "imageFor: container_image beats cfg map beats default" {
@@ -306,7 +439,7 @@ test "buildContainerCreateSpec embeds image, workspace bind, and env" {
     defer arena.deinit();
     const a = arena.allocator();
     const workspace = "/home/user/proj";
-    const spec = try buildContainerCreateSpec(a, "node:20-bookworm-slim", &.{"CI=true"}, workspace, null);
+    const spec = try buildContainerCreateSpec(a, "node:20-bookworm-slim", &.{ "sleep", "infinity" }, &.{"CI=true"}, workspace, null, &.{});
     const raw_bind = try std.fmt.allocPrint(a, "{s}:/github/workspace", .{try toBindSource(a, workspace)});
     // jsonStrAppend escapes backslashes (Windows bind sources can contain
     // them); build the same escaped form so this assertion works on both OSes.
@@ -320,6 +453,19 @@ test "buildContainerCreateSpec embeds image, workspace bind, and env" {
     try std.testing.expect(std.mem.indexOf(u8, spec, expected_bind) != null);
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"CI=true\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"WorkingDir\":\"/github/workspace\"") != null);
+}
+
+test "buildContainerCreateSpec includes NetworkMode and Aliases when network_id and aliases are set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const spec = try buildContainerCreateSpec(a, "redis:7-alpine", null, &.{}, null, "net123", &.{"redis"});
+    try std.testing.expect(std.mem.indexOf(u8, spec, "\"NetworkMode\":\"net123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, spec, "\"NetworkingConfig\":{\"EndpointsConfig\":{\"net123\":{\"Aliases\":[\"redis\"]}}}") != null);
+    // service spec: no Cmd override (uses image default), no workspace bind.
+    try std.testing.expect(std.mem.indexOf(u8, spec, "\"Cmd\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, spec, "\"Binds\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, spec, "\"WorkingDir\"") == null);
 }
 
 test "parseOutputs parses k=v lines, ignores blanks and malformed lines" {
@@ -354,4 +500,24 @@ test "docker backend runs a two-step job sharing filesystem (skips without daemo
     const s2 = ir.Step{ .id = "b", .name = "b", .kind = .run, .shell = "sh", .script = "cat /tmp/marker" };
     const o2 = try b.runStep(a, &h, s2, &.{}, null, &em);
     try std.testing.expect(std.mem.indexOf(u8, o2.stdout, "one") != null);
+}
+
+test "docker backend service is reachable by DNS alias on the job network (skips without daemon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cl = client.Client{ .socket_path = client.detectSocket(a, .{}).? };
+    if (!client.ping(a, cl)) return error.SkipZigTest;
+    var db = DockerBackend{ .client = cl, .cfg = .{ .image_map = @constCast(&[_]config.ImagePair{.{ .runs_on = "ubuntu-latest", .image = "busybox:latest" }}) } };
+    const b = db.backend();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var services = [_]ir.Service{.{ .name = "redis", .image = "redis:7-alpine" }};
+    var h = try b.setupJob(a, .{ .id = "svc-job", .display_name = "svc-job", .runs_on = "ubuntu-latest", .steps = &.{}, .services = &services }, cwd, null);
+    defer b.teardownJob(a, &h);
+    try std.testing.expect(h.network_id.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), h.service_ids.len);
+    var em: ?[]const u8 = null;
+    const s = ir.Step{ .id = "dns", .name = "dns", .kind = .run, .shell = "sh", .script = "getent hosts redis || nslookup redis" };
+    const o = try b.runStep(a, &h, s, &.{}, null, &em);
+    try std.testing.expectEqual(@as(i32, 0), o.exit_code);
 }

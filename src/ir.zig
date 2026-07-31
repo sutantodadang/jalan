@@ -27,6 +27,12 @@ pub const Step = struct {
     src_line: u32 = 0,
 };
 
+pub const Service = struct {
+    name: []const u8,
+    image: []const u8,
+    env: []EnvPair = &.{},
+};
+
 pub const Job = struct {
     id: []const u8,
     display_name: []const u8,
@@ -37,6 +43,7 @@ pub const Job = struct {
     steps: []Step,
     src_line: u32 = 0,
     container_image: []const u8 = "",
+    services: []Service = &.{},
 };
 
 pub const Pipeline = struct {
