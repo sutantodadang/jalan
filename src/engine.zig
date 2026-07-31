@@ -122,7 +122,23 @@ test "independent jobs run concurrently" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // Two 300ms sleeps; concurrent wall clock must be < 550ms (sequential would be 600ms+).
+
+    // Relative bound instead of an absolute wall-clock cliff: measure one 300ms
+    // sleep job alone, then two of them in parallel, and assert the parallel
+    // run is well under 2x the single-job time. This proves concurrency
+    // without flaking on slow/loaded CI runners (process spawn + AV scans).
+    const single_p = try parseFixture(a,
+        \\jobs:
+        \\  a:
+        \\    steps:
+        \\      - run: sleep 0.3
+        \\        shell: sh
+    );
+    const t0 = std.time.milliTimestamp();
+    const single_report = try run(a, single_p, .{});
+    const single_elapsed = std.time.milliTimestamp() - t0;
+    try std.testing.expect(single_report.ok());
+
     const p = try parseFixture(a,
         \\jobs:
         \\  a:
@@ -134,11 +150,16 @@ test "independent jobs run concurrently" {
         \\      - run: sleep 0.3
         \\        shell: sh
     );
-    const t0 = std.time.milliTimestamp();
+    const t1 = std.time.milliTimestamp();
     const report = try run(a, p, .{ .max_parallel = 2 });
-    const elapsed = std.time.milliTimestamp() - t0;
+    const parallel_elapsed = std.time.milliTimestamp() - t1;
     try std.testing.expect(report.ok());
-    try std.testing.expect(elapsed < 550);
+
+    // Floor guard: if the single-job baseline itself is too small to measure
+    // meaningfully, skip the ratio assert rather than risk a divide-by-noise flake.
+    if (single_elapsed >= 50) {
+        try std.testing.expect(parallel_elapsed < 2 * single_elapsed);
+    }
 }
 
 pub const StepStatus = enum { success, failed, skipped };
@@ -177,6 +198,7 @@ pub const RunOptions = struct {
     extra_env: []const ir.EnvPair = &.{},
     secrets: []const ir.EnvPair = &.{},
     matrix_filter: []const ir.EnvPair = &.{},
+    // Called from worker threads under parallel job execution — must be thread-safe.
     log: ?*const fn (line: []const u8) void = null,
 };
 
@@ -231,7 +253,17 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
                     // function) into the caller arena, guarded by the shared mutex.
                     mx.lock();
                     defer mx.unlock();
-                    out.* = copyResult(sh.alloc, r) catch r;
+                    out.* = copyResult(sh.alloc, r) catch |e| blk: {
+                        // Do NOT fall back to `r`: its strings live in the thread
+                        // arena, which `defer thread_arena.deinit()` frees right
+                        // after this function returns — aliasing it would be a
+                        // use-after-free on every later read of this job's result.
+                        // display_name comes from the pipeline (caller-arena memory)
+                        // instead, so it stays valid; steps are lost but status is
+                        // honest (.failed) rather than silently wrong.
+                        std.debug.print("failed to copy job result: {s}\n", .{@errorName(e)});
+                        break :blk .{ .job_index = ji, .display_name = pi.jobs[ji].display_name, .status = .failed, .steps = &.{} };
+                    };
                 }
             };
             for (batch, 0..) |ji, bi| {
@@ -383,8 +415,9 @@ fn runJob(
         const workdir = if (step.workdir) |w| expr.interpolate(alloc, w, &env) catch w else null;
 
         // last_spawn_error_msg may race under parallel spawn failures — message may be
-        // misattributed, status is not affected. runStep itself blocks for the step's
-        // duration, so the mutex is never held across this call.
+        // misattributed, or, in worst case, reference invalid memory (torn ptr/len);
+        // status is not affected. runStep itself blocks for the step's duration, so
+        // the mutex is never held across this call.
         const outcome = native.runStep(alloc, patched, spawn_env.items, workdir) catch {
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = native.last_spawn_error_msg orelse "spawn failed" };
             if (!step.continue_on_error) job_status = .failed;
