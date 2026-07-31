@@ -87,6 +87,37 @@ test "if condition false skips step; dry run executes nothing" {
     try std.testing.expectEqual(@as(usize, 0), dry.jobs[0].steps[1].stdout.len);
 }
 
+test "spawn failure (unknown shell) respects continue-on-error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p_cont = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - run: echo unreachable
+        \\        shell: nosuchshell
+        \\        continue-on-error: true
+        \\      - run: echo ok
+    );
+    const report = try run(a, p_cont, .{});
+    try std.testing.expectEqual(StepStatus.failed, report.jobs[0].steps[0].status);
+    try std.testing.expectEqual(StepStatus.success, report.jobs[0].steps[1].status);
+    try std.testing.expectEqual(JobStatus.success, report.jobs[0].status);
+
+    const p_fail = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - run: echo unreachable
+        \\        shell: nosuchshell
+        \\      - run: echo ok
+    );
+    const report2 = try run(a, p_fail, .{});
+    try std.testing.expectEqual(StepStatus.failed, report2.jobs[0].steps[0].status);
+    try std.testing.expectEqual(JobStatus.failed, report2.jobs[0].status);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -257,7 +288,7 @@ fn runJob(
 
         const outcome = native.runStep(alloc, patched, spawn_env.items, workdir) catch {
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = native.last_spawn_error_msg orelse "spawn failed" };
-            job_status = .failed;
+            if (!step.continue_on_error) job_status = .failed;
             continue;
         };
         const dur: u64 = @intCast(@max(std.time.milliTimestamp() - t0, 0));
