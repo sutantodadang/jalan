@@ -334,7 +334,10 @@ pub fn pickBackend(alloc: std.mem.Allocator, choice: []const u8, cfg: config.Con
         return .{ .b = backend.native(), .desc = "native" };
     }
     if (std.mem.eql(u8, choice, "docker")) {
-        const socket = client.detectSocket(alloc, cfg).?;
+        const socket = client.detectSocket(alloc, cfg) orelse {
+            _ = try print("error: no docker socket path could be determined\n");
+            return error.BackendUnavailable;
+        };
         const cl = client.Client{ .socket_path = socket };
         if (!client.ping(alloc, cl)) {
             _ = try print(try std.fmt.allocPrint(alloc, "error: docker socket not reachable at {s} \xe2\x80\x94 is Docker running? (or pass --backend native)\n", .{socket}));
@@ -368,13 +371,17 @@ pub fn pickBackend(alloc: std.mem.Allocator, choice: []const u8, cfg: config.Con
         return .{ .b = nb.backend(), .desc = "nix" };
     }
     if (std.mem.eql(u8, choice, "auto")) {
-        const socket = client.detectSocket(alloc, cfg).?;
-        const cl = client.Client{ .socket_path = socket };
-        if (client.ping(alloc, cl)) {
-            if (log) |l| l("auto: docker available, using docker");
-            const db = try alloc.create(docker_backend.DockerBackend);
-            db.* = .{ .client = cl, .cfg = cfg };
-            return .{ .b = db.backend(), .desc = try std.fmt.allocPrint(alloc, "docker ({s})", .{socket}) };
+        // No socket path determinable is treated the same as "docker not
+        // reachable" here: auto's whole point is graceful degradation, so it
+        // falls back to native rather than erroring.
+        if (client.detectSocket(alloc, cfg)) |socket| {
+            const cl = client.Client{ .socket_path = socket };
+            if (client.ping(alloc, cl)) {
+                if (log) |l| l("auto: docker available, using docker");
+                const db = try alloc.create(docker_backend.DockerBackend);
+                db.* = .{ .client = cl, .cfg = cfg };
+                return .{ .b = db.backend(), .desc = try std.fmt.allocPrint(alloc, "docker ({s})", .{socket}) };
+            }
         }
         if (log) |l| l("auto: docker unavailable, using native");
         return .{ .b = backend.native(), .desc = "native" };
