@@ -61,7 +61,7 @@ pub const NixBackend = struct {
     cfg: config.Config = .{},
 
     pub fn backend(self: *NixBackend) backend_iface.Backend {
-        return .{ .ctx = @ptrCast(self), .vtable = &vtable };
+        return .{ .ctx = @ptrCast(self), .vtable = &vtable, .kind = .nix };
     }
 };
 

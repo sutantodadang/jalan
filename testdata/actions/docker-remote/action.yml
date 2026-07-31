@@ -1,0 +1,5 @@
+name: docker-remote
+description: A docker:// image action, for the non-docker-backend skip test.
+runs:
+  using: docker
+  image: docker://alpine:3

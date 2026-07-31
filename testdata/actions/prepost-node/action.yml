@@ -1,0 +1,6 @@
+name: prepost-node
+description: A node action declaring pre/post entrypoints jalan does not execute.
+runs:
+  using: node20
+  main: index.js
+  pre: pre.js

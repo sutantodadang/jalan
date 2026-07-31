@@ -1,15 +1,21 @@
-//! Action runner: `action.yml` parsing, composite-action execution, and the
-//! small set of GitHub-hosted actions jalan simulates natively (`builtin_*`)
-//! instead of fetching + running their real (often Node-based) code.
+//! Action runner: `action.yml` parsing, composite/node/docker-image action
+//! execution, and the small set of GitHub-hosted actions jalan simulates
+//! natively (`builtin_*`) instead of fetching + running their real (often
+//! Node-based) code.
 //!
 //! `runUses` is the single dispatch entry point for a `uses:` step. Builtins
 //! are matched on `step.uses_ref` *before* any ref resolution/network access
 //! happens — `actions/checkout`, `actions/upload-artifact`, and
-//! `actions/download-artifact` never hit `resolve.fetch`. Everything else is
-//! resolved (local path or GitHub tarball) and its `action.yml` is parsed to
-//! decide `composite` vs. `node`/`docker` — the latter two are Task 12's
-//! job; this task returns a clear placeholder error for them so `classify`
-//! (via `runUses`) already reports the right shape of failure.
+//! `actions/download-artifact` never hit `resolve.fetch`; `setup-node`/
+//! `setup-python`/`setup-go` are intercepted the same way, but only on the
+//! nix backend. Everything else is resolved (local path or GitHub tarball,
+//! or the ref itself for a bare `docker://...`) and classified (`classify`)
+//! by its `action.yml`'s `runs.using` (or the ref, for `docker://`) into
+//! `composite`, `node`, or `docker_image`. Phase 2 ships all three, with
+//! explicit, logged scope cuts rather than silent no-ops: remote JS actions
+//! and `docker://` actions both require specific backends (see
+//! `runNodeAction`/`runDockerImageAction`), Dockerfile-built actions and
+//! `runs.pre`/`runs.post` aren't executed at all.
 const std = @import("std");
 const yaml = @import("../yaml.zig");
 const ir = @import("../ir.zig");
@@ -17,15 +23,37 @@ const expr = @import("../expr.zig");
 const backend = @import("../backend.zig");
 const resolve = @import("resolve.zig");
 const gha = @import("../frontend/gha.zig");
+const nix_backend = @import("../backend/nix.zig");
 
 pub const ActionKind = enum {
     composite,
     node,
     docker_image,
+    unsupported,
     builtin_checkout,
     builtin_upload_artifact,
     builtin_download_artifact,
 };
+
+/// Pure dispatch selection for a resolved `uses:` step: what kind of action
+/// `runUsesDepth` should treat this as, given the parsed `action.yml`'s
+/// `runs.using` and the resolved ref. A `docker://` ref always wins
+/// regardless of `using` — GitHub itself never reads `action.yml` for a
+/// `docker://`-prefixed `uses:` line, there is no `action.yml` to read.
+/// `using: docker` (with a local/github ref, backed by an `action.yml` with
+/// an `image:` field) also classifies as `docker_image`; the Dockerfile-vs-
+/// `docker://` distinction lives in the `image:` value, not here — that's
+/// `runUsesDepth`'s job once it has `meta.image` in hand. Anything else
+/// (`unsupported`) covers actions this task doesn't ship: unknown/missing
+/// `using` values (e.g. `node12`, a typo, or a composite/action.yml this
+/// parser never populated `using` for).
+pub fn classify(meta_using: []const u8, ref: resolve.Ref) ActionKind {
+    if (ref == .docker_image) return .docker_image;
+    if (std.mem.eql(u8, meta_using, "composite")) return .composite;
+    if (std.mem.eql(u8, meta_using, "node20") or std.mem.eql(u8, meta_using, "node16")) return .node;
+    if (std.mem.eql(u8, meta_using, "docker")) return .docker_image;
+    return .unsupported;
+}
 
 /// `INPUT_` + uppercased name with spaces turned into underscores, matching
 /// how GitHub Actions exposes `with:` values as env vars to `node`/`docker`
@@ -42,14 +70,22 @@ pub fn inputEnvName(alloc: std.mem.Allocator, input: []const u8) ![]const u8 {
 pub const ActionMeta = struct {
     using: []const u8,
     main: []const u8 = "",
+    /// `runs.image` — only meaningful when `using == "docker"`. A
+    /// `docker://...` value runs as-is; anything else (`Dockerfile`, a
+    /// relative path) means a build-from-source action, out of phase-2 scope.
+    image: []const u8 = "",
+    /// `runs.pre` / `runs.post` presence — phase 2 never executes either;
+    /// `runUsesDepth` logs a warning and continues when set.
+    has_pre: bool = false,
+    has_post: bool = false,
     steps: []yaml.Node = &.{},
     input_defaults: []ir.EnvPair = &.{},
 };
 
 /// Reads and parses `<dir>/action.yml` (falling back to `action.yaml`) into
-/// an `ActionMeta`: `runs.using`, `runs.main`, `runs.steps`, and one
-/// `input_defaults` entry per top-level `inputs.<k>` that declares a
-/// `default:`.
+/// an `ActionMeta`: `runs.using`, `runs.main`, `runs.image`, `runs.pre`/
+/// `runs.post` presence, `runs.steps`, and one `input_defaults` entry per
+/// top-level `inputs.<k>` that declares a `default:`.
 pub fn parseActionYaml(alloc: std.mem.Allocator, dir: []const u8, diags: *yaml.Diags) !ActionMeta {
     const source = try readActionSource(alloc, dir);
     const root = try yaml.parse(alloc, source, diags);
@@ -60,6 +96,7 @@ pub fn parseActionYaml(alloc: std.mem.Allocator, dir: []const u8, diags: *yaml.D
     };
     const using = if (runs.get("using")) |u| u.scalarOr("") else "";
     const main = if (runs.get("main")) |m| m.scalarOr("") else "";
+    const image = if (runs.get("image")) |m| m.scalarOr("") else "";
     var steps: []yaml.Node = &.{};
     if (runs.get("steps")) |sn| switch (sn.data) {
         .seq => |items| steps = items,
@@ -81,6 +118,9 @@ pub fn parseActionYaml(alloc: std.mem.Allocator, dir: []const u8, diags: *yaml.D
     return .{
         .using = using,
         .main = main,
+        .image = image,
+        .has_pre = runs.get("pre") != null,
+        .has_post = runs.get("post") != null,
         .steps = steps,
         .input_defaults = try defaults.toOwnedSlice(alloc),
     };
@@ -164,14 +204,28 @@ fn runUsesDepth(
         };
     }
 
+    // `actions/setup-node`/`setup-python`/`setup-go` on the nix backend are
+    // intercepted the same way builtins are — before ref resolution/network
+    // — since nix's default package set (or `Config.nix_packages`) already
+    // covers what these actions would otherwise install. On other backends
+    // they fall through to the normal node-action path below (and are
+    // subject to the container JS cut there, same as any other JS action).
+    if (b.kind == .nix) {
+        if (nixSetupActionKind(step.uses_ref)) |_| {
+            if (opts_log) |l| l("setup action mapped to nix packages");
+            return .{ .exit_code = 0, .stdout = "", .stderr = "", .outputs = &.{} };
+        }
+    }
+
     const ref = resolve.parseRef(step.uses_ref) catch |e| {
         err_msg.* = try std.fmt.allocPrint(alloc, "bad uses ref '{s}': {s}", .{ step.uses_ref, @errorName(e) });
         return error.SpawnFailed;
     };
 
+    // A bare `uses: docker://image` has no `action.yml` to read — the ref
+    // itself *is* the whole action.
     if (ref == .docker_image) {
-        err_msg.* = "action type 'docker' lands in Task 12";
-        return error.SpawnFailed;
+        return runDockerImageAction(alloc, ref.docker_image, with, &.{}, b, handle, opts_log, err_msg);
     }
 
     const dir = switch (ref) {
@@ -186,11 +240,154 @@ fn runUsesDepth(
         return error.SpawnFailed;
     };
 
-    if (std.mem.eql(u8, meta.using, "composite"))
-        return runComposite(alloc, meta, with, b, handle, env, opts_log, force_pull, err_msg, depth);
+    if (meta.has_pre or meta.has_post) {
+        if (opts_log) |l| l("action pre/post entrypoints are not executed (phase 2 scope)");
+    }
 
-    err_msg.* = try std.fmt.allocPrint(alloc, "action type '{s}' lands in Task 12", .{meta.using});
-    return error.SpawnFailed;
+    return switch (classify(meta.using, ref)) {
+        .composite => runComposite(alloc, meta, with, b, handle, env, opts_log, force_pull, err_msg, depth),
+        .node => runNodeAction(alloc, meta, dir, ref, with, b, handle, opts_log, err_msg),
+        .docker_image => blk: {
+            if (!std.mem.startsWith(u8, meta.image, "docker://")) {
+                if (opts_log) |l| l("Dockerfile-based actions are not supported (docker build is out of phase-2 scope)");
+                break :blk .{ .exit_code = 0, .stdout = "", .stderr = "", .outputs = &.{} };
+            }
+            break :blk runDockerImageAction(alloc, meta.image["docker://".len..], with, meta.input_defaults, b, handle, opts_log, err_msg);
+        },
+        else => blk: {
+            err_msg.* = try std.fmt.allocPrint(alloc, "action type '{s}' lands in Task 12", .{meta.using});
+            break :blk error.SpawnFailed;
+        },
+    };
+}
+
+/// Matches a `uses:` ref (before the `@ref` suffix) against the setup-*
+/// actions jalan intercepts on the nix backend. Returns the matched action
+/// path purely for callers that want it logged/tested; `null` when
+/// `uses_ref` isn't one of these three.
+fn nixSetupActionKind(uses_ref: []const u8) ?[]const u8 {
+    const at = std.mem.indexOfScalar(u8, uses_ref, '@') orelse uses_ref.len;
+    const path = uses_ref[0..at];
+    if (std.mem.eql(u8, path, "actions/setup-node")) return path;
+    if (std.mem.eql(u8, path, "actions/setup-python")) return path;
+    if (std.mem.eql(u8, path, "actions/setup-go")) return path;
+    return null;
+}
+
+/// Builds the `INPUT_<NAME>` env pairs a node/docker-image action sees:
+/// `defaults` first (only when `with` doesn't already override that input),
+/// then every `with` entry — giving `with` precedence, matching GitHub
+/// Actions' own default-vs-explicit-input semantics, and (unlike relying on
+/// each backend's own env-map overwrite order) works identically regardless
+/// of how a given backend happens to apply a list with duplicate keys.
+fn buildInputEnv(alloc: std.mem.Allocator, with: []const ir.EnvPair, defaults: []const ir.EnvPair) ![]ir.EnvPair {
+    var out: std.ArrayList(ir.EnvPair) = .empty;
+    for (defaults) |d| {
+        if (withGet(with, d.name) != null) continue;
+        try out.append(alloc, .{ .name = try inputEnvName(alloc, d.name), .value = d.value });
+    }
+    for (with) |w|
+        try out.append(alloc, .{ .name = try inputEnvName(alloc, w.name), .value = w.value });
+    return out.toOwnedSlice(alloc);
+}
+
+/// `node20`/`node16` action: runs `node "<abs main path>"` through the
+/// backend's own `runStep` as a synthetic `.run` step (env = `INPUT_*` from
+/// `with`/defaults; `GITHUB_OUTPUT` is added by the backend's `runStep`
+/// itself, same as any other step).
+///
+/// SCOPE CUT (explicit, logged, never silent): JS actions run on the NATIVE
+/// and NIX backends (host `node`), and on the DOCKER backend only when the
+/// action is local to the workspace (a `./`-prefixed `uses:` ref) — its
+/// files are already inside the bind-mounted workspace, so no extra copy is
+/// needed. A *remote* (github-fetched) action's directory lives in jalan's
+/// host-side cache, outside the container entirely; making it visible would
+/// need `putArchive`-ing the whole action directory into the container on
+/// every step, which is phase 2.1 scope. Remote JS actions on the docker
+/// backend warn and skip (exit 0) instead of failing the job outright.
+fn runNodeAction(
+    alloc: std.mem.Allocator,
+    meta: ActionMeta,
+    dir: []const u8,
+    ref: resolve.Ref,
+    with: []const ir.EnvPair,
+    b: backend.Backend,
+    handle: *backend.JobHandle,
+    opts_log: ?backend.LogFn,
+    err_msg: *?[]const u8,
+) !backend.StepOutcome {
+    if (b.kind == .docker and ref != .local) {
+        if (opts_log) |l| l("remote JS actions inside containers land in phase 2.1 — run with --backend native for this workflow");
+        return .{ .exit_code = 0, .stdout = "", .stderr = "", .outputs = &.{} };
+    }
+    if (meta.main.len == 0) {
+        err_msg.* = "action.yml missing 'main' for a node action";
+        return error.SpawnFailed;
+    }
+
+    const abs_main = resolveMainPath(alloc, b, dir, meta.main) catch |e| {
+        err_msg.* = try std.fmt.allocPrint(alloc, "resolving action main '{s}/{s}' failed: {s}", .{ dir, meta.main, @errorName(e) });
+        return error.SpawnFailed;
+    };
+    const script = try std.fmt.allocPrint(alloc, "node \"{s}\"", .{abs_main});
+    const env_pairs = try buildInputEnv(alloc, with, meta.input_defaults);
+    const run_step = ir.Step{ .id = "uses-node", .name = "uses-node", .kind = .run, .script = script };
+    return b.runStep(alloc, handle, run_step, env_pairs, null, err_msg);
+}
+
+/// Resolves `runs.main` to the path `node` should be invoked with. On
+/// native/nix, `node` runs on the host — a real host-filesystem realpath.
+/// On docker (only reached for a local, workspace-relative action; see
+/// `runNodeAction`'s scope-cut comment), `node` runs *inside* the container,
+/// where the workspace is bind-mounted at `/github/workspace` — so the path
+/// is built by hand from the (already-verified-local) `./`-relative `dir`,
+/// not resolved against the host filesystem at all.
+fn resolveMainPath(alloc: std.mem.Allocator, b: backend.Backend, dir: []const u8, main: []const u8) ![]const u8 {
+    if (b.kind == .docker) {
+        const rel = if (std.mem.startsWith(u8, dir, "./")) dir[2..] else dir;
+        return std.fmt.allocPrint(alloc, "/github/workspace/{s}/{s}", .{ rel, main });
+    }
+    const joined = try std.fs.path.join(alloc, &.{ dir, main });
+    return std.fs.cwd().realpathAlloc(alloc, joined);
+}
+
+/// `docker://image` action (either a bare `uses: docker://...` ref, or
+/// `using: docker` with `image: docker://...` in `action.yml`): docker
+/// backend only, via the optional `runContainerAction` vtable entry — a
+/// one-shot container (create/start/wait/logs/remove), never the job's own
+/// long-lived container. `Cmd` comes from `with.args` split on whitespace
+/// when present (GitHub Actions' own `args:` -> container args mapping);
+/// `env_pairs` are `INPUT_*` from `with`/`defaults` via `buildInputEnv`.
+/// Non-docker backends warn and skip (exit 0) — this cut is checked via the
+/// vtable itself (`null` on native/nix) rather than `b.kind`, since that's
+/// the one fact that actually determines whether the call would work.
+fn runDockerImageAction(
+    alloc: std.mem.Allocator,
+    image: []const u8,
+    with: []const ir.EnvPair,
+    defaults: []const ir.EnvPair,
+    b: backend.Backend,
+    handle: *backend.JobHandle,
+    opts_log: ?backend.LogFn,
+    err_msg: *?[]const u8,
+) !backend.StepOutcome {
+    if (b.vtable.runContainerAction == null) {
+        if (opts_log) |l| l("docker:// actions require --backend docker");
+        return .{ .exit_code = 0, .stdout = "", .stderr = "", .outputs = &.{} };
+    }
+
+    var cmd_args: []const []const u8 = &.{};
+    if (withGet(with, "args")) |args_str| {
+        var list: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, args_str, ' ');
+        while (it.next()) |tok| {
+            if (tok.len > 0) try list.append(alloc, tok);
+        }
+        cmd_args = try list.toOwnedSlice(alloc);
+    }
+    const env_pairs = try buildInputEnv(alloc, with, defaults);
+
+    return b.runContainerAction(alloc, handle, image, cmd_args, env_pairs, err_msg);
 }
 
 fn setInputsEnv(alloc: std.mem.Allocator, env: *expr.Env, with: []const ir.EnvPair, defaults: []const ir.EnvPair) !void {
@@ -479,4 +676,198 @@ test "composite short-circuits on first failing step (no continue-on-error)" {
     const out = try runUses(a, step, &.{}, b, &h, &env, null, false, &em);
     try std.testing.expectEqual(@as(i32, 3), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "MARKER_SHOULD_NOT_APPEAR") == null);
+}
+
+test "classify: docker:// ref wins regardless of using" {
+    const docker_ref = resolve.Ref{ .docker_image = "alpine:3" };
+    try std.testing.expectEqual(ActionKind.docker_image, classify("composite", docker_ref));
+    try std.testing.expectEqual(ActionKind.docker_image, classify("node20", docker_ref));
+    try std.testing.expectEqual(ActionKind.docker_image, classify("", docker_ref));
+}
+
+test "classify: using maps to a kind for non-docker refs" {
+    const local_ref = resolve.Ref{ .local = "./x" };
+    try std.testing.expectEqual(ActionKind.composite, classify("composite", local_ref));
+    try std.testing.expectEqual(ActionKind.node, classify("node20", local_ref));
+    try std.testing.expectEqual(ActionKind.node, classify("node16", local_ref));
+    try std.testing.expectEqual(ActionKind.docker_image, classify("docker", local_ref));
+    try std.testing.expectEqual(ActionKind.unsupported, classify("node12", local_ref));
+    try std.testing.expectEqual(ActionKind.unsupported, classify("", local_ref));
+
+    const github_ref = resolve.Ref{ .github = .{ .owner = "o", .repo = "r", .subpath = "", .ref = "v1" } };
+    try std.testing.expectEqual(ActionKind.composite, classify("composite", github_ref));
+    try std.testing.expectEqual(ActionKind.node, classify("node16", github_ref));
+    try std.testing.expectEqual(ActionKind.docker_image, classify("docker", github_ref));
+}
+
+/// Spawns `node --version`; exit 0 means node is on PATH. Test-only gate,
+/// mirrors `backend/native.zig`'s private `onPath` helper.
+fn nodeOnPath(alloc: std.mem.Allocator) bool {
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "node", "--version" },
+    }) catch return false;
+    return result.term == .Exited and result.term.Exited == 0;
+}
+
+test "js node20 local action runs through native backend, INPUT_ mapping works (gated: node on PATH)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (!nodeOnPath(a)) return error.SkipZigTest;
+
+    const b = backend.native();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/js-hello" };
+    const with = [_]ir.EnvPair{.{ .name = "who", .value = "jalan" }};
+    var env = expr.Env{};
+    const out = try runUses(a, step, &with, b, &h, &env, null, false, &em);
+    if (em) |m| std.debug.print("js-hello run failed: {s}\n", .{m});
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "js says jalan") != null);
+}
+
+test "js node20 action falls back to input default when 'with' omits it (gated: node on PATH)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (!nodeOnPath(a)) return error.SkipZigTest;
+
+    const b = backend.native();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/js-hello" };
+    var env = expr.Env{};
+    const out = try runUses(a, step, &.{}, b, &h, &env, null, false, &em);
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "js says world") != null);
+}
+
+test "node action with runs.pre logs the pre/post warning and still runs (gated: node on PATH)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (!nodeOnPath(a)) return error.SkipZigTest;
+
+    const b = backend.native();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/prepost-node" };
+    var env = expr.Env{};
+    const Capture = struct {
+        var lines: [8][]const u8 = undefined;
+        var count: usize = 0;
+        fn log(line: []const u8) void {
+            if (count < lines.len) lines[count] = line;
+            count += 1;
+        }
+    };
+    Capture.count = 0;
+    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "main ran") != null);
+    var saw_warning = false;
+    for (Capture.lines[0..Capture.count]) |l| {
+        if (std.mem.indexOf(u8, l, "pre/post entrypoints are not executed") != null) saw_warning = true;
+    }
+    try std.testing.expect(saw_warning);
+}
+
+test "docker-using action with image != docker:// warns and skips (Dockerfile actions unsupported)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = backend.native();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/dockerfile-action" };
+    var env = expr.Env{};
+    var logged: ?[]const u8 = null;
+    const Capture = struct {
+        var msg: ?[]const u8 = null;
+        fn log(line: []const u8) void {
+            msg = line;
+        }
+    };
+    Capture.msg = null;
+    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    logged = Capture.msg;
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(logged != null);
+    try std.testing.expect(std.mem.indexOf(u8, logged.?, "Dockerfile-based actions are not supported") != null);
+}
+
+test "docker:// action on a non-docker backend warns and skips (bare uses: docker://)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = backend.native();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "docker://alpine:3" };
+    var env = expr.Env{};
+    const Capture = struct {
+        var msg: ?[]const u8 = null;
+        fn log(line: []const u8) void {
+            msg = line;
+        }
+    };
+    Capture.msg = null;
+    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(Capture.msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, Capture.msg.?, "docker:// actions require --backend docker") != null);
+}
+
+test "docker:// action via using:docker+image on a non-docker backend also warns and skips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = backend.native();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/docker-remote" };
+    var env = expr.Env{};
+    const Capture = struct {
+        var msg: ?[]const u8 = null;
+        fn log(line: []const u8) void {
+            msg = line;
+        }
+    };
+    Capture.msg = null;
+    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(Capture.msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, Capture.msg.?, "docker:// actions require --backend docker") != null);
+}
+
+test "setup-node is intercepted on the nix backend without needing nix installed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var nb = nix_backend.NixBackend{};
+    const b = nb.backend();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "actions/setup-node@v4" };
+    var env = expr.Env{};
+    const Capture = struct {
+        var msg: ?[]const u8 = null;
+        fn log(line: []const u8) void {
+            msg = line;
+        }
+    };
+    Capture.msg = null;
+    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(Capture.msg != null);
+    try std.testing.expectEqualStrings("setup action mapped to nix packages", Capture.msg.?);
 }

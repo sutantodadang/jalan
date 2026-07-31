@@ -20,14 +20,32 @@ pub const JobHandle = struct {
 
 pub const LogFn = *const fn (line: []const u8) void;
 
+/// Which concrete backend a `Backend` value wraps. `runUses` (in
+/// `actions/runner.zig`) needs this to decide things the vtable alone can't
+/// express: whether `docker://` container actions are even possible
+/// (`runContainerAction` is only non-null for `.docker`, but the marker is
+/// cheaper to branch on than an optional-fn null check at every call site),
+/// whether a local JS action is allowed to run inside a container (`.docker`
+/// + a workspace-relative action, vs. a remote one — phase 2.1), and whether
+/// `setup-node`/`setup-python`/`setup-go` should be intercepted as nix
+/// package installs (`.nix` only).
+pub const Kind = enum { native, docker, nix };
+
 pub const Backend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
+    kind: Kind,
 
     pub const VTable = struct {
         setupJob: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: []const u8, log: ?LogFn) anyerror!JobHandle,
         runStep: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, handle: *JobHandle, step: ir.Step, env: []const ir.EnvPair, workdir: ?[]const u8, err_msg: *?[]const u8) anyerror!StepOutcome,
         teardownJob: *const fn (ctx: *anyopaque, alloc: std.mem.Allocator, handle: *JobHandle) void,
+        /// One-shot `docker://` action execution (create, start, wait, collect
+        /// logs, remove). Optional: only `DockerBackend` implements it —
+        /// native/nix leave this `null`, and `runUses` checks for that before
+        /// calling it, warning + skipping `docker_image`-kind actions instead
+        /// of dispatching into a backend that can't run them.
+        runContainerAction: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, handle: *JobHandle, image: []const u8, cmd_args: []const []const u8, env_pairs: []const ir.EnvPair, err_msg: *?[]const u8) anyerror!StepOutcome = null,
     };
 
     pub fn setupJob(self: Backend, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: []const u8, log: ?LogFn) !JobHandle {
@@ -38,6 +56,12 @@ pub const Backend = struct {
     }
     pub fn teardownJob(self: Backend, alloc: std.mem.Allocator, handle: *JobHandle) void {
         self.vtable.teardownJob(self.ctx, alloc, handle);
+    }
+    /// Callers must check `self.vtable.runContainerAction != null` first
+    /// (this asserts non-null rather than silently no-oping) — `runUses` is
+    /// the one caller and it always checks before calling.
+    pub fn runContainerAction(self: Backend, alloc: std.mem.Allocator, handle: *JobHandle, image: []const u8, cmd_args: []const []const u8, env_pairs: []const ir.EnvPair, err_msg: *?[]const u8) !StepOutcome {
+        return self.vtable.runContainerAction.?(self.ctx, alloc, handle, image, cmd_args, env_pairs, err_msg);
     }
 };
 
@@ -50,7 +74,7 @@ const native_vtable = Backend.VTable{
 };
 
 pub fn native() Backend {
-    return .{ .ctx = @ptrCast(&native_ctx), .vtable = &native_vtable };
+    return .{ .ctx = @ptrCast(&native_ctx), .vtable = &native_vtable, .kind = .native };
 }
 
 fn nativeSetup(_: *anyopaque, _: std.mem.Allocator, _: ir.Job, workspace_abs: []const u8, _: ?LogFn) anyerror!JobHandle {

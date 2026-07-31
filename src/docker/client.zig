@@ -240,6 +240,18 @@ pub fn containerInspectHealth(alloc: std.mem.Allocator, c: Client, id: []const u
     return parseHealthStatus(alloc, resp.body);
 }
 
+/// `GET {prefix}/containers/{id}/logs?stdout=1&stderr=1`: raw response body
+/// for a non-tty container is Docker's multiplexed stdout/stderr stream
+/// (same frame format as `execRun`'s attach stream) — pass the result to
+/// `demuxFrames` to split it. Used for one-shot `docker://` actions, whose
+/// output isn't available via `exec` (there's no long-lived container to
+/// exec into — the action *is* the container's own entrypoint/cmd).
+pub fn containerLogs(alloc: std.mem.Allocator, c: Client, id: []const u8, err: *?[]const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(alloc, "{s}/containers/{s}/logs?stdout=1&stderr=1", .{ api_prefix, id });
+    const resp = try apiCall(alloc, c, .{ .method = "GET", .path = path }, err);
+    return resp.body;
+}
+
 test "parseHealthStatus: no Health object returns null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

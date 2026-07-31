@@ -189,7 +189,7 @@ pub const DockerBackend = struct {
     cfg: config.Config = .{},
 
     pub fn backend(self: *DockerBackend) backend_iface.Backend {
-        return .{ .ctx = @ptrCast(self), .vtable = &vtable };
+        return .{ .ctx = @ptrCast(self), .vtable = &vtable, .kind = .docker };
     }
 };
 
@@ -197,6 +197,7 @@ const vtable = backend_iface.Backend.VTable{
     .setupJob = setup,
     .runStep = run,
     .teardownJob = teardown,
+    .runContainerAction = runContainerAction,
 };
 
 /// Best-effort teardown of whatever service containers + network got
@@ -383,6 +384,65 @@ fn run(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHand
     };
 }
 
+/// One-shot `docker://` action: pull (if needed), create (with `cmd_args` as
+/// `Cmd` when non-empty — empty means "use the image's own ENTRYPOINT/CMD",
+/// `env_pairs` as `Env`, joining `handle.network_id` when the job has one, no
+/// workspace bind — a `docker://` action gets its inputs via env, not a
+/// mounted repo), start, wait for exit, collect logs (`exec` doesn't apply
+/// here: there's no long-lived container to exec into, the container's own
+/// entrypoint *is* the action), remove. Mirrors `setup`/`run`'s
+/// create-then-start shape but is a single-container, run-to-completion flow
+/// rather than a long-lived job container.
+fn runContainerAction(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHandle, image: []const u8, cmd_args: []const []const u8, env_pairs: []const ir.EnvPair, err_msg: *?[]const u8) anyerror!backend_iface.StepOutcome {
+    const self: *DockerBackend = @ptrCast(@alignCast(ctx));
+    var err: ?[]const u8 = null;
+
+    const exists = client.imageExists(alloc, self.client, image, &err) catch |e| {
+        err_msg.* = err;
+        return e;
+    };
+    if (!exists) {
+        client.imagePull(alloc, self.client, image, null, &err) catch |e| {
+            err_msg.* = err;
+            return e;
+        };
+    }
+
+    const cmd: ?[]const []const u8 = if (cmd_args.len > 0) cmd_args else null;
+    const env_strs = try formatEnvPairs(alloc, env_pairs, &.{});
+    const network_id: ?[]const u8 = if (handle.network_id.len > 0) handle.network_id else null;
+    const spec = try buildContainerCreateSpec(alloc, image, cmd, env_strs, null, network_id, &.{});
+
+    const id = client.containerCreate(alloc, self.client, spec, null, &err) catch |e| {
+        err_msg.* = err;
+        return e;
+    };
+    client.containerStart(alloc, self.client, id, &err) catch |e| {
+        err_msg.* = err;
+        var cleanup_err: ?[]const u8 = null;
+        client.containerRemove(alloc, self.client, id, &cleanup_err) catch {};
+        return e;
+    };
+    const exit_code = client.containerWait(alloc, self.client, id, &err) catch |e| {
+        err_msg.* = err;
+        var cleanup_err: ?[]const u8 = null;
+        client.containerRemove(alloc, self.client, id, &cleanup_err) catch {};
+        return e;
+    };
+    const log_bytes = client.containerLogs(alloc, self.client, id, &err) catch |e| {
+        err_msg.* = err;
+        var cleanup_err: ?[]const u8 = null;
+        client.containerRemove(alloc, self.client, id, &cleanup_err) catch {};
+        return e;
+    };
+    const demuxed = try client.demuxFrames(alloc, log_bytes);
+
+    var cleanup_err: ?[]const u8 = null;
+    client.containerRemove(alloc, self.client, id, &cleanup_err) catch {};
+
+    return .{ .exit_code = exit_code, .stdout = demuxed.stdout, .stderr = demuxed.stderr, .outputs = &.{} };
+}
+
 fn teardown(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHandle) void {
     const self: *DockerBackend = @ptrCast(@alignCast(ctx));
     if (handle.container_id.len > 0) {
@@ -565,4 +625,23 @@ test "docker backend service is reachable by DNS alias on the job network (skips
     const s = ir.Step{ .id = "dns", .name = "dns", .kind = .run, .shell = "sh", .script = "getent hosts redis || nslookup redis" };
     const o = try b.runStep(a, &h, s, &.{}, null, &em);
     try std.testing.expectEqual(@as(i32, 0), o.exit_code);
+}
+
+test "runContainerAction: one-shot docker:// container returns exit code and demuxed logs (skips without daemon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cl = client.Client{ .socket_path = client.detectSocket(a, .{}).? };
+    if (!client.ping(a, cl)) return error.SkipZigTest;
+    var err: ?[]const u8 = null;
+    if (!try client.imageExists(a, cl, "busybox:latest", &err)) try client.imagePull(a, cl, "busybox:latest", null, &err);
+    var db = DockerBackend{ .client = cl };
+    const b = db.backend();
+    try std.testing.expectEqual(backend_iface.Kind.docker, b.kind);
+    var handle = backend_iface.JobHandle{};
+    var err_msg: ?[]const u8 = null;
+    const out = try b.runContainerAction(a, &handle, "busybox:latest", &.{ "sh", "-c", "echo hi; echo bad >&2; exit 7" }, &.{}, &err_msg);
+    try std.testing.expectEqual(@as(i32, 7), out.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.stderr, "bad") != null);
 }
