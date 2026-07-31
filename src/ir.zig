@@ -36,6 +36,7 @@ pub const Job = struct {
     matrix: []EnvPair = &.{},
     steps: []Step,
     src_line: u32 = 0,
+    container_image: []const u8 = "",
 };
 
 pub const Pipeline = struct {

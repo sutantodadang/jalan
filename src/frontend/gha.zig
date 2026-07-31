@@ -171,6 +171,57 @@ test "'with' on a run step is an unknown-key warning" {
     try std.testing.expect(found);
 }
 
+test "container: scalar image lowers into container_image, no warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    container: node:20-bookworm-slim
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqualStrings("node:20-bookworm-slim", p.jobs[0].container_image);
+    for (diags.list.items) |d| {
+        try std.testing.expect(std.mem.indexOf(u8, d.msg, "'container'") == null);
+    }
+}
+
+test "container: map with image key lowers into container_image" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    container:
+        \\      image: ubuntu:22.04
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqualStrings("ubuntu:22.04", p.jobs[0].container_image);
+}
+
+test "no container key leaves container_image empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqualStrings("", p.jobs[0].container_image);
+}
+
 test "validation diagnostics carry real source line numbers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -385,7 +436,7 @@ fn condText(alloc: std.mem.Allocator, raw: []const u8, line: u32, diags: *yaml.D
 //   anything else        -> genuinely unknown key; "not supported in phase 1" warning.
 const workflow_supported_keys = [_][]const u8{ "name", "on", "env", "defaults", "jobs" };
 const workflow_known_unsupported_keys = [_][]const u8{ "permissions", "concurrency", "run-name" };
-const job_supported_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults" };
+const job_supported_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults", "container" };
 const job_known_unsupported_keys = [_][]const u8{ "if", "outputs", "continue-on-error", "timeout-minutes", "environment", "concurrency", "permissions" };
 // 'with' is added conditionally by lowerStep: supported on `uses` steps only.
 const step_supported_keys = [_][]const u8{ "name", "id", "run", "uses", "shell", "env", "if", "working-directory", "continue-on-error", "timeout-minutes" };
@@ -573,6 +624,12 @@ fn lowerJob(
 
     try checkKeys(diags, jn, "job", &job_supported_keys, &job_known_unsupported_keys);
 
+    const container_image = if (jn.get("container")) |c| switch (c.data) {
+        .scalar => |s| s,
+        .map => if (c.get("image")) |img| img.scalarOr("") else "",
+        .seq => "",
+    } else "";
+
     return .{
         .id = job_id,
         .display_name = job_id,
@@ -581,6 +638,7 @@ fn lowerJob(
         .env = try env.toOwnedSlice(alloc),
         .steps = try steps.toOwnedSlice(alloc),
         .src_line = jn.line,
+        .container_image = container_image,
     };
 }
 
