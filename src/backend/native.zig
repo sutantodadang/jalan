@@ -91,12 +91,26 @@ pub fn runStep(
     env_map.put("CI", "true") catch return error.OutOfMemory;
     env_map.put("GITHUB_ACTIONS", "true") catch return error.OutOfMemory;
     env_map.put("JALAN", "true") catch return error.OutOfMemory;
-    const abs_output = std.fs.cwd().realpathAlloc(alloc, output_path) catch output_path;
+    const abs_output = std.fs.cwd().realpathAlloc(alloc, output_path) catch |e| {
+        last_spawn_error_msg = std.fmt.allocPrint(
+            alloc,
+            "cannot resolve output path '{s}': {s}",
+            .{ output_path, @errorName(e) },
+        ) catch null;
+        return error.SpawnFailed;
+    };
     env_map.put("GITHUB_OUTPUT", abs_output) catch return error.OutOfMemory;
 
     var argv: std.ArrayList([]const u8) = .empty;
     argv.appendSlice(alloc, shell.argv_prefix) catch return error.OutOfMemory;
-    const abs_script = std.fs.cwd().realpathAlloc(alloc, script_path) catch script_path;
+    const abs_script = std.fs.cwd().realpathAlloc(alloc, script_path) catch |e| {
+        last_spawn_error_msg = std.fmt.allocPrint(
+            alloc,
+            "cannot resolve script path '{s}': {s}",
+            .{ script_path, @errorName(e) },
+        ) catch null;
+        return error.SpawnFailed;
+    };
     argv.append(alloc, abs_script) catch return error.OutOfMemory;
 
     const result = std.process.Child.run(.{
@@ -171,4 +185,15 @@ test "step outputs parsed from GITHUB_OUTPUT" {
     const out = try runStep(a, step, &.{}, null);
     try std.testing.expectEqualStrings("ver", out.outputs[0].name);
     try std.testing.expectEqualStrings("1.2", std.mem.trim(u8, out.outputs[0].value, " "));
+}
+
+test "step with workdir set resolves script and output paths correctly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.fs.cwd().makePath(".jalan/tmp/wdtest");
+    const step = ir.Step{ .id = "s", .name = "s", .kind = .run, .script = "echo from-workdir" };
+    const out = try runStep(a, step, &.{}, ".jalan/tmp/wdtest");
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "from-workdir") != null);
 }
