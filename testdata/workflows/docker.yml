@@ -1,0 +1,8 @@
+name: DockerSmoke
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "in-container=$(uname -s)" >> "$GITHUB_OUTPUT"
+        id: probe
+      - run: echo "probed ${{ steps.probe.outputs.in-container }}"
