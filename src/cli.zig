@@ -3,6 +3,7 @@ const std = @import("std");
 const yaml = @import("yaml.zig");
 const ir = @import("ir.zig");
 const gha = @import("frontend/gha.zig");
+const engine = @import("engine.zig");
 
 pub const Provider = enum { gha, unknown };
 
@@ -73,6 +74,309 @@ pub fn lintMain(alloc: std.mem.Allocator, path: []const u8, json: bool, strict: 
 fn printDiags(alloc: std.mem.Allocator, path: []const u8, diags: *const yaml.Diags, out: *std.ArrayList(u8)) !void {
     for (diags.list.items) |d|
         try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s}:{d}:{d}: {s}\n", .{ path, d.line, d.col, d.msg }));
+}
+
+pub const RunArgs = struct {
+    file: ?[]const u8 = null,
+    job: ?[]const u8 = null,
+    step: ?[]const u8 = null,
+    dry_run: bool = false,
+    strict: bool = false,
+    no_color: bool = false,
+    max_parallel: usize = 4,
+    env: []ir.EnvPair = &.{},
+    matrix: []ir.EnvPair = &.{},
+    secret_file: ?[]const u8 = null,
+};
+
+test "parse run args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const args = [_][]const u8{ "wf.yml", "-j", "build", "--dry-run", "--env", "A=1", "--matrix", "os=linux", "--max-parallel", "2" };
+    const r = try parseRunArgs(a, &args);
+    try std.testing.expectEqualStrings("wf.yml", r.file.?);
+    try std.testing.expectEqualStrings("build", r.job.?);
+    try std.testing.expect(r.dry_run);
+    try std.testing.expectEqualStrings("A", r.env[0].name);
+    try std.testing.expectEqualStrings("linux", r.matrix[0].value);
+    try std.testing.expectEqual(@as(usize, 2), r.max_parallel);
+}
+
+test "unknown flag is an error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadArgs, parseRunArgs(arena.allocator(), &[_][]const u8{"--bogus"}));
+}
+
+test "secrets file parses k=v with comments" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pairs = try parseSecretsText(a, "# comment\nTOKEN=abc\nEMPTY=\n");
+    try std.testing.expectEqual(@as(usize, 2), pairs.len);
+    try std.testing.expectEqualStrings("TOKEN", pairs[0].name);
+    try std.testing.expectEqualStrings("abc", pairs[0].value);
+}
+
+pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs {
+    var r = RunArgs{};
+    var env: std.ArrayList(ir.EnvPair) = .empty;
+    var matrix: std.ArrayList(ir.EnvPair) = .empty;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-j") or std.mem.eql(u8, arg, "--job")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            r.job = args[i];
+        } else if (std.mem.eql(u8, arg, "--step")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            r.step = args[i];
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            r.dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            r.strict = true;
+        } else if (std.mem.eql(u8, arg, "--no-color")) {
+            r.no_color = true;
+        } else if (std.mem.eql(u8, arg, "--max-parallel")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            r.max_parallel = std.fmt.parseInt(usize, args[i], 10) catch return error.BadArgs;
+        } else if (std.mem.eql(u8, arg, "--env")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            try env.append(alloc, splitPair(args[i]) orelse return error.BadArgs);
+        } else if (std.mem.eql(u8, arg, "--matrix")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            try matrix.append(alloc, splitPair(args[i]) orelse return error.BadArgs);
+        } else if (std.mem.eql(u8, arg, "--secret-file")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            r.secret_file = args[i];
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.BadArgs;
+        } else if (r.file == null) {
+            r.file = arg;
+        } else return error.BadArgs;
+    }
+    r.env = try env.toOwnedSlice(alloc);
+    r.matrix = try matrix.toOwnedSlice(alloc);
+    return r;
+}
+
+fn splitPair(s: []const u8) ?ir.EnvPair {
+    const eq = std.mem.indexOfScalar(u8, s, '=') orelse return null;
+    if (eq == 0) return null;
+    return .{ .name = s[0..eq], .value = s[eq + 1 ..] };
+}
+
+pub fn parseSecretsText(alloc: std.mem.Allocator, text: []const u8) ![]ir.EnvPair {
+    var out: std.ArrayList(ir.EnvPair) = .empty;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const l = std.mem.trim(u8, line, " \r");
+        if (l.len == 0 or l[0] == '#') continue;
+        if (splitPair(l)) |p| try out.append(alloc, p);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+pub fn main(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
+    if (args.len == 0) return help();
+    const cmd = args[0];
+    if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help")) return help();
+    if (std.mem.eql(u8, cmd, "version")) return print("jalan 0.1.0\n");
+    if (std.mem.eql(u8, cmd, "lint")) {
+        var json = false;
+        var strict = false;
+        var file: ?[]const u8 = null;
+        for (args[1..]) |a2| {
+            if (std.mem.eql(u8, a2, "--json")) json = true else if (std.mem.eql(u8, a2, "--strict")) strict = true else file = a2;
+        }
+        const path = file orelse (try findDefaultWorkflow(alloc)) orelse {
+            _ = try print("error: no workflow found in .github/workflows\n");
+            return 2;
+        };
+        var out: std.ArrayList(u8) = .empty;
+        const code = try lintMain(alloc, path, json, strict, &out);
+        _ = try print(out.items);
+        return code;
+    }
+    if (std.mem.eql(u8, cmd, "run")) {
+        const ra = parseRunArgs(alloc, args[1..]) catch {
+            _ = try print("error: bad arguments (see 'jalan help')\n");
+            return 2;
+        };
+        return runMain(alloc, ra);
+    }
+    _ = try print("error: unknown command\n");
+    return 2;
+}
+
+fn print(s: []const u8) !u8 {
+    try std.fs.File.stdout().writeAll(s);
+    return 0;
+}
+
+fn help() !u8 {
+    return print(
+        \\jalan — local CI simulator
+        \\
+        \\usage:
+        \\  jalan lint [file] [--json] [--strict]
+        \\  jalan run [file] [-j <job>] [--step <id>] [--dry-run] [--env K=V]...
+        \\            [--secret-file <path>] [--matrix k=v]... [--max-parallel N]
+        \\            [--strict] [--no-color]
+        \\  jalan version
+        \\  jalan help
+        \\
+    );
+}
+
+const ansi_green = "\x1b[32m";
+const ansi_red = "\x1b[31m";
+const ansi_dim_yellow = "\x1b[2;33m";
+const ansi_reset = "\x1b[0m";
+
+fn colorsEnabled(alloc: std.mem.Allocator, ra: RunArgs) bool {
+    if (ra.no_color) return false;
+    const has = std.process.hasEnvVar(alloc, "NO_COLOR") catch false;
+    return !has;
+}
+
+pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
+    const path = ra.file orelse (try findDefaultWorkflow(alloc)) orelse {
+        _ = try print("error: no workflow found in .github/workflows\n");
+        return 2;
+    };
+    const source = std.fs.cwd().readFileAlloc(alloc, path, 4 * 1024 * 1024) catch {
+        _ = try print(try std.fmt.allocPrint(alloc, "error: cannot read '{s}'\n", .{path}));
+        return 3;
+    };
+    if (detectProvider(path, source) == .unknown) {
+        _ = try print("error: could not detect CI provider (phase 1 supports GitHub Actions only)\n");
+        return 2;
+    }
+    var diags = yaml.Diags.init(alloc);
+    const pipeline = gha.parseWorkflow(alloc, path, source, &diags) catch |e| switch (e) {
+        error.ParseFailed => {
+            var out: std.ArrayList(u8) = .empty;
+            try printDiags(alloc, path, &diags, &out);
+            _ = try print(out.items);
+            return 2;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    {
+        var out: std.ArrayList(u8) = .empty;
+        try printDiags(alloc, path, &diags, &out);
+        if (out.items.len > 0) _ = try print(out.items);
+    }
+    if (ra.strict and diags.list.items.len > 0) return 2;
+
+    var secrets: []ir.EnvPair = &.{};
+    if (ra.secret_file) |sf| {
+        const text = std.fs.cwd().readFileAlloc(alloc, sf, 1024 * 1024) catch {
+            _ = try print(try std.fmt.allocPrint(alloc, "error: cannot read secret file '{s}'\n", .{sf}));
+            return 3;
+        };
+        secrets = try parseSecretsText(alloc, text);
+    } else {
+        const default_path = ".jalan/secrets.env";
+        if (std.fs.cwd().readFileAlloc(alloc, default_path, 1024 * 1024)) |text| {
+            secrets = try parseSecretsText(alloc, text);
+        } else |_| {}
+    }
+
+    const report = engine.run(alloc, pipeline, .{
+        .job_filter = ra.job,
+        .step_filter = ra.step,
+        .dry_run = ra.dry_run,
+        .max_parallel = ra.max_parallel,
+        .extra_env = ra.env,
+        .secrets = secrets,
+        .matrix_filter = ra.matrix,
+    }) catch |e| switch (e) {
+        error.InternalError => {
+            _ = try print("internal error: engine failed\n");
+            return 3;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    const use_color = colorsEnabled(alloc, ra);
+    var out: std.ArrayList(u8) = .empty;
+    for (report.jobs) |j| {
+        for (j.steps) |s| {
+            if (s.status == .skipped) continue;
+            var lines = std.mem.splitScalar(u8, s.stdout, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "[{s}/{s}] {s}\n", .{ j.display_name, s.name, line }));
+            }
+            var elines = std.mem.splitScalar(u8, s.stderr, '\n');
+            while (elines.next()) |line| {
+                if (line.len == 0) continue;
+                try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "[{s}/{s}] {s} (stderr)\n", .{ j.display_name, s.name, line }));
+            }
+        }
+    }
+
+    try out.appendSlice(alloc, "── summary ──────────────────────\n");
+    for (report.jobs) |j| {
+        switch (j.status) {
+            .success => {
+                var total_ms: u64 = 0;
+                for (j.steps) |s| total_ms += s.duration_ms;
+                const mark = if (use_color) ansi_green ++ "\xe2\x9c\x93" ++ ansi_reset else "\xe2\x9c\x93";
+                try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   {d} steps   {d}ms\n", .{ mark, j.display_name, j.steps.len, total_ms }));
+            },
+            .failed => {
+                var failed_step: ?engine.StepResult = null;
+                for (j.steps) |s| if (s.status == .failed) {
+                    failed_step = s;
+                    break;
+                };
+                const mark = if (use_color) ansi_red ++ "\xe2\x9c\x97" ++ ansi_reset else "\xe2\x9c\x97";
+                if (failed_step) |fs| {
+                    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   failed at '{s}' (exit {d})\n", .{ mark, j.display_name, fs.name, fs.exit_code }));
+                } else {
+                    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   failed\n", .{ mark, j.display_name }));
+                }
+            },
+            .skipped => {
+                const mark = if (use_color) ansi_dim_yellow ++ "\xe2\x97\x8b" ++ ansi_reset else "\xe2\x97\x8b";
+                try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   skipped\n", .{ mark, j.display_name }));
+            },
+        }
+    }
+
+    // Log tail: last 20 lines of the failing step's stdout+stderr, for each failed job.
+    for (report.jobs) |j| {
+        if (j.status != .failed) continue;
+        for (j.steps) |s| {
+            if (s.status != .failed) continue;
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\n── log tail: {s}/{s} ──\n", .{ j.display_name, s.name }));
+            var combined: std.ArrayList(u8) = .empty;
+            try combined.appendSlice(alloc, s.stdout);
+            try combined.appendSlice(alloc, s.stderr);
+            var all_lines: std.ArrayList([]const u8) = .empty;
+            var it = std.mem.splitScalar(u8, combined.items, '\n');
+            while (it.next()) |line| {
+                if (line.len == 0) continue;
+                try all_lines.append(alloc, line);
+            }
+            const start = if (all_lines.items.len > 20) all_lines.items.len - 20 else 0;
+            for (all_lines.items[start..]) |line|
+                try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s}\n", .{line}));
+        }
+    }
+
+    _ = try print(out.items);
+    return if (report.ok()) 0 else 1;
 }
 
 test "detect provider by path and content" {
