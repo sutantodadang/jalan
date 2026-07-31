@@ -118,6 +118,29 @@ test "spawn failure (unknown shell) respects continue-on-error" {
     try std.testing.expectEqual(JobStatus.failed, report2.jobs[0].status);
 }
 
+test "independent jobs run concurrently" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Two 300ms sleeps; concurrent wall clock must be < 550ms (sequential would be 600ms+).
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  a:
+        \\    steps:
+        \\      - run: sleep 0.3
+        \\        shell: sh
+        \\  b:
+        \\    steps:
+        \\      - run: sleep 0.3
+        \\        shell: sh
+    );
+    const t0 = std.time.milliTimestamp();
+    const report = try run(a, p, .{ .max_parallel = 2 });
+    const elapsed = std.time.milliTimestamp() - t0;
+    try std.testing.expect(report.ok());
+    try std.testing.expect(elapsed < 550);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -168,21 +191,83 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
     const done = try alloc.alloc(bool, p.jobs.len);
     @memset(done, false);
     var shared = Shared{ .alloc = alloc };
+    var mutex = std.Thread.Mutex{};
     var completed: usize = 0;
+    const max_par = @max(opts.max_parallel, 1);
 
     while (completed < p.jobs.len) {
-        var progressed = false;
+        var ready: std.ArrayList(usize) = .empty;
         for (p.jobs, 0..) |job, i| {
-            if (done[i]) continue;
-            if (!needsSatisfied(p, done, job)) continue;
-            results[i] = runJob(alloc, p, job, i, opts, &shared, results, done) catch return error.OutOfMemory;
-            done[i] = true;
-            completed += 1;
-            progressed = true;
+            if (!done[i] and needsSatisfied(p, done, job)) try ready.append(alloc, i);
         }
-        if (!progressed) return error.InternalError; // cycle — validated upstream, defensive
+        if (ready.items.len == 0) return error.InternalError; // cycle — validated upstream, defensive
+
+        var batch_start: usize = 0;
+        while (batch_start < ready.items.len) {
+            const batch = ready.items[batch_start..@min(batch_start + max_par, ready.items.len)];
+            const threads = try alloc.alloc(?std.Thread, batch.len);
+            const Ctx = struct {
+                fn work(
+                    pi: ir.Pipeline,
+                    ji: usize,
+                    o: RunOptions,
+                    sh: *Shared,
+                    mx: *std.Thread.Mutex,
+                    out: *JobResult,
+                    res: []JobResult,
+                    dn: []bool,
+                ) void {
+                    // Each worker thread gets its own arena off page_allocator: caller
+                    // arenas are not thread-safe, so per-thread work cannot share one.
+                    var thread_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer thread_arena.deinit();
+                    const ta = thread_arena.allocator();
+                    const r = runJob(ta, pi, pi.jobs[ji], ji, o, sh, res, dn, mx) catch |e| {
+                        out.* = .{ .job_index = ji, .display_name = pi.jobs[ji].display_name, .status = .failed, .steps = &.{} };
+                        std.debug.print("internal error in job: {s}\n", .{@errorName(e)});
+                        return;
+                    };
+                    // Copy result out of the thread arena (which dies with this
+                    // function) into the caller arena, guarded by the shared mutex.
+                    mx.lock();
+                    defer mx.unlock();
+                    out.* = copyResult(sh.alloc, r) catch r;
+                }
+            };
+            for (batch, 0..) |ji, bi| {
+                threads[bi] = std.Thread.spawn(.{}, Ctx.work, .{ p, ji, opts, &shared, &mutex, &results[ji], results, done }) catch null;
+                if (threads[bi] == null) {
+                    // Spawn failed (e.g. thread-limit exhaustion) — fall back to inline execution.
+                    Ctx.work(p, ji, opts, &shared, &mutex, &results[ji], results, done);
+                }
+            }
+            for (threads) |t| if (t) |th| th.join();
+            for (batch) |ji| {
+                done[ji] = true;
+                completed += 1;
+            }
+            batch_start += batch.len;
+        }
     }
     return .{ .jobs = results };
+}
+
+fn copyResult(alloc: std.mem.Allocator, r: JobResult) !JobResult {
+    const steps = try alloc.alloc(StepResult, r.steps.len);
+    for (steps, r.steps) |*d, s| d.* = .{
+        .name = try alloc.dupe(u8, s.name),
+        .status = s.status,
+        .exit_code = s.exit_code,
+        .duration_ms = s.duration_ms,
+        .stdout = try alloc.dupe(u8, s.stdout),
+        .stderr = try alloc.dupe(u8, s.stderr),
+    };
+    return .{
+        .job_index = r.job_index,
+        .display_name = try alloc.dupe(u8, r.display_name),
+        .status = r.status,
+        .steps = steps,
+    };
 }
 
 fn needsSatisfied(p: ir.Pipeline, done: []bool, job: ir.Job) bool {
@@ -215,6 +300,7 @@ fn runJob(
     shared: *Shared,
     results: []JobResult,
     done: []bool,
+    mutex: *std.Thread.Mutex,
 ) !JobResult {
     var steps = try alloc.alloc(StepResult, job.steps.len);
     for (steps, job.steps) |*r, s|
@@ -239,11 +325,21 @@ fn runJob(
     try merged_env.appendSlice(alloc, job.env);
     try merged_env.appendSlice(alloc, opts.extra_env);
     for (merged_env.items) |e| try env.put(alloc, try key2(alloc, "env", e.name), e.value);
-    var it = shared.job_outputs.iterator();
-    while (it.next()) |e| {
-        // stored as "jobid.outputs.key" -> expose as needs.jobid.outputs.key
-        const path = try std.fmt.allocPrint(alloc, "needs.{s}", .{e.key_ptr.*});
-        try env.put(alloc, path, e.value_ptr.*);
+    {
+        // shared.job_outputs is read here and written post-step below; other
+        // worker threads may be doing either concurrently, so both are locked.
+        // Key/value strings are duped into this job's own allocator (thread
+        // arena under parallel execution) since the shared map's storage
+        // lives in the caller arena and dies independently of any one thread.
+        mutex.lock();
+        defer mutex.unlock();
+        var it = shared.job_outputs.iterator();
+        while (it.next()) |e| {
+            // stored as "jobid.outputs.key" -> expose as needs.jobid.outputs.key
+            const path = try std.fmt.allocPrint(alloc, "needs.{s}", .{e.key_ptr.*});
+            const val = try alloc.dupe(u8, e.value_ptr.*);
+            try env.put(alloc, path, val);
+        }
     }
 
     var job_status: JobStatus = .success;
@@ -286,6 +382,9 @@ fn runJob(
         patched.script = script;
         const workdir = if (step.workdir) |w| expr.interpolate(alloc, w, &env) catch w else null;
 
+        // last_spawn_error_msg may race under parallel spawn failures — message may be
+        // misattributed, status is not affected. runStep itself blocks for the step's
+        // duration, so the mutex is never held across this call.
         const outcome = native.runStep(alloc, patched, spawn_env.items, workdir) catch {
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = native.last_spawn_error_msg orelse "spawn failed" };
             if (!step.continue_on_error) job_status = .failed;
@@ -304,7 +403,14 @@ fn runJob(
         for (outcome.outputs) |o| {
             try env.put(alloc, try std.fmt.allocPrint(alloc, "steps.{s}.outputs.{s}", .{ step.id, o.name }), o.value);
             const jk = try std.fmt.allocPrint(alloc, "{s}.outputs.{s}", .{ job.id, o.name });
-            try shared.job_outputs.put(alloc, jk, o.value);
+            // Values put INTO the shared map must be duped with shared.alloc (caller
+            // arena) under the lock — the thread arena that owns jk/o.value dies at
+            // job end, but the map itself lives for the whole run.
+            mutex.lock();
+            defer mutex.unlock();
+            const jk_dup = try shared.alloc.dupe(u8, jk);
+            const val_dup = try shared.alloc.dupe(u8, o.value);
+            try shared.job_outputs.put(shared.alloc, jk_dup, val_dup);
         }
         if (!ok and !step.continue_on_error) job_status = .failed;
     }
