@@ -66,6 +66,70 @@ test "bad if expression is a hard diagnostic" {
     try std.testing.expectError(error.ParseFailed, parseWorkflow(a, "x.yml", src, &diags));
 }
 
+test "unknown job key warns but does not fail parsing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    containerz: oops
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 1), p.jobs.len);
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.startsWith(u8, d.msg, "warning: ") and std.mem.indexOf(u8, d.msg, "containerz") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "unknown step key warns but does not fail parsing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    steps:
+        \\      - run: echo hi
+        \\        bogus-key: nope
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 1), p.jobs.len);
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.startsWith(u8, d.msg, "warning: ") and std.mem.indexOf(u8, d.msg, "bogus-key") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "known-but-unsupported keys (strategy, with) do not warn" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    strategy:
+        \\      fail-fast: false
+        \\    steps:
+        \\      - uses: actions/checkout@v4
+        \\        with:
+        \\          ref: main
+    ;
+    _ = try parseWorkflow(a, "x.yml", src, &diags);
+    for (diags.list.items) |d| {
+        try std.testing.expect(std.mem.indexOf(u8, d.msg, "job key") == null);
+        try std.testing.expect(std.mem.indexOf(u8, d.msg, "step key") == null);
+    }
+}
+
 pub const ParseError = error{ ParseFailed, OutOfMemory };
 
 fn addWarn(diags: *yaml.Diags, line: u32, col: u32, comptime fmt: []const u8, args: anytype) !void {
@@ -115,6 +179,37 @@ fn condText(alloc: std.mem.Allocator, raw: []const u8, line: u32, diags: *yaml.D
     return t;
 }
 
+const workflow_known_keys = [_][]const u8{ "name", "on", "env", "defaults", "jobs", "permissions", "concurrency", "run-name" };
+const job_known_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults", "if", "outputs", "permissions", "timeout-minutes", "continue-on-error", "concurrency", "environment" };
+const step_known_keys = [_][]const u8{ "name", "id", "run", "uses", "with", "shell", "env", "if", "working-directory", "continue-on-error", "timeout-minutes" };
+
+/// Warn on any map key not present in `allowed`. Never a hard error —
+/// unsupported-but-known GHA keys and genuinely unknown keys are both
+/// reported the same way: explicit, never a silent skip.
+fn warnUnknownKeys(diags: *yaml.Diags, node: ?yaml.Node, comptime kind: []const u8, allowed: []const []const u8) !void {
+    const n = node orelse return;
+    switch (n.data) {
+        .map => |m| {
+            var it = m.iterator();
+            while (it.next()) |e| {
+                const key = e.key_ptr.*;
+                var known = false;
+                for (allowed) |ak| {
+                    if (std.mem.eql(u8, ak, key)) {
+                        known = true;
+                        break;
+                    }
+                }
+                if (!known) {
+                    const v = e.value_ptr.*;
+                    try addWarn(diags, v.line, v.col, kind ++ " key '{s}' is not supported in phase 1 (ignored)", .{key});
+                }
+            }
+        },
+        else => {},
+    }
+}
+
 const Defaults = struct { shell: ?[]const u8 = null, workdir: ?[]const u8 = null };
 
 fn readDefaults(node: ?yaml.Node) Defaults {
@@ -136,6 +231,7 @@ pub fn parseWorkflow(
         error.ParseFailed => return error.ParseFailed,
         error.OutOfMemory => return error.OutOfMemory,
     };
+    try warnUnknownKeys(diags, root, "workflow", &workflow_known_keys);
     const wf_env = try envPairs(alloc, root.get("env"));
     const wf_defaults = readDefaults(root.get("defaults"));
     const name = if (root.get("name")) |n| n.scalarOr(source_path) else source_path;
@@ -167,10 +263,7 @@ pub fn parseWorkflow(
                     else => try diags.add(sn.line, sn.col, "'steps' must be a sequence", .{}),
                 } else try diags.add(jn.line, jn.col, "job '{s}' has no steps", .{job_id});
 
-                for ([_][]const u8{ "services", "container", "uses", "secrets" }) |k| {
-                    if (jn.get(k)) |bad|
-                        try addWarn(diags, bad.line, bad.col, "job key '{s}' is not supported in phase 1 (ignored)", .{k});
-                }
+                try warnUnknownKeys(diags, jn, "job", &job_known_keys);
 
                 try jobs.append(alloc, .{
                     .id = job_id,
@@ -199,6 +292,7 @@ fn lowerStep(
     workdir_default: ?[]const u8,
     diags: *yaml.Diags,
 ) !ir.Step {
+    try warnUnknownKeys(diags, n, "step", &step_known_keys);
     const run_node = n.get("run");
     const uses_node = n.get("uses");
     if (run_node == null and uses_node == null)
