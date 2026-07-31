@@ -1,0 +1,17 @@
+name: Basic
+env:
+  ROOT: yes
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: compile
+        run: echo compiling
+      - id: emit
+        run: echo "v=1" >> "$GITHUB_OUTPUT"
+        shell: sh
+  release:
+    needs: build
+    steps:
+      - run: echo "release ${{ needs.build.outputs.v }}"
+        if: github.ref == 'refs/heads/main'

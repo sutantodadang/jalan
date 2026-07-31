@@ -1,0 +1,8 @@
+name: Matrix
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [linux, windows]
+    steps:
+      - run: echo ${{ matrix.os }}
