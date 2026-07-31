@@ -8,6 +8,7 @@ pub const backend = @import("backend.zig");
 pub const engine = @import("engine.zig");
 pub const cli = @import("cli.zig");
 pub const config = @import("config.zig");
+pub const docker_http = @import("docker/http.zig");
 
 test {
     _ = yaml;
@@ -19,5 +20,6 @@ test {
     _ = engine;
     _ = cli;
     _ = config;
+    _ = docker_http;
     _ = @import("golden_test.zig");
 }
