@@ -200,6 +200,47 @@ fn setInputsEnv(alloc: std.mem.Allocator, env: *expr.Env, with: []const ir.EnvPa
         try env.put(alloc, try std.fmt.allocPrint(alloc, "inputs.{s}", .{w.name}), w.value);
 }
 
+const InputSnapshot = struct {
+    path: []const u8,
+    had_value: bool,
+    value: []const u8 = "",
+};
+
+/// Captures the pre-call state of every `inputs.<k>` key `setInputsEnv` is
+/// about to write, so `restoreInputs` can put the shared `expr.Env` back the
+/// way it found it once this composite call is done. Each composite gets its
+/// own `inputs.*` context in real GitHub Actions — without this, a nested
+/// composite's `with:` values leak into (and outlive) the caller's context.
+fn snapshotInputs(alloc: std.mem.Allocator, env: *expr.Env, with: []const ir.EnvPair, defaults: []const ir.EnvPair) ![]InputSnapshot {
+    var out: std.ArrayList(InputSnapshot) = .empty;
+    for (defaults) |d| {
+        const path = try std.fmt.allocPrint(alloc, "inputs.{s}", .{d.name});
+        const prior = try env.lookup(alloc, path);
+        try out.append(alloc, .{ .path = path, .had_value = prior != null, .value = prior orelse "" });
+    }
+    for (with) |w| {
+        const path = try std.fmt.allocPrint(alloc, "inputs.{s}", .{w.name});
+        const prior = try env.lookup(alloc, path);
+        try out.append(alloc, .{ .path = path, .had_value = prior != null, .value = prior orelse "" });
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Restores keys captured by `snapshotInputs`: puts back the prior value, or
+/// removes the key entirely if it was absent before this composite call.
+/// Duplicate entries (a key present in both `defaults` and `with`) are safe
+/// to restore more than once — every entry recorded the *same* pre-call
+/// state, so re-applying it is idempotent.
+fn restoreInputs(alloc: std.mem.Allocator, env: *expr.Env, snaps: []const InputSnapshot) void {
+    for (snaps) |s| {
+        if (s.had_value) {
+            env.put(alloc, s.path, s.value) catch {};
+        } else {
+            env.remove(alloc, s.path) catch {};
+        }
+    }
+}
+
 fn runComposite(
     alloc: std.mem.Allocator,
     meta: ActionMeta,
@@ -212,7 +253,13 @@ fn runComposite(
     err_msg: *?[]const u8,
     depth: u32,
 ) anyerror!backend.StepOutcome {
+    // Snapshot before mutating, restore no matter how this call exits
+    // (normal return or an error propagated via `try` below) — each
+    // composite invocation gets its own `inputs.*` context; the caller's
+    // (or a sibling composite's) `inputs.*` must never leak or get clobbered.
+    const snaps = try snapshotInputs(alloc, env, with, meta.input_defaults);
     try setInputsEnv(alloc, env, with, meta.input_defaults);
+    defer restoreInputs(alloc, env, snaps);
 
     var stdout_buf: std.ArrayList(u8) = .empty;
     var stderr_buf: std.ArrayList(u8) = .empty;
@@ -232,7 +279,14 @@ fn runComposite(
 
         try stdout_buf.appendSlice(alloc, out.stdout);
         try stderr_buf.appendSlice(alloc, out.stderr);
-        if (exit_code == 0) exit_code = out.exit_code;
+
+        // GHA stops a composite at its first failing step (unless that step
+        // tolerates its own failure via continue-on-error) — later steps
+        // never run, but output from steps that did run is kept.
+        if (out.exit_code != 0 and !child.continue_on_error) {
+            exit_code = out.exit_code;
+            break;
+        }
     }
 
     return .{
@@ -390,4 +444,39 @@ test "composite local action runs through native backend" {
     const out = try runUses(a, step, &with, b, &h, &env, null, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "hello jalan") != null);
+}
+
+test "nested composite: inputs are isolated per composite boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = backend.native();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    // outer's own `who` (via `with:`) must survive the nested `hello`
+    // composite setting its own `who: inner` and returning.
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/outer" };
+    const with = [_]ir.EnvPair{.{ .name = "who", .value = "caller" }};
+    var env = expr.Env{};
+    const out = try runUses(a, step, &with, b, &h, &env, null, false, &em);
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "before caller") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "after caller") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "after inner") == null);
+}
+
+test "composite short-circuits on first failing step (no continue-on-error)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = backend.native();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/failmid" };
+    var env = expr.Env{};
+    const out = try runUses(a, step, &.{}, b, &h, &env, null, false, &em);
+    try std.testing.expectEqual(@as(i32, 3), out.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "MARKER_SHOULD_NOT_APPEAR") == null);
 }

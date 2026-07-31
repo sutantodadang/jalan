@@ -1,0 +1,14 @@
+name: Outer
+inputs:
+  who:
+    default: outer
+runs:
+  using: composite
+  steps:
+    - run: echo "before ${{ inputs.who }}"
+      shell: sh
+    - uses: ./testdata/actions/hello
+      with:
+        who: inner
+    - run: echo "after ${{ inputs.who }}"
+      shell: sh
