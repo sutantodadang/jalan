@@ -11,6 +11,7 @@ pub const config = @import("config.zig");
 pub const docker_http = @import("docker/http.zig");
 pub const docker_client = @import("docker/client.zig");
 pub const docker_backend = @import("backend/docker.zig");
+pub const nix_backend = @import("backend/nix.zig");
 
 test {
     _ = yaml;
@@ -25,5 +26,6 @@ test {
     _ = docker_http;
     _ = docker_client;
     _ = docker_backend;
+    _ = nix_backend;
     _ = @import("golden_test.zig");
 }
