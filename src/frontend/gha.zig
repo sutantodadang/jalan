@@ -48,13 +48,11 @@ test "lower workflow to pipeline IR" {
     try std.testing.expectEqualStrings("github.ref == 'refs/heads/main'", build.steps[1].cond.?);
     // needs scalar form
     try std.testing.expectEqualStrings("build", p.jobs[1].needs[0]);
-    // uses step lowered with warning
+    // uses step lowered without a warning — phase 2 executes uses steps
     try std.testing.expectEqual(ir.StepKind.uses, p.jobs[1].steps[0].kind);
-    var warned = false;
     for (diags.list.items) |d| {
-        if (std.mem.startsWith(u8, d.msg, "warning: ")) warned = true;
+        try std.testing.expect(!std.mem.startsWith(u8, d.msg, "warning: "));
     }
-    try std.testing.expect(warned);
 }
 
 test "bad if expression is a hard diagnostic" {
@@ -83,6 +81,28 @@ test "unknown job key warns but does not fail parsing" {
     var found = false;
     for (diags.list.items) |d| {
         if (std.mem.startsWith(u8, d.msg, "warning: ") and std.mem.indexOf(u8, d.msg, "containerz") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "dropped x-jalan-nix-packages key warns with migration hint" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    x-jalan-nix-packages: nodejs_20,git
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 1), p.jobs.len);
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "was removed in phase 2") != null and
+            std.mem.indexOf(u8, d.msg, "setup-node") != null) found = true;
     }
     try std.testing.expect(found);
 }
@@ -169,6 +189,142 @@ test "'with' on a run step is an unknown-key warning" {
         if (std.mem.indexOf(u8, d.msg, "'with'") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "container: scalar image lowers into container_image, no warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    container: node:20-bookworm-slim
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqualStrings("node:20-bookworm-slim", p.jobs[0].container_image);
+    for (diags.list.items) |d| {
+        try std.testing.expect(std.mem.indexOf(u8, d.msg, "'container'") == null);
+    }
+}
+
+test "container: map with image key lowers into container_image" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    container:
+        \\      image: ubuntu:22.04
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqualStrings("ubuntu:22.04", p.jobs[0].container_image);
+}
+
+test "no container key leaves container_image empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqualStrings("", p.jobs[0].container_image);
+}
+
+test "services: scalar value lowers to service image, no env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    services:
+        \\      redis: redis:7-alpine
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 1), p.jobs[0].services.len);
+    try std.testing.expectEqualStrings("redis", p.jobs[0].services[0].name);
+    try std.testing.expectEqualStrings("redis:7-alpine", p.jobs[0].services[0].image);
+    try std.testing.expectEqual(@as(usize, 0), p.jobs[0].services[0].env.len);
+}
+
+test "services: map form with image and env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    services:
+        \\      redis:
+        \\        image: redis:7-alpine
+        \\        env:
+        \\          FOO: bar
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "x.yml", src, &diags);
+    try std.testing.expectEqualStrings("redis", p.jobs[0].services[0].name);
+    try std.testing.expectEqualStrings("redis:7-alpine", p.jobs[0].services[0].image);
+    try std.testing.expectEqualStrings("FOO", p.jobs[0].services[0].env[0].name);
+    try std.testing.expectEqualStrings("bar", p.jobs[0].services[0].env[0].value);
+}
+
+test "services: map form missing image is a hard diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    services:
+        \\      redis:
+        \\        env:
+        \\          FOO: bar
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    try std.testing.expectError(error.ParseFailed, parseWorkflow(a, "x.yml", src, &diags));
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "service 'redis' has no image") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "services key is recognized, no unknown-key warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    services:
+        \\      redis: redis:7-alpine
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    _ = try parseWorkflow(a, "x.yml", src, &diags);
+    for (diags.list.items) |d| {
+        try std.testing.expect(std.mem.indexOf(u8, d.msg, "'services'") == null);
+    }
 }
 
 test "validation diagnostics carry real source line numbers" {
@@ -355,6 +511,39 @@ fn envPairs(alloc: std.mem.Allocator, node: ?yaml.Node) ![]ir.EnvPair {
     return out.toOwnedSlice(alloc);
 }
 
+/// Lowers a `services:` map. Each entry's value is either a scalar (the
+/// image ref directly) or a map with a required `image:` key and optional
+/// `env:` map. A map entry with no (or empty) `image:` is a hard diagnostic
+/// — a service jalan can't start isn't worth silently dropping.
+fn lowerServices(alloc: std.mem.Allocator, node: ?yaml.Node, diags: *yaml.Diags) ![]ir.Service {
+    var out: std.ArrayList(ir.Service) = .empty;
+    if (node) |n| switch (n.data) {
+        .map => |m| {
+            var it = m.iterator();
+            while (it.next()) |e| {
+                const name = e.key_ptr.*;
+                const v = e.value_ptr.*;
+                var image: []const u8 = "";
+                var env: []ir.EnvPair = &.{};
+                switch (v.data) {
+                    .scalar => |s| image = s,
+                    .map => {
+                        image = if (v.get("image")) |img| img.scalarOr("") else "";
+                        env = try envPairs(alloc, v.get("env"));
+                    },
+                    .seq => {},
+                }
+                if (image.len == 0) {
+                    try diags.add(v.line, v.col, "service '{s}' has no image", .{name});
+                }
+                try out.append(alloc, .{ .name = name, .image = image, .env = env });
+            }
+        },
+        else => {},
+    };
+    return out.toOwnedSlice(alloc);
+}
+
 fn needsList(alloc: std.mem.Allocator, node: ?yaml.Node) ![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     if (node) |n| switch (n.data) {
@@ -385,7 +574,7 @@ fn condText(alloc: std.mem.Allocator, raw: []const u8, line: u32, diags: *yaml.D
 //   anything else        -> genuinely unknown key; "not supported in phase 1" warning.
 const workflow_supported_keys = [_][]const u8{ "name", "on", "env", "defaults", "jobs" };
 const workflow_known_unsupported_keys = [_][]const u8{ "permissions", "concurrency", "run-name" };
-const job_supported_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults" };
+const job_supported_keys = [_][]const u8{ "name", "runs-on", "needs", "env", "steps", "strategy", "defaults", "container", "services", "x-jalan-nix-packages" };
 const job_known_unsupported_keys = [_][]const u8{ "if", "outputs", "continue-on-error", "timeout-minutes", "environment", "concurrency", "permissions" };
 // 'with' is added conditionally by lowerStep: supported on `uses` steps only.
 const step_supported_keys = [_][]const u8{ "name", "id", "run", "uses", "shell", "env", "if", "working-directory", "continue-on-error", "timeout-minutes" };
@@ -573,6 +762,20 @@ fn lowerJob(
 
     try checkKeys(diags, jn, "job", &job_supported_keys, &job_known_unsupported_keys);
 
+    // Spec'd per-job override `x-jalan-nix-packages` was dropped in phase 2 in
+    // favor of `uses: actions/setup-*` interception on the nix backend — say
+    // so explicitly instead of the generic unknown-key warning, so a workflow
+    // carrying the old extension key is never silently misled.
+    if (jn.get("x-jalan-nix-packages") != null) {
+        try addWarn(diags, jn.line, 1, "job key 'x-jalan-nix-packages' was removed in phase 2 — use 'uses: actions/setup-node|setup-python|setup-go' to add nix packages instead", .{});
+    }
+
+    const container_image = if (jn.get("container")) |c| switch (c.data) {
+        .scalar => |s| s,
+        .map => if (c.get("image")) |img| img.scalarOr("") else "",
+        .seq => "",
+    } else "";
+
     return .{
         .id = job_id,
         .display_name = job_id,
@@ -581,6 +784,8 @@ fn lowerJob(
         .env = try env.toOwnedSlice(alloc),
         .steps = try steps.toOwnedSlice(alloc),
         .src_line = jn.line,
+        .container_image = container_image,
+        .services = try lowerServices(alloc, jn.get("services"), diags),
     };
 }
 
@@ -679,8 +884,6 @@ fn lowerStep(
     }
     if (run_node == null and uses_node == null)
         try diags.add(n.line, n.col, "step needs 'run' or 'uses'", .{});
-    if (uses_node != null)
-        try addWarn(diags, n.line, n.col, "'uses' actions are not executed in phase 1 (skipped at runtime)", .{});
 
     const script = if (run_node) |r| r.scalarOr("") else "";
     const uses_ref = if (uses_node) |u| u.scalarOr("") else "";
@@ -703,10 +906,20 @@ fn lowerStep(
         .uses_ref = uses_ref,
         .shell = if (n.get("shell")) |s| s.scalarOr("") else shell_default,
         .env = try envPairs(alloc, n.get("env")),
+        .with = if (uses_node != null) try envPairs(alloc, n.get("with")) else &.{},
         .workdir = if (n.get("working-directory")) |w| w.scalarOr("") else workdir_default,
         .cond = if (n.get("if")) |c| try condText(alloc, c.scalarOr(""), c.line, diags) else null,
         .continue_on_error = if (n.get("continue-on-error")) |c| std.mem.eql(u8, c.scalarOr(""), "true") else false,
         .timeout_minutes = timeout,
         .src_line = n.line,
     };
+}
+
+/// Lowers a single `runs.steps[]` node from a composite action.yml into an
+/// `ir.Step`, reusing the same step-shape rules as workflow steps (`run`,
+/// `uses`, `with`, `shell`, `if`, ...). No `shell`/`workdir` defaults apply
+/// inside a composite action — GitHub Actions composites don't inherit the
+/// caller workflow's `defaults:` block, so both are passed as `null`.
+pub fn lowerStepForComposite(alloc: std.mem.Allocator, n: yaml.Node, index: usize, diags: *yaml.Diags) !ir.Step {
+    return lowerStep(alloc, n, index, null, null, diags);
 }

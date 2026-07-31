@@ -1,0 +1,10 @@
+name: FailMid
+runs:
+  using: composite
+  steps:
+    - run: echo start
+      shell: sh
+    - run: exit 3
+      shell: sh
+    - run: echo MARKER_SHOULD_NOT_APPEAR
+      shell: sh

@@ -1,0 +1,9 @@
+name: Hello
+inputs:
+  who:
+    default: world
+runs:
+  using: composite
+  steps:
+    - run: echo "hello ${{ inputs.who }}"
+      shell: sh

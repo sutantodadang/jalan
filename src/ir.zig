@@ -19,12 +19,19 @@ pub const Step = struct {
     uses_ref: []const u8 = "",
     shell: ?[]const u8 = null,
     env: []EnvPair = &.{},
+    with: []EnvPair = &.{},
     workdir: ?[]const u8 = null,
     cond: ?[]const u8 = null,
     continue_on_error: bool = false,
     timeout_minutes: ?u32 = null,
     input_hash: ?[]const u8 = null,
     src_line: u32 = 0,
+};
+
+pub const Service = struct {
+    name: []const u8,
+    image: []const u8,
+    env: []EnvPair = &.{},
 };
 
 pub const Job = struct {
@@ -36,6 +43,8 @@ pub const Job = struct {
     matrix: []EnvPair = &.{},
     steps: []Step,
     src_line: u32 = 0,
+    container_image: []const u8 = "",
+    services: []Service = &.{},
 };
 
 pub const Pipeline = struct {

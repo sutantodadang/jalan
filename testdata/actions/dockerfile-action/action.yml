@@ -1,0 +1,5 @@
+name: dockerfile-action
+description: A build-from-source docker action, out of phase-2 scope.
+runs:
+  using: docker
+  image: Dockerfile

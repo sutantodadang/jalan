@@ -3,12 +3,7 @@ const std = @import("std");
 const ir = @import("../ir.zig");
 const builtin = @import("builtin");
 
-pub const StepOutcome = struct {
-    exit_code: i32,
-    stdout: []u8,
-    stderr: []u8,
-    outputs: []ir.EnvPair,
-};
+pub const StepOutcome = @import("../backend.zig").StepOutcome;
 
 pub const RunError = error{ SpawnFailed, OutOfMemory };
 
@@ -29,18 +24,50 @@ fn shellTable(name: []const u8) ?Shell {
     return null;
 }
 
+fn whereExe(alloc: std.mem.Allocator, exe: []const u8) ?[]const u8 {
+    if (builtin.os.tag == .windows) {
+        const r = std.process.Child.run(.{ .allocator = alloc, .argv = &.{ "where", exe } }) catch return null;
+        if (r.term == .Exited and r.term.Exited == 0) {
+            var it = std.mem.splitScalar(u8, r.stdout, '\n');
+            while (it.next()) |line| {
+                const t = std.mem.trim(u8, line, " \r\n");
+                if (t.len > 0) return t;
+            }
+        }
+        return null;
+    }
+    const cmd = std.fmt.allocPrint(alloc, "command -v {s}", .{exe}) catch return null;
+    const r = std.process.Child.run(.{ .allocator = alloc, .argv = &.{ "sh", "-c", cmd } }) catch return null;
+    if (r.term == .Exited and r.term.Exited == 0) {
+        const t = std.mem.trim(u8, r.stdout, " \r\n");
+        if (t.len > 0) return t;
+    }
+    return null;
+}
+
 fn onPath(alloc: std.mem.Allocator, exe: []const u8) bool {
-    const argv: []const []const u8 = if (builtin.os.tag == .windows)
-        &.{ "where", exe }
-    else blk: {
-        const cmd = std.fmt.allocPrint(alloc, "command -v {s}", .{exe}) catch return false;
-        break :blk &.{ "sh", "-c", cmd };
-    };
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
-        .argv = argv,
-    }) catch return false;
-    return result.term == .Exited and result.term.Exited == 0;
+    return whereExe(alloc, exe) != null;
+}
+
+fn gitBashExe(alloc: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    if (builtin.os.tag != .windows) return null;
+    const env_names = [_][]const u8{ "ProgramFiles", "LOCALAPPDATA", "ProgramW6432" };
+    const rels = [_][]const u8{ "", "\\Programs" };
+    for (env_names) |env_name| {
+        const base = std.process.getEnvVarOwned(alloc, env_name) catch continue;
+        for (rels) |rel| {
+            const p = std.fmt.allocPrint(alloc, "{s}{s}\\Git\\bin\\{s}.exe", .{ base, rel, name }) catch continue;
+            std.fs.cwd().access(p, .{}) catch continue;
+            return p;
+        }
+    }
+    return null;
+}
+
+fn resolveExe(alloc: std.mem.Allocator, name: []const u8) []const u8 {
+    if (whereExe(alloc, name)) |p| return p;
+    if (gitBashExe(alloc, name)) |p| return p;
+    return name;
 }
 
 fn defaultShell(alloc: std.mem.Allocator) Shell {
@@ -101,7 +128,8 @@ pub fn runStep(
     env_map.put("GITHUB_OUTPUT", abs_output) catch return error.OutOfMemory;
 
     var argv: std.ArrayList([]const u8) = .empty;
-    argv.appendSlice(alloc, shell.argv_prefix) catch return error.OutOfMemory;
+    argv.append(alloc, resolveExe(alloc, shell.name)) catch return error.OutOfMemory;
+    for (shell.argv_prefix[1..]) |a| argv.append(alloc, a) catch return error.OutOfMemory;
     const abs_script = std.fs.cwd().realpathAlloc(alloc, script_path) catch |e| {
         err_msg.* = std.fmt.allocPrint(
             alloc,

@@ -9,7 +9,8 @@ const ir = @import("ir.zig");
 const gha = @import("frontend/gha.zig");
 const yaml = @import("yaml.zig");
 const expr = @import("expr.zig");
-const native = @import("backend/native.zig");
+const backend_mod = @import("backend.zig");
+const runner = @import("actions/runner.zig");
 
 fn parseFixture(a: std.mem.Allocator, src: []const u8) !ir.Pipeline {
     var diags = yaml.Diags.init(a);
@@ -224,6 +225,44 @@ test "script interpolation failure fails the step without spawning" {
     try std.testing.expectEqual(@as(usize, 0), report.jobs[0].steps[0].stdout.len);
 }
 
+test "uses step runs end-to-end through the action runner (native backend)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - uses: ./testdata/actions/hello
+        \\        with:
+        \\          who: engine
+    );
+    const report = try run(a, p, .{});
+    try std.testing.expect(report.ok());
+    try std.testing.expectEqual(StepStatus.success, report.jobs[0].steps[0].status);
+    try std.testing.expect(std.mem.indexOf(u8, report.jobs[0].steps[0].stdout, "hello engine") != null);
+}
+
+test "job env and step env flow into uses actions and composite children" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\env:
+        \\  JOBVAR: hello
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - uses: ./testdata/actions/envcheck
+        \\        env:
+        \\          STEPVAR: world
+    );
+    const report = try run(a, p, .{});
+    try std.testing.expect(report.ok());
+    try std.testing.expectEqual(StepStatus.success, report.jobs[0].steps[0].status);
+    try std.testing.expect(std.mem.indexOf(u8, report.jobs[0].steps[0].stdout, "job=hello step=world") != null);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -262,6 +301,12 @@ pub const RunOptions = struct {
     matrix_filter: []const ir.EnvPair = &.{},
     // Called from worker threads under parallel job execution — must be thread-safe.
     log: ?*const fn (line: []const u8) void = null,
+    // null -> backend_mod.native(). Lets callers swap in container/other backends
+    // without touching runJob's step-loop logic.
+    exec_backend: ?backend_mod.Backend = null,
+    // Threaded to runUses's ref-resolution cache; forces a fresh fetch of
+    // GitHub-hosted actions instead of reusing a cached checkout.
+    force_pull: bool = false,
 };
 
 const Shared = struct {
@@ -447,6 +492,15 @@ fn runJob(
         }
     }
 
+    const b = opts.exec_backend orelse backend_mod.native();
+    var handle = b.setupJob(alloc, job, cwd, opts.log) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        // infra failure: whole job fails before any step runs
+        logJob(opts, alloc, job, "backend setup failed for job");
+        return .{ .job_index = index, .display_name = job.display_name, .status = .failed, .steps = steps };
+    };
+    defer b.teardownJob(alloc, &handle);
+
     var job_status: JobStatus = .success;
     step_loop: for (job.steps, 0..) |step, si| {
         if (opts.step_filter) |f| if (!std.mem.eql(u8, f, step.id)) continue;
@@ -466,13 +520,54 @@ fn runJob(
             };
             if (!v.truthy()) continue; // stays .skipped
         }
-        if (step.kind == .uses) {
-            logLine(opts, alloc, job, step, "skipped 'uses' step (phase 1)");
-            continue;
-        }
         if (opts.dry_run) {
             logLine(opts, alloc, job, step, "[dry-run] would run step");
             steps[si].status = .success;
+            continue;
+        }
+
+        if (step.kind == .uses) {
+            // Interpolate each `with:` value against the step's expr Env — same
+            // policy as step.env below: an expression error fails the step
+            // loudly (never runs the action un-interpolated), OOM propagates.
+            var with_list: std.ArrayList(ir.EnvPair) = .empty;
+            for (step.with) |w| {
+                const val = expr.interpolate(alloc, w.value, &env) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    const msg = try std.fmt.allocPrint(alloc, "warning: expression error in with {s}, step failed", .{w.name});
+                    logLine(opts, alloc, job, step, msg);
+                    steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+                    if (!step.continue_on_error) job_status = .failed;
+                    continue :step_loop;
+                };
+                try with_list.append(alloc, .{ .name = w.name, .value = val });
+            }
+            // Job env plus this step's `env:` map flow into the action — for
+            // composite children they are the child process environment, and
+            // for node/docker actions they join the INPUT_* entries. Same
+            // interpolation/failure policy as the `.run` branch below.
+            var step_env: std.ArrayList(ir.EnvPair) = .empty;
+            try step_env.appendSlice(alloc, merged_env.items);
+            for (step.env) |e| {
+                const val = expr.interpolate(alloc, e.value, &env) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    const msg = try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, step failed", .{e.name});
+                    logLine(opts, alloc, job, step, msg);
+                    steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+                    if (!step.continue_on_error) job_status = .failed;
+                    continue :step_loop;
+                };
+                try step_env.append(alloc, .{ .name = e.name, .value = val });
+                try env.put(alloc, try key2(alloc, "env", e.name), val);
+            }
+            var err_msg: ?[]const u8 = null;
+            const outcome = runner.runUses(alloc, step, with_list.items, step_env.items, b, &handle, &env, opts.log, opts.force_pull, &err_msg) catch {
+                steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
+                if (!step.continue_on_error) job_status = .failed;
+                continue;
+            };
+            const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
+            if (!ok and !step.continue_on_error) job_status = .failed;
             continue;
         }
 
@@ -513,36 +608,58 @@ fn runJob(
         } else null;
 
         var err_msg: ?[]const u8 = null;
-        const outcome = native.runStep(alloc, patched, spawn_env.items, workdir, &err_msg) catch {
+        const outcome = b.runStep(alloc, &handle, patched, spawn_env.items, workdir, &err_msg) catch {
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
             if (!step.continue_on_error) job_status = .failed;
             continue;
         };
-        const dur: u64 = @intCast(@max(std.time.milliTimestamp() - t0, 0));
-        const ok = outcome.exit_code == 0;
-        steps[si] = .{
-            .name = step.name,
-            .status = if (ok) .success else .failed,
-            .exit_code = outcome.exit_code,
-            .duration_ms = dur,
-            .stdout = outcome.stdout,
-            .stderr = outcome.stderr,
-        };
-        for (outcome.outputs) |o| {
-            try env.put(alloc, try std.fmt.allocPrint(alloc, "steps.{s}.outputs.{s}", .{ step.id, o.name }), o.value);
-            const jk = try std.fmt.allocPrint(alloc, "{s}.outputs.{s}", .{ job.id, o.name });
-            // Values put INTO the shared map must be duped with shared.alloc (caller
-            // arena) under the lock — the thread arena that owns jk/o.value dies at
-            // job end, but the map itself lives for the whole run.
-            mutex.lock();
-            defer mutex.unlock();
-            const jk_dup = try shared.alloc.dupe(u8, jk);
-            const val_dup = try shared.alloc.dupe(u8, o.value);
-            try shared.job_outputs.put(shared.alloc, jk_dup, val_dup);
-        }
+        const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
         if (!ok and !step.continue_on_error) job_status = .failed;
     }
     return .{ .job_index = index, .display_name = job.display_name, .status = job_status, .steps = steps };
+}
+
+/// Shared `.run`/`.uses` outcome plumbing: fills in the step's `StepResult`
+/// (status/exit_code/duration/stdout/stderr) and publishes its outputs into
+/// both the job-local expr Env (`steps.<id>.outputs.<name>`) and the
+/// cross-job shared map (`needs.<jobid>.outputs.<name>` for dependents).
+/// Returns whether the step succeeded (exit_code == 0); callers decide what
+/// that means for `job_status` (continue-on-error is a per-branch concern).
+fn applyStepOutcome(
+    alloc: std.mem.Allocator,
+    step: ir.Step,
+    si: usize,
+    t0: i64,
+    outcome: backend_mod.StepOutcome,
+    steps: []StepResult,
+    job: ir.Job,
+    shared: *Shared,
+    mutex: *std.Thread.Mutex,
+    env: *expr.Env,
+) !bool {
+    const dur: u64 = @intCast(@max(std.time.milliTimestamp() - t0, 0));
+    const ok = outcome.exit_code == 0;
+    steps[si] = .{
+        .name = step.name,
+        .status = if (ok) .success else .failed,
+        .exit_code = outcome.exit_code,
+        .duration_ms = dur,
+        .stdout = outcome.stdout,
+        .stderr = outcome.stderr,
+    };
+    for (outcome.outputs) |o| {
+        try env.put(alloc, try std.fmt.allocPrint(alloc, "steps.{s}.outputs.{s}", .{ step.id, o.name }), o.value);
+        const jk = try std.fmt.allocPrint(alloc, "{s}.outputs.{s}", .{ job.id, o.name });
+        // Values put INTO the shared map must be duped with shared.alloc (caller
+        // arena) under the lock — the thread arena that owns jk/o.value dies at
+        // job end, but the map itself lives for the whole run.
+        mutex.lock();
+        defer mutex.unlock();
+        const jk_dup = try shared.alloc.dupe(u8, jk);
+        const val_dup = try shared.alloc.dupe(u8, o.value);
+        try shared.job_outputs.put(shared.alloc, jk_dup, val_dup);
+    }
+    return ok;
 }
 
 fn key2(alloc: std.mem.Allocator, root: []const u8, name: []const u8) ![]const u8 {

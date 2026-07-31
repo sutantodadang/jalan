@@ -1,0 +1,8 @@
+name: js-hello
+description: Says hello in JavaScript, for runner.zig's node-action tests.
+inputs:
+  who:
+    default: world
+runs:
+  using: node20
+  main: index.js

@@ -60,6 +60,20 @@ test "functions contains and format" {
     try std.testing.expectEqualStrings("os=ubuntu-latest", f.string);
 }
 
+test "Env remove deletes a key so lookup falls back to unset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env = Env{};
+    try env.put(a, "inputs.who", "world");
+    try std.testing.expectEqualStrings("world", (try env.lookup(a, "inputs.who")).?);
+    try env.remove(a, "inputs.who");
+    try std.testing.expect((try env.lookup(a, "inputs.who")) == null);
+    // Removing an already-absent (or never-set) key is a no-op, not an error.
+    try env.remove(a, "inputs.who");
+    try env.remove(a, "inputs.never_set");
+}
+
 test "interpolate replaces multiple expressions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -255,6 +269,13 @@ pub const Env = struct {
     }
     pub fn lookup(self: *const Env, alloc: std.mem.Allocator, path: []const u8) !?[]const u8 {
         return self.vars.get(try std.ascii.allocLowerString(alloc, path));
+    }
+    /// Deletes `path` from the env (no-op if absent). Used to restore a
+    /// snapshotted env back to "key was never set" rather than leaving a
+    /// stale value behind.
+    pub fn remove(self: *Env, alloc: std.mem.Allocator, path: []const u8) !void {
+        const key = try std.ascii.allocLowerString(alloc, path);
+        _ = self.vars.fetchRemove(key);
     }
 };
 
