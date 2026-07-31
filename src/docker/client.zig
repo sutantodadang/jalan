@@ -256,6 +256,108 @@ pub fn tarSingleFile(alloc: std.mem.Allocator, name: []const u8, contents: []con
     return buf;
 }
 
+/// Appends a JSON-quoted, escaped copy of `s` to `out`. Copied from
+/// `ir.jsonStr` rather than imported, since this module doesn't otherwise
+/// depend on the pipeline IR.
+fn jsonStrAppend(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    try out.append(alloc, '"');
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(alloc, "\\\""),
+        '\\' => try out.appendSlice(alloc, "\\\\"),
+        '\n' => try out.appendSlice(alloc, "\\n"),
+        '\r' => try out.appendSlice(alloc, "\\r"),
+        '\t' => try out.appendSlice(alloc, "\\t"),
+        else => if (c < 0x20) {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\\u{x:0>4}", .{c}));
+        } else try out.append(alloc, c),
+    };
+    try out.append(alloc, '"');
+}
+
+/// Splits a Docker attach/exec multiplexed stream into stdout/stderr.
+/// Frame format: `[stream_type u8, 0,0,0, size u32 big-endian, payload...]`.
+/// Type 1 -> stdout, 2 -> stderr, 0 (stdin) is ignored. A truncated trailing
+/// frame just keeps whatever was already parsed.
+pub fn demuxFrames(alloc: std.mem.Allocator, body: []const u8) !struct { stdout: []u8, stderr: []u8 } {
+    var out: std.ArrayList(u8) = .empty;
+    var errs: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i + 8 <= body.len) {
+        const kind = body[i];
+        const size = std.mem.readInt(u32, body[i + 4 ..][0..4], .big);
+        i += 8;
+        const end = @min(i + size, body.len);
+        switch (kind) {
+            1 => try out.appendSlice(alloc, body[i..end]),
+            2 => try errs.appendSlice(alloc, body[i..end]),
+            else => {},
+        }
+        i = end;
+    }
+    return .{ .stdout = try out.toOwnedSlice(alloc), .stderr = try errs.toOwnedSlice(alloc) };
+}
+
+pub const ExecResult = struct { exit_code: i32, stdout: []u8, stderr: []u8 };
+
+/// Runs `cmd` inside an already-running container via the Docker exec API:
+/// `POST {prefix}/containers/{id}/exec` to create, `POST {prefix}/exec/{id}/start`
+/// to run it (the response body is the raw multiplexed stdout/stderr stream,
+/// demuxed with `demuxFrames`), then polls `GET {prefix}/exec/{id}/json` (up
+/// to 50x100ms while `Running`) for the exit code.
+pub fn execRun(alloc: std.mem.Allocator, c: Client, container_id: []const u8, cmd: []const []const u8, env: []const []const u8, workdir: ?[]const u8, err: *?[]const u8) !ExecResult {
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(alloc, "{\"AttachStdout\":true,\"AttachStderr\":true,\"Cmd\":[");
+    for (cmd, 0..) |arg, i| {
+        if (i > 0) try body.append(alloc, ',');
+        try jsonStrAppend(&body, alloc, arg);
+    }
+    try body.appendSlice(alloc, "],\"Env\":[");
+    for (env, 0..) |kv, i| {
+        if (i > 0) try body.append(alloc, ',');
+        try jsonStrAppend(&body, alloc, kv);
+    }
+    try body.append(alloc, ']');
+    if (workdir) |wd| {
+        try body.appendSlice(alloc, ",\"WorkingDir\":");
+        try jsonStrAppend(&body, alloc, wd);
+    }
+    try body.append(alloc, '}');
+
+    const create_path = try std.fmt.allocPrint(alloc, "{s}/containers/{s}/exec", .{ api_prefix, container_id });
+    const create_resp = try apiCall(alloc, c, .{
+        .method = "POST",
+        .path = create_path,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .body = try body.toOwnedSlice(alloc),
+    }, err);
+    const created = std.json.parseFromSliceLeaky(struct { Id: []const u8 }, alloc, create_resp.body, .{ .ignore_unknown_fields = true }) catch return error.DockerApi;
+    const eid = created.Id;
+
+    const start_path = try std.fmt.allocPrint(alloc, "{s}/exec/{s}/start", .{ api_prefix, eid });
+    const start_resp = try apiCall(alloc, c, .{
+        .method = "POST",
+        .path = start_path,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .body = "{\"Detach\":false,\"Tty\":false}",
+    }, err);
+    const demuxed = try demuxFrames(alloc, start_resp.body);
+
+    const inspect_path = try std.fmt.allocPrint(alloc, "{s}/exec/{s}/json", .{ api_prefix, eid });
+    var exit_code: i32 = 0;
+    var attempt: usize = 0;
+    while (attempt < 50) : (attempt += 1) {
+        const inspect_resp = try apiCall(alloc, c, .{ .method = "GET", .path = inspect_path }, err);
+        const parsed = std.json.parseFromSliceLeaky(struct { ExitCode: ?i32 = null, Running: bool = false }, alloc, inspect_resp.body, .{ .ignore_unknown_fields = true }) catch return error.DockerApi;
+        if (!parsed.Running) {
+            exit_code = parsed.ExitCode orelse 0;
+            break;
+        }
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+
+    return .{ .exit_code = exit_code, .stdout = demuxed.stdout, .stderr = demuxed.stderr };
+}
+
 test "detectSocket precedence: config over default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -322,4 +424,34 @@ test "docker end-to-end: pull tiny image, create, start, wait, remove (skips wit
     try containerStart(a, c, id, &err);
     const code = try containerWait(a, c, id, &err);
     try std.testing.expectEqual(@as(i32, 0), code);
+}
+
+test "demuxFrames splits stdout and stderr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // frame: type=1 "out\n", type=2 "err\n"
+    const body = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 4 } ++ "out\n".* ++ [_]u8{ 2, 0, 0, 0, 0, 0, 0, 4 } ++ "err\n".*;
+    const r = try demuxFrames(a, &body);
+    try std.testing.expectEqualStrings("out\n", r.stdout);
+    try std.testing.expectEqualStrings("err\n", r.stderr);
+}
+
+test "exec in live container captures output and exit code (skips without daemon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = Client{ .socket_path = detectSocket(a, .{}).? };
+    if (!ping(a, c)) return error.SkipZigTest;
+    var err: ?[]const u8 = null;
+    if (!try imageExists(a, c, "busybox:latest", &err)) try imagePull(a, c, "busybox:latest", null, &err);
+    const id = try containerCreate(a, c,
+        \\{"Image":"busybox:latest","Cmd":["sleep","30"]}
+    , null, &err);
+    defer containerRemove(a, c, id, &err) catch {};
+    try containerStart(a, c, id, &err);
+    const r = try execRun(a, c, id, &.{ "sh", "-c", "echo hi; echo bad >&2; exit 7" }, &.{}, null, &err);
+    try std.testing.expectEqual(@as(i32, 7), r.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "bad") != null);
 }
