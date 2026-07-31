@@ -130,6 +130,43 @@ test "known-but-unsupported keys (strategy, with) do not warn" {
     }
 }
 
+test "matrix expands cartesian product with display names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    strategy:
+        \\      matrix:
+        \\        os: [linux, windows]
+        \\        node: [18, 20]
+        \\    steps:
+        \\      - run: echo ${{ matrix.os }}-${{ matrix.node }}
+    ;
+    const p = try parseWorkflow(a, "m.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 4), p.jobs.len);
+    try std.testing.expectEqualStrings("build (linux, 18)", p.jobs[0].display_name);
+    try std.testing.expectEqualStrings("build (windows, 20)", p.jobs[3].display_name);
+    try std.testing.expectEqualStrings("os", p.jobs[0].matrix[0].name);
+    try std.testing.expectEqualStrings("linux", p.jobs[0].matrix[0].value);
+}
+
+test "matrixMatches filters combos" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var combo = [_]ir.EnvPair{ .{ .name = "os", .value = "linux" }, .{ .name = "node", .value = "18" } };
+    var steps = [_]ir.Step{};
+    const job = ir.Job{ .id = "b", .display_name = "b", .matrix = &combo, .steps = &steps };
+    var f_ok = [_]ir.EnvPair{.{ .name = "os", .value = "linux" }};
+    var f_no = [_]ir.EnvPair{.{ .name = "node", .value = "20" }};
+    try std.testing.expect(matrixMatches(job, &f_ok));
+    try std.testing.expect(!matrixMatches(job, &f_no));
+    _ = a;
+}
+
 pub const ParseError = error{ ParseFailed, OutOfMemory };
 
 fn addWarn(diags: *yaml.Diags, line: u32, col: u32, comptime fmt: []const u8, args: anytype) !void {
@@ -247,32 +284,9 @@ pub fn parseWorkflow(
             while (it.next()) |e| {
                 const job_id = e.key_ptr.*;
                 const jn = e.value_ptr.*;
-                const job_defaults = readDefaults(jn.get("defaults"));
-                const shell_default = job_defaults.shell orelse wf_defaults.shell;
-                const workdir_default = job_defaults.workdir orelse wf_defaults.workdir;
-
-                var env: std.ArrayList(ir.EnvPair) = .empty;
-                try env.appendSlice(alloc, wf_env);
-                try env.appendSlice(alloc, try envPairs(alloc, jn.get("env")));
-
-                var steps: std.ArrayList(ir.Step) = .empty;
-                if (jn.get("steps")) |sn| switch (sn.data) {
-                    .seq => |items| for (items, 0..) |stepn, i| {
-                        try steps.append(alloc, try lowerStep(alloc, stepn, i, shell_default, workdir_default, diags));
-                    },
-                    else => try diags.add(sn.line, sn.col, "'steps' must be a sequence", .{}),
-                } else try diags.add(jn.line, jn.col, "job '{s}' has no steps", .{job_id});
-
-                try warnUnknownKeys(diags, jn, "job", &job_known_keys);
-
-                try jobs.append(alloc, .{
-                    .id = job_id,
-                    .display_name = job_id,
-                    .runs_on = if (jn.get("runs-on")) |r| r.scalarOr("") else "",
-                    .needs = try needsList(alloc, jn.get("needs")),
-                    .env = try env.toOwnedSlice(alloc),
-                    .steps = try steps.toOwnedSlice(alloc),
-                });
+                const base = try lowerJob(alloc, job_id, jn, wf_env, wf_defaults, diags);
+                const axes = try readMatrix(alloc, jn, diags);
+                try appendExpanded(alloc, &jobs, base, axes);
             }
         },
         else => {
@@ -282,6 +296,109 @@ pub fn parseWorkflow(
     }
     if (hasHardError(diags)) return error.ParseFailed;
     return .{ .name = name, .source_path = source_path, .jobs = try jobs.toOwnedSlice(alloc) };
+}
+
+fn lowerJob(
+    alloc: std.mem.Allocator,
+    job_id: []const u8,
+    jn: yaml.Node,
+    wf_env: []const ir.EnvPair,
+    wf_defaults: Defaults,
+    diags: *yaml.Diags,
+) !ir.Job {
+    const job_defaults = readDefaults(jn.get("defaults"));
+    const shell_default = job_defaults.shell orelse wf_defaults.shell;
+    const workdir_default = job_defaults.workdir orelse wf_defaults.workdir;
+
+    var env: std.ArrayList(ir.EnvPair) = .empty;
+    try env.appendSlice(alloc, wf_env);
+    try env.appendSlice(alloc, try envPairs(alloc, jn.get("env")));
+
+    var steps: std.ArrayList(ir.Step) = .empty;
+    if (jn.get("steps")) |sn| switch (sn.data) {
+        .seq => |items| for (items, 0..) |stepn, i| {
+            try steps.append(alloc, try lowerStep(alloc, stepn, i, shell_default, workdir_default, diags));
+        },
+        else => try diags.add(sn.line, sn.col, "'steps' must be a sequence", .{}),
+    } else try diags.add(jn.line, jn.col, "job '{s}' has no steps", .{job_id});
+
+    try warnUnknownKeys(diags, jn, "job", &job_known_keys);
+
+    return .{
+        .id = job_id,
+        .display_name = job_id,
+        .runs_on = if (jn.get("runs-on")) |r| r.scalarOr("") else "",
+        .needs = try needsList(alloc, jn.get("needs")),
+        .env = try env.toOwnedSlice(alloc),
+        .steps = try steps.toOwnedSlice(alloc),
+    };
+}
+
+const Axis = struct { name: []const u8, values: [][]const u8 };
+
+fn readMatrix(alloc: std.mem.Allocator, jn: yaml.Node, diags: *yaml.Diags) ![]Axis {
+    var axes: std.ArrayList(Axis) = .empty;
+    const strategy = jn.get("strategy") orelse return axes.toOwnedSlice(alloc);
+    const matrix = strategy.get("matrix") orelse return axes.toOwnedSlice(alloc);
+    switch (matrix.data) {
+        .map => |m| {
+            var it = m.iterator();
+            while (it.next()) |e| {
+                const axis_name = e.key_ptr.*;
+                if (std.mem.eql(u8, axis_name, "include") or std.mem.eql(u8, axis_name, "exclude")) {
+                    try addWarn(diags, e.value_ptr.line, e.value_ptr.col, "matrix {s} is not supported in phase 1 (ignored)", .{axis_name});
+                    continue;
+                }
+                var vals: std.ArrayList([]const u8) = .empty;
+                switch (e.value_ptr.data) {
+                    .seq => |items| for (items) |v| try vals.append(alloc, v.scalarOr("")),
+                    .scalar => |s| try vals.append(alloc, s),
+                    .map => try diags.add(e.value_ptr.line, e.value_ptr.col, "matrix axis '{s}' must be a list", .{axis_name}),
+                }
+                try axes.append(alloc, .{ .name = axis_name, .values = try vals.toOwnedSlice(alloc) });
+            }
+        },
+        else => try diags.add(matrix.line, matrix.col, "'matrix' must be a mapping", .{}),
+    }
+    return axes.toOwnedSlice(alloc);
+}
+
+fn appendExpanded(alloc: std.mem.Allocator, jobs: *std.ArrayList(ir.Job), base: ir.Job, axes: []Axis) !void {
+    if (axes.len == 0) {
+        try jobs.append(alloc, base);
+        return;
+    }
+    var total: usize = 1;
+    for (axes) |ax| total *= @max(ax.values.len, 1);
+    var combo_idx: usize = 0;
+    while (combo_idx < total) : (combo_idx += 1) {
+        var combo: std.ArrayList(ir.EnvPair) = .empty;
+        var names: std.ArrayList([]const u8) = .empty;
+        var rem = combo_idx;
+        var stride: usize = total;
+        for (axes) |ax| {
+            stride /= @max(ax.values.len, 1);
+            const v = ax.values[(rem / @max(stride, 1)) % @max(ax.values.len, 1)];
+            rem %= @max(stride, 1);
+            try combo.append(alloc, .{ .name = ax.name, .value = v });
+            try names.append(alloc, v);
+        }
+        var j = base;
+        j.matrix = try combo.toOwnedSlice(alloc);
+        j.display_name = try std.fmt.allocPrint(alloc, "{s} ({s})", .{ base.id, try std.mem.join(alloc, ", ", names.items) });
+        try jobs.append(alloc, j);
+    }
+}
+
+pub fn matrixMatches(job: ir.Job, filters: []const ir.EnvPair) bool {
+    for (filters) |f| {
+        var found = false;
+        for (job.matrix) |m| {
+            if (std.mem.eql(u8, m.name, f.name) and std.mem.eql(u8, m.value, f.value)) found = true;
+        }
+        if (!found) return false;
+    }
+    return true;
 }
 
 fn lowerStep(
