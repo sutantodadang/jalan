@@ -1,0 +1,6 @@
+name: EnvCheck
+runs:
+  using: composite
+  steps:
+    - run: echo "job=$JOBVAR step=$STEPVAR"
+      shell: sh

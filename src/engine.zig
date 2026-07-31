@@ -243,6 +243,26 @@ test "uses step runs end-to-end through the action runner (native backend)" {
     try std.testing.expect(std.mem.indexOf(u8, report.jobs[0].steps[0].stdout, "hello engine") != null);
 }
 
+test "job env and step env flow into uses actions and composite children" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\env:
+        \\  JOBVAR: hello
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - uses: ./testdata/actions/envcheck
+        \\        env:
+        \\          STEPVAR: world
+    );
+    const report = try run(a, p, .{});
+    try std.testing.expect(report.ok());
+    try std.testing.expectEqual(StepStatus.success, report.jobs[0].steps[0].status);
+    try std.testing.expect(std.mem.indexOf(u8, report.jobs[0].steps[0].stdout, "job=hello step=world") != null);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -522,8 +542,26 @@ fn runJob(
                 };
                 try with_list.append(alloc, .{ .name = w.name, .value = val });
             }
+            // Job env plus this step's `env:` map flow into the action — for
+            // composite children they are the child process environment, and
+            // for node/docker actions they join the INPUT_* entries. Same
+            // interpolation/failure policy as the `.run` branch below.
+            var step_env: std.ArrayList(ir.EnvPair) = .empty;
+            try step_env.appendSlice(alloc, merged_env.items);
+            for (step.env) |e| {
+                const val = expr.interpolate(alloc, e.value, &env) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    const msg = try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, step failed", .{e.name});
+                    logLine(opts, alloc, job, step, msg);
+                    steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+                    if (!step.continue_on_error) job_status = .failed;
+                    continue :step_loop;
+                };
+                try step_env.append(alloc, .{ .name = e.name, .value = val });
+                try env.put(alloc, try key2(alloc, "env", e.name), val);
+            }
             var err_msg: ?[]const u8 = null;
-            const outcome = runner.runUses(alloc, step, with_list.items, b, &handle, &env, opts.log, opts.force_pull, &err_msg) catch {
+            const outcome = runner.runUses(alloc, step, with_list.items, step_env.items, b, &handle, &env, opts.log, opts.force_pull, &err_msg) catch {
                 steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
                 if (!step.continue_on_error) job_status = .failed;
                 continue;

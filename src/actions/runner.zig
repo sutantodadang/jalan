@@ -164,6 +164,7 @@ pub fn runUses(
     alloc: std.mem.Allocator,
     step: ir.Step,
     with: []const ir.EnvPair,
+    job_env: []const ir.EnvPair,
     b: backend.Backend,
     handle: *backend.JobHandle,
     env: *expr.Env,
@@ -171,7 +172,7 @@ pub fn runUses(
     force_pull: bool,
     err_msg: *?[]const u8,
 ) !backend.StepOutcome {
-    return runUsesDepth(alloc, step, with, b, handle, env, opts_log, force_pull, err_msg, 0);
+    return runUsesDepth(alloc, step, with, job_env, b, handle, env, opts_log, force_pull, err_msg, 0);
 }
 
 // `runUsesDepth` and `runComposite` are mutually recursive (a composite
@@ -182,6 +183,7 @@ fn runUsesDepth(
     alloc: std.mem.Allocator,
     step: ir.Step,
     with: []const ir.EnvPair,
+    job_env: []const ir.EnvPair,
     b: backend.Backend,
     handle: *backend.JobHandle,
     env: *expr.Env,
@@ -225,7 +227,7 @@ fn runUsesDepth(
     // A bare `uses: docker://image` has no `action.yml` to read — the ref
     // itself *is* the whole action.
     if (ref == .docker_image) {
-        return runDockerImageAction(alloc, ref.docker_image, with, &.{}, b, handle, opts_log, err_msg);
+        return runDockerImageAction(alloc, ref.docker_image, with, &.{}, job_env, b, handle, opts_log, err_msg);
     }
 
     const dir = switch (ref) {
@@ -245,14 +247,14 @@ fn runUsesDepth(
     }
 
     return switch (classify(meta.using, ref)) {
-        .composite => runComposite(alloc, meta, with, b, handle, env, opts_log, force_pull, err_msg, depth),
-        .node => runNodeAction(alloc, meta, dir, ref, with, b, handle, opts_log, err_msg),
+        .composite => runComposite(alloc, meta, with, job_env, b, handle, env, opts_log, force_pull, err_msg, depth),
+        .node => runNodeAction(alloc, meta, dir, ref, with, job_env, b, handle, opts_log, err_msg),
         .docker_image => blk: {
             if (!std.mem.startsWith(u8, meta.image, "docker://")) {
                 if (opts_log) |l| l("Dockerfile-based actions are not supported (docker build is out of phase-2 scope)");
                 break :blk .{ .exit_code = 0, .stdout = "", .stderr = "", .outputs = &.{} };
             }
-            break :blk runDockerImageAction(alloc, meta.image["docker://".len..], with, meta.input_defaults, b, handle, opts_log, err_msg);
+            break :blk runDockerImageAction(alloc, meta.image["docker://".len..], with, meta.input_defaults, job_env, b, handle, opts_log, err_msg);
         },
         else => blk: {
             err_msg.* = try std.fmt.allocPrint(alloc, "unsupported action type '{s}'", .{meta.using});
@@ -342,6 +344,7 @@ fn runNodeAction(
     dir: []const u8,
     ref: resolve.Ref,
     with: []const ir.EnvPair,
+    job_env: []const ir.EnvPair,
     b: backend.Backend,
     handle: *backend.JobHandle,
     opts_log: ?backend.LogFn,
@@ -361,9 +364,12 @@ fn runNodeAction(
         return error.SpawnFailed;
     };
     const script = try std.fmt.allocPrint(alloc, "node \"{s}\"", .{abs_main});
-    const env_pairs = try buildInputEnv(alloc, with, meta.input_defaults);
+    const input_env = try buildInputEnv(alloc, with, meta.input_defaults);
+    var env_pairs: std.ArrayList(ir.EnvPair) = .empty;
+    try env_pairs.appendSlice(alloc, job_env);
+    try env_pairs.appendSlice(alloc, input_env);
     const run_step = ir.Step{ .id = "uses-node", .name = "uses-node", .kind = .run, .script = script };
-    return b.runStep(alloc, handle, run_step, env_pairs, null, err_msg);
+    return b.runStep(alloc, handle, run_step, env_pairs.items, null, err_msg);
 }
 
 /// Resolves `runs.main` to the path `node` should be invoked with. On
@@ -397,6 +403,7 @@ fn runDockerImageAction(
     image: []const u8,
     with: []const ir.EnvPair,
     defaults: []const ir.EnvPair,
+    job_env: []const ir.EnvPair,
     b: backend.Backend,
     handle: *backend.JobHandle,
     opts_log: ?backend.LogFn,
@@ -416,9 +423,12 @@ fn runDockerImageAction(
         }
         cmd_args = try list.toOwnedSlice(alloc);
     }
-    const env_pairs = try buildInputEnv(alloc, with, defaults);
+    const input_env = try buildInputEnv(alloc, with, defaults);
+    var env_pairs: std.ArrayList(ir.EnvPair) = .empty;
+    try env_pairs.appendSlice(alloc, job_env);
+    try env_pairs.appendSlice(alloc, input_env);
 
-    return b.runContainerAction(alloc, handle, image, cmd_args, env_pairs, err_msg);
+    return b.runContainerAction(alloc, handle, image, cmd_args, env_pairs.items, err_msg);
 }
 
 fn setInputsEnv(alloc: std.mem.Allocator, env: *expr.Env, with: []const ir.EnvPair, defaults: []const ir.EnvPair) !void {
@@ -473,6 +483,7 @@ fn runComposite(
     alloc: std.mem.Allocator,
     meta: ActionMeta,
     with: []const ir.EnvPair,
+    job_env: []const ir.EnvPair,
     b: backend.Backend,
     handle: *backend.JobHandle,
     env: *expr.Env,
@@ -498,11 +509,11 @@ fn runComposite(
         const child = try gha.lowerStepForComposite(alloc, sn, i, &step_diags);
 
         const out = if (child.kind == .uses)
-            try runUsesDepth(alloc, child, child.with, b, handle, env, opts_log, force_pull, err_msg, depth + 1)
+            try runUsesDepth(alloc, child, child.with, job_env, b, handle, env, opts_log, force_pull, err_msg, depth + 1)
         else blk: {
             var run_step = child;
             run_step.script = try expr.interpolate(alloc, child.script, env);
-            break :blk try b.runStep(alloc, handle, run_step, &.{}, run_step.workdir, err_msg);
+            break :blk try b.runStep(alloc, handle, run_step, job_env, run_step.workdir, err_msg);
         };
 
         try stdout_buf.appendSlice(alloc, out.stdout);
@@ -669,9 +680,28 @@ test "composite local action runs through native backend" {
     const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/hello" };
     const with = [_]ir.EnvPair{.{ .name = "who", .value = "jalan" }};
     var env = expr.Env{};
-    const out = try runUses(a, step, &with, b, &h, &env, null, false, &em);
+    const out = try runUses(a, step, &with, &.{}, b, &h, &env, null, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "hello jalan") != null);
+}
+
+test "composite child steps inherit threaded job env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = backend.native();
+    const cwd = try std.fs.cwd().realpathAlloc(a, ".");
+    var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .steps = &.{} }, cwd, null);
+    var em: ?[]const u8 = null;
+    const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/envcheck" };
+    const job_env = [_]ir.EnvPair{
+        .{ .name = "JOBVAR", .value = "hello" },
+        .{ .name = "STEPVAR", .value = "world" },
+    };
+    var env = expr.Env{};
+    const out = try runUses(a, step, &.{}, &job_env, b, &h, &env, null, false, &em);
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, out.stdout, "job=hello step=world") != null);
 }
 
 test "nested composite: inputs are isolated per composite boundary" {
@@ -687,7 +717,7 @@ test "nested composite: inputs are isolated per composite boundary" {
     const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/outer" };
     const with = [_]ir.EnvPair{.{ .name = "who", .value = "caller" }};
     var env = expr.Env{};
-    const out = try runUses(a, step, &with, b, &h, &env, null, false, &em);
+    const out = try runUses(a, step, &with, &.{}, b, &h, &env, null, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "before caller") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "after caller") != null);
@@ -704,7 +734,7 @@ test "composite short-circuits on first failing step (no continue-on-error)" {
     var em: ?[]const u8 = null;
     const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/failmid" };
     var env = expr.Env{};
-    const out = try runUses(a, step, &.{}, b, &h, &env, null, false, &em);
+    const out = try runUses(a, step, &.{}, &.{}, b, &h, &env, null, false, &em);
     try std.testing.expectEqual(@as(i32, 3), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "MARKER_SHOULD_NOT_APPEAR") == null);
 }
@@ -754,7 +784,7 @@ test "js node20 local action runs through native backend, INPUT_ mapping works (
     const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/js-hello" };
     const with = [_]ir.EnvPair{.{ .name = "who", .value = "jalan" }};
     var env = expr.Env{};
-    const out = try runUses(a, step, &with, b, &h, &env, null, false, &em);
+    const out = try runUses(a, step, &with, &.{}, b, &h, &env, null, false, &em);
     if (em) |m| std.debug.print("js-hello run failed: {s}\n", .{m});
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "js says jalan") != null);
@@ -772,7 +802,7 @@ test "js node20 action falls back to input default when 'with' omits it (gated: 
     var em: ?[]const u8 = null;
     const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "./testdata/actions/js-hello" };
     var env = expr.Env{};
-    const out = try runUses(a, step, &.{}, b, &h, &env, null, false, &em);
+    const out = try runUses(a, step, &.{}, &.{}, b, &h, &env, null, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "js says world") != null);
 }
@@ -798,7 +828,7 @@ test "node action with runs.pre logs the pre/post warning and still runs (gated:
         }
     };
     Capture.count = 0;
-    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    const out = try runUses(a, step, &.{}, &.{}, b, &h, &env, Capture.log, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, out.stdout, "main ran") != null);
     var saw_warning = false;
@@ -826,7 +856,7 @@ test "docker-using action with image != docker:// warns and skips (Dockerfile ac
         }
     };
     Capture.msg = null;
-    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    const out = try runUses(a, step, &.{}, &.{}, b, &h, &env, Capture.log, false, &em);
     logged = Capture.msg;
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(logged != null);
@@ -850,7 +880,7 @@ test "docker:// action on a non-docker backend warns and skips (bare uses: docke
         }
     };
     Capture.msg = null;
-    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    const out = try runUses(a, step, &.{}, &.{}, b, &h, &env, Capture.log, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(Capture.msg != null);
     try std.testing.expect(std.mem.indexOf(u8, Capture.msg.?, "docker:// actions require --backend docker") != null);
@@ -873,7 +903,7 @@ test "docker:// action via using:docker+image on a non-docker backend also warns
         }
     };
     Capture.msg = null;
-    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    const out = try runUses(a, step, &.{}, &.{}, b, &h, &env, Capture.log, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(Capture.msg != null);
     try std.testing.expect(std.mem.indexOf(u8, Capture.msg.?, "docker:// actions require --backend docker") != null);
@@ -897,7 +927,7 @@ test "setup-node is intercepted on the nix backend without needing nix installed
         }
     };
     Capture.msg = null;
-    const out = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    const out = try runUses(a, step, &.{}, &.{}, b, &h, &env, Capture.log, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(Capture.msg != null);
     try std.testing.expectEqualStrings("setup-node: added nix package 'nodejs_20' for subsequent steps", Capture.msg.?);
@@ -917,7 +947,7 @@ test "setup-python on nix actually appends to handle.nix_packages, no duplicate 
     const step = ir.Step{ .id = "u", .name = "u", .kind = .uses, .script = "", .uses_ref = "actions/setup-python@v5" };
     var env = expr.Env{};
 
-    const out1 = try runUses(a, step, &.{}, b, &h, &env, null, false, &em);
+    const out1 = try runUses(a, step, &.{}, &.{}, b, &h, &env, null, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out1.exit_code);
     try std.testing.expectEqual(@as(usize, 1), h.nix_packages.len);
     try std.testing.expect(containsStr(h.nix_packages, "python3"));
@@ -930,7 +960,7 @@ test "setup-python on nix actually appends to handle.nix_packages, no duplicate 
         }
     };
     Capture.msg = null;
-    const out2 = try runUses(a, step, &.{}, b, &h, &env, Capture.log, false, &em);
+    const out2 = try runUses(a, step, &.{}, &.{}, b, &h, &env, Capture.log, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out2.exit_code);
     try std.testing.expectEqual(@as(usize, 1), h.nix_packages.len);
     try std.testing.expectEqualStrings("setup-python: nix package 'python3' already present", Capture.msg.?);
