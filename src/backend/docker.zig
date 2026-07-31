@@ -46,18 +46,18 @@ fn jsonStrAppend(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u
     try out.append(alloc, '"');
 }
 
-/// Converts a Windows-style absolute path (`C:\Users\x`) into the
-/// forward-slash form Docker Desktop's Linux daemon expects for bind-mount
-/// sources (`/c/Users/x`). No-op on non-Windows hosts and on paths that
-/// don't look like a drive-letter path.
+/// Bind-mount source for `workspace_abs`. We call the Engine API raw (no
+/// `docker` CLI in between), and Docker Desktop's daemon translates host
+/// paths itself — a native Windows path (`C:\Users\x`) is what the CLI
+/// itself sends over the wire, so it passes through unchanged here (just
+/// normalized to backslashes, in case a caller handed us a mixed-separator
+/// path). Live verification pending — Docker Desktop was down during
+/// development; revisit if bind mounts fail against a real daemon.
 fn toBindSource(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
     if (builtin.os.tag != .windows) return path;
-    if (path.len < 2 or path[1] != ':') return path;
-    var out: std.ArrayList(u8) = .empty;
-    try out.append(alloc, '/');
-    try out.append(alloc, std.ascii.toLower(path[0]));
-    for (path[2..]) |ch| try out.append(alloc, if (ch == '\\') '/' else ch);
-    return out.toOwnedSlice(alloc);
+    var out = try alloc.alloc(u8, path.len);
+    for (path, 0..) |ch, i| out[i] = if (ch == '/') '\\' else ch;
+    return out;
 }
 
 /// Replaces path-unsafe characters in a step id with `-`, so it's safe to
@@ -172,6 +172,8 @@ fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: 
     };
     client.containerStart(alloc, self.client, id, &err) catch |e| {
         if (log) |l| if (err) |m| l(m);
+        var cleanup_err: ?[]const u8 = null;
+        client.containerRemove(alloc, self.client, id, &cleanup_err) catch {};
         return e;
     };
 
@@ -277,6 +279,19 @@ test "shellArgv maps known shells, rejects unavailable ones" {
     try std.testing.expectError(error.UnsupportedShell, shellArgv(a, "fish", "/tmp/s.fish"));
 }
 
+test "toBindSource: windows path passes through unchanged (Docker Desktop translates it), unix path always unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqualStrings("C:\\Users\\x\\proj", try toBindSource(a, "C:\\Users\\x\\proj"));
+        // mixed separators get normalized to backslash, not converted to /c/ form.
+        try std.testing.expectEqualStrings("C:\\Users\\x\\proj", try toBindSource(a, "C:/Users/x/proj"));
+    } else {
+        try std.testing.expectEqualStrings("/home/user/proj", try toBindSource(a, "/home/user/proj"));
+    }
+}
+
 test "sanitizeStepId replaces unsafe characters with dashes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -290,10 +305,19 @@ test "buildContainerCreateSpec embeds image, workspace bind, and env" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const spec = try buildContainerCreateSpec(a, "node:20-bookworm-slim", &.{"CI=true"}, "/home/user/proj", null);
+    const workspace = "/home/user/proj";
+    const spec = try buildContainerCreateSpec(a, "node:20-bookworm-slim", &.{"CI=true"}, workspace, null);
+    const raw_bind = try std.fmt.allocPrint(a, "{s}:/github/workspace", .{try toBindSource(a, workspace)});
+    // jsonStrAppend escapes backslashes (Windows bind sources can contain
+    // them); build the same escaped form so this assertion works on both OSes.
+    var escaped: std.ArrayList(u8) = .empty;
+    for (raw_bind) |c| {
+        if (c == '\\') try escaped.appendSlice(a, "\\\\") else try escaped.append(a, c);
+    }
+    const expected_bind = try escaped.toOwnedSlice(a);
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"Image\":\"node:20-bookworm-slim\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"Cmd\":[\"sleep\",\"infinity\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, spec, "/home/user/proj:/github/workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, spec, expected_bind) != null);
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"CI=true\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"WorkingDir\":\"/github/workspace\"") != null);
 }
