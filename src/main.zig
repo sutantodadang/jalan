@@ -3,8 +3,8 @@ const jalan = @import("jalan");
 
 pub fn main() !void {
     // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try jalan.bufferedPrint();
+    std.debug.print("jalan: local CI simulator\n", .{});
+    _ = jalan.yaml;
 }
 
 test "simple test" {
