@@ -109,6 +109,12 @@ test "unknown flag is an error" {
     try std.testing.expectError(error.BadArgs, parseRunArgs(arena.allocator(), &[_][]const u8{"--bogus"}));
 }
 
+test "unknown single-dash flag is an error, not a positional file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.BadArgs, parseRunArgs(arena.allocator(), &[_][]const u8{"-x"}));
+}
+
 test "secrets file parses k=v with comments" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -156,7 +162,9 @@ pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs
             i += 1;
             if (i >= args.len) return error.BadArgs;
             r.secret_file = args[i];
-        } else if (std.mem.startsWith(u8, arg, "--")) {
+        } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
+            // Any other `-`/`--`-prefixed token (single-dash unknowns included,
+            // e.g. `-x`) is an unrecognized flag, not a positional file path.
             return error.BadArgs;
         } else if (r.file == null) {
             r.file = arg;
@@ -335,10 +343,17 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
                 try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   {d} steps   {d}ms\n", .{ mark, j.display_name, j.steps.len, total_ms }));
             },
             .failed => {
+                // A job can have multiple `.failed` steps if earlier ones were
+                // `continue-on-error: true` (they fail but don't stop the job).
+                // The engine's step loop (see engine.zig runJob) breaks
+                // immediately after the first non-continue-on-error failure,
+                // so that fatal step is always the LAST `.failed` entry in
+                // `j.steps` — keep overwriting instead of breaking on first
+                // match, or an earlier continue-on-error failure gets blamed
+                // instead of the step that actually failed the job.
                 var failed_step: ?engine.StepResult = null;
                 for (j.steps) |s| if (s.status == .failed) {
                     failed_step = s;
-                    break;
                 };
                 const mark = if (use_color) ansi_red ++ "\xe2\x9c\x97" ++ ansi_reset else "\xe2\x9c\x97";
                 if (failed_step) |fs| {
@@ -362,6 +377,7 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
             try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "\n── log tail: {s}/{s} ──\n", .{ j.display_name, s.name }));
             var combined: std.ArrayList(u8) = .empty;
             try combined.appendSlice(alloc, s.stdout);
+            if (s.stdout.len > 0 and !std.mem.endsWith(u8, s.stdout, "\n")) try combined.append(alloc, '\n');
             try combined.appendSlice(alloc, s.stderr);
             var all_lines: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, combined.items, '\n');
