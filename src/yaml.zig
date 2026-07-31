@@ -114,6 +114,25 @@ const Parser = struct {
         };
     }
 
+    fn parseBlockScalar(self: *Parser, marker: []const u8, base_indent: u32, no: u32) ParseError!Node {
+        const folded = marker[0] == '>';
+        var parts: std.ArrayList([]const u8) = .empty;
+        var content_indent: ?u32 = null;
+        while (self.peek()) |ln| {
+            if (ln.indent <= base_indent) break;
+            if (content_indent == null) content_indent = ln.indent;
+            const keep = if (ln.indent >= content_indent.?) ln.indent - content_indent.? else 0;
+            var buf: std.ArrayList(u8) = .empty;
+            try buf.appendNTimes(self.alloc, ' ', keep);
+            try buf.appendSlice(self.alloc, ln.text);
+            try parts.append(self.alloc, try buf.toOwnedSlice(self.alloc));
+            self.idx += 1;
+        }
+        const sep: []const u8 = if (folded) " " else "\n";
+        const joined = try std.mem.join(self.alloc, sep, parts.items);
+        return .{ .line = no, .col = base_indent + 1, .data = .{ .scalar = joined } };
+    }
+
     fn parseMapBlock(self: *Parser, base_indent: u32, min_indent: u32) ParseError!Node {
         var m: Map = .empty;
         const start = self.peek().?;
@@ -138,7 +157,14 @@ const Parser = struct {
                 var off: usize = 0;
                 while (off < after_colon.len and after_colon[off] == ' ') off += 1;
                 const value_col = ln.indent + @as(u32, @intCast(colon)) + 1 + @as(u32, @intCast(off)) + 1;
-                value = try self.parseValueText(rest, ln.no, value_col);
+                if ((rest[0] == '|' or rest[0] == '>') and rest.len <= 2) {
+                    value = try self.parseBlockScalar(rest, base_indent, ln.no);
+                } else if (rest[0] == '&' or rest[0] == '*') {
+                    try self.diags.add(ln.no, value_col, "YAML anchors are not supported", .{});
+                    value = try self.parseValueText(rest, ln.no, value_col);
+                } else {
+                    value = try self.parseValueText(rest, ln.no, value_col);
+                }
             } else if (self.peek()) |next| {
                 if (next.indent > base_indent) {
                     value = try self.parseBlock(base_indent + 1);
@@ -176,6 +202,23 @@ fn unescapeDouble(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.toOwnedSlice(alloc);
 }
 
+/// Strip a trailing ` # comment` outside quotes; `#` must be at index 0 or
+/// preceded by a space to count as a comment marker.
+fn stripComment(text: []const u8) []const u8 {
+    var in_s = false;
+    var in_d = false;
+    for (text, 0..) |c, i| {
+        switch (c) {
+            '\'' => in_s = !in_s,
+            '"' => in_d = !in_d,
+            '#' => if (!in_s and !in_d and (i == 0 or text[i - 1] == ' '))
+                return std.mem.trimRight(u8, text[0..i], " "),
+            else => {},
+        }
+    }
+    return text;
+}
+
 /// Colon that terminates a key: first ':' followed by space/EOL, outside quotes.
 fn findKeyColon(text: []const u8) ?usize {
     var in_s = false;
@@ -208,7 +251,7 @@ pub fn parse(alloc: std.mem.Allocator, source: []const u8, diags: *Diags) ParseE
                 break;
             } else break;
         }
-        const text = line[indent..];
+        const text = stripComment(line[indent..]);
         if (text.len == 0 or text[0] == '#') continue;
         try lines.append(alloc, .{ .indent = indent, .text = text, .no = no });
     }
@@ -314,6 +357,38 @@ test "parse sequence of mappings (steps shape)" {
     try std.testing.expectEqual(@as(usize, 2), steps.len);
     try std.testing.expectEqualStrings("echo hi", steps[0].get("run").?.data.scalar);
     try std.testing.expectEqualStrings("echo two", steps[1].get("run").?.data.scalar);
+}
+
+test "literal block scalar preserves newlines" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a,
+        \\run: |
+        \\  echo one
+        \\  echo two
+    , &diags);
+    try std.testing.expectEqualStrings("echo one\necho two", root.get("run").?.data.scalar);
+}
+
+test "folded block scalar joins with spaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a, "msg: >\n  hello\n  world", &diags);
+    try std.testing.expectEqualStrings("hello world", root.get("msg").?.data.scalar);
+}
+
+test "inline comment stripped outside quotes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = Diags.init(a);
+    const root = try parse(a, "name: CI # the pipeline\nmsg: \"a # not comment\"", &diags);
+    try std.testing.expectEqualStrings("CI", root.get("name").?.data.scalar);
+    try std.testing.expectEqualStrings("a # not comment", root.get("msg").?.data.scalar);
 }
 
 test "flow sequence and quoted scalars" {
