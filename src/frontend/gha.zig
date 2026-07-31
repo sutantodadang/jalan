@@ -189,6 +189,37 @@ test "matrixMatches filters combos" {
     _ = a;
 }
 
+test "dangling needs and cycle are hard errors, unknown shell warns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  a:
+        \\    needs: [b, ghost]
+        \\    steps:
+        \\      - run: echo a
+        \\        shell: fish
+        \\  b:
+        \\    needs: a
+        \\    steps:
+        \\      - run: echo b
+    ;
+    try std.testing.expectError(error.ParseFailed, parseWorkflow(a, "v.yml", src, &diags));
+    var dangling = false;
+    var cycle = false;
+    var shell_warn = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "unknown job 'ghost'") != null) dangling = true;
+        if (std.mem.indexOf(u8, d.msg, "cycle") != null) cycle = true;
+        if (std.mem.indexOf(u8, d.msg, "unknown shell 'fish'") != null) shell_warn = true;
+    }
+    try std.testing.expect(dangling);
+    try std.testing.expect(cycle);
+    try std.testing.expect(shell_warn);
+}
+
 pub const ParseError = error{ ParseFailed, OutOfMemory };
 
 fn addWarn(diags: *yaml.Diags, line: u32, col: u32, comptime fmt: []const u8, args: anytype) !void {
@@ -316,8 +347,67 @@ pub fn parseWorkflow(
             return error.ParseFailed;
         },
     }
+    const job_slice = try jobs.toOwnedSlice(alloc);
+    try validate(alloc, job_slice, diags);
     if (hasHardError(diags)) return error.ParseFailed;
-    return .{ .name = name, .source_path = source_path, .jobs = try jobs.toOwnedSlice(alloc) };
+    return .{ .name = name, .source_path = source_path, .jobs = job_slice };
+}
+
+const known_shells = [_][]const u8{ "bash", "sh", "pwsh", "powershell", "cmd", "python" };
+
+fn validate(alloc: std.mem.Allocator, jobs: []const ir.Job, diags: *yaml.Diags) !void {
+    // Unique base ids (matrix copies share id — dedupe first).
+    var ids: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (jobs) |j| try ids.put(alloc, j.id, {});
+
+    for (jobs) |j| {
+        for (j.needs) |n| {
+            if (!ids.contains(n))
+                try diags.add(0, 0, "job '{s}' needs unknown job '{s}'", .{ j.id, n });
+        }
+        var step_ids: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for (j.steps) |s| {
+            if (step_ids.contains(s.id))
+                try diags.add(0, 0, "duplicate step id '{s}' in job '{s}'", .{ s.id, j.id });
+            try step_ids.put(alloc, s.id, {});
+            if (s.shell) |sh| {
+                var ok = false;
+                for (known_shells) |k| {
+                    if (std.mem.eql(u8, k, sh)) ok = true;
+                }
+                if (!ok) try addWarn(diags, 0, 0, "unknown shell '{s}'", .{sh});
+            }
+        }
+    }
+    // Cycle detection over base ids.
+    const Color = enum { white, grey, black };
+    var color: std.StringArrayHashMapUnmanaged(Color) = .empty;
+    for (ids.keys()) |id| try color.put(alloc, id, .white);
+    const Ctx = struct {
+        jobs: []const ir.Job,
+        color: *std.StringArrayHashMapUnmanaged(Color),
+        diags: *yaml.Diags,
+        alloc: std.mem.Allocator,
+        fn needsOf(self: @This(), id: []const u8) [][]const u8 {
+            for (self.jobs) |j| {
+                if (std.mem.eql(u8, j.id, id)) return j.needs;
+            }
+            return &.{};
+        }
+        fn dfs(self: @This(), id: []const u8) !void {
+            const c = self.color.get(id) orelse return;
+            if (c == .grey) {
+                try self.diags.add(0, 0, "dependency cycle involving job '{s}'", .{id});
+                return;
+            }
+            if (c == .black) return;
+            try self.color.put(self.alloc, id, .grey);
+            for (self.needsOf(id)) |n| try self.dfs(n);
+            try self.color.put(self.alloc, id, .black);
+        }
+    };
+    const ctx = Ctx{ .jobs = jobs, .color = &color, .diags = diags, .alloc = alloc };
+    for (ids.keys()) |id| try ctx.dfs(id);
 }
 
 fn lowerJob(
