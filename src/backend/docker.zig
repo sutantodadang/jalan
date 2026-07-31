@@ -322,11 +322,12 @@ test "docker backend runs a two-step job sharing filesystem (skips without daemo
     var h = try b.setupJob(a, .{ .id = "j", .display_name = "j", .runs_on = "ubuntu-latest", .steps = &.{} }, cwd, null);
     defer b.teardownJob(a, &h);
     var em: ?[]const u8 = null;
-    const s1 = ir.Step{ .id = "a", .name = "a", .kind = .run, .script = "echo one > /tmp/marker && echo \"k=v\" >> \"$GITHUB_OUTPUT\"" };
+    // busybox has sh only — force sh; default image node:20-bookworm-slim has bash.
+    const s1 = ir.Step{ .id = "a", .name = "a", .kind = .run, .shell = "sh", .script = "echo one > /tmp/marker && echo \"k=v\" >> \"$GITHUB_OUTPUT\"" };
     const o1 = try b.runStep(a, &h, s1, &.{}, null, &em);
     try std.testing.expectEqual(@as(i32, 0), o1.exit_code);
     try std.testing.expectEqualStrings("k", o1.outputs[0].name);
-    const s2 = ir.Step{ .id = "b", .name = "b", .kind = .run, .script = "cat /tmp/marker" };
+    const s2 = ir.Step{ .id = "b", .name = "b", .kind = .run, .shell = "sh", .script = "cat /tmp/marker" };
     const o2 = try b.runStep(a, &h, s2, &.{}, null, &em);
     try std.testing.expect(std.mem.indexOf(u8, o2.stdout, "one") != null);
 }
