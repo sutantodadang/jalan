@@ -220,6 +220,51 @@ test "dangling needs and cycle are hard errors, unknown shell warns" {
     try std.testing.expect(shell_warn);
 }
 
+test "duplicate step id within a job is a hard error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    steps:
+        \\      - id: dup
+        \\        run: echo one
+        \\      - id: dup
+        \\        run: echo two
+    ;
+    try std.testing.expectError(error.ParseFailed, parseWorkflow(a, "v.yml", src, &diags));
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "duplicate step id 'dup'") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "matrix expansion validates each base job once, not per combo" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    needs: ghost
+        \\    strategy:
+        \\      matrix:
+        \\        os: [linux, windows]
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    try std.testing.expectError(error.ParseFailed, parseWorkflow(a, "v.yml", src, &diags));
+    var count: usize = 0;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "needs unknown job 'ghost'") != null) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
 pub const ParseError = error{ ParseFailed, OutOfMemory };
 
 fn addWarn(diags: *yaml.Diags, line: u32, col: u32, comptime fmt: []const u8, args: anytype) !void {
@@ -355,12 +400,25 @@ pub fn parseWorkflow(
 
 const known_shells = [_][]const u8{ "bash", "sh", "pwsh", "powershell", "cmd", "python" };
 
+/// First job (in expansion order) matching a base id. Matrix copies share
+/// id/needs/steps, so any copy is representative for per-job validation.
+fn firstJobWithId(jobs: []const ir.Job, id: []const u8) ?ir.Job {
+    for (jobs) |j| {
+        if (std.mem.eql(u8, j.id, id)) return j;
+    }
+    return null;
+}
+
 fn validate(alloc: std.mem.Allocator, jobs: []const ir.Job, diags: *yaml.Diags) !void {
     // Unique base ids (matrix copies share id — dedupe first).
     var ids: std.StringArrayHashMapUnmanaged(void) = .empty;
     for (jobs) |j| try ids.put(alloc, j.id, {});
 
-    for (jobs) |j| {
+    // Per-job checks (needs refs, step ids, shells) run once per BASE id —
+    // matrix copies share id/needs/steps, so validating every expanded copy
+    // would report the same diag N times for an N-combo matrix job.
+    for (ids.keys()) |id| {
+        const j = firstJobWithId(jobs, id) orelse continue;
         for (j.needs) |n| {
             if (!ids.contains(n))
                 try diags.add(0, 0, "job '{s}' needs unknown job '{s}'", .{ j.id, n });
@@ -389,10 +447,8 @@ fn validate(alloc: std.mem.Allocator, jobs: []const ir.Job, diags: *yaml.Diags) 
         diags: *yaml.Diags,
         alloc: std.mem.Allocator,
         fn needsOf(self: @This(), id: []const u8) [][]const u8 {
-            for (self.jobs) |j| {
-                if (std.mem.eql(u8, j.id, id)) return j.needs;
-            }
-            return &.{};
+            const j = firstJobWithId(self.jobs, id) orelse return &.{};
+            return j.needs;
         }
         fn dfs(self: @This(), id: []const u8) !void {
             const c = self.color.get(id) orelse return;
