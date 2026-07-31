@@ -4,6 +4,7 @@ pub const ir = @import("ir.zig");
 pub const expr = @import("expr.zig");
 pub const gha = @import("frontend/gha.zig");
 pub const native = @import("backend/native.zig");
+pub const backend = @import("backend.zig");
 pub const engine = @import("engine.zig");
 pub const cli = @import("cli.zig");
 pub const config = @import("config.zig");
@@ -14,6 +15,7 @@ test {
     _ = expr;
     _ = gha;
     _ = native;
+    _ = backend;
     _ = engine;
     _ = cli;
     _ = config;

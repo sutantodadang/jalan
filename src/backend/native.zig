@@ -3,12 +3,7 @@ const std = @import("std");
 const ir = @import("../ir.zig");
 const builtin = @import("builtin");
 
-pub const StepOutcome = struct {
-    exit_code: i32,
-    stdout: []u8,
-    stderr: []u8,
-    outputs: []ir.EnvPair,
-};
+pub const StepOutcome = @import("../backend.zig").StepOutcome;
 
 pub const RunError = error{ SpawnFailed, OutOfMemory };
 

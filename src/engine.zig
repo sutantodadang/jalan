@@ -9,7 +9,7 @@ const ir = @import("ir.zig");
 const gha = @import("frontend/gha.zig");
 const yaml = @import("yaml.zig");
 const expr = @import("expr.zig");
-const native = @import("backend/native.zig");
+const backend_mod = @import("backend.zig");
 
 fn parseFixture(a: std.mem.Allocator, src: []const u8) !ir.Pipeline {
     var diags = yaml.Diags.init(a);
@@ -262,6 +262,9 @@ pub const RunOptions = struct {
     matrix_filter: []const ir.EnvPair = &.{},
     // Called from worker threads under parallel job execution — must be thread-safe.
     log: ?*const fn (line: []const u8) void = null,
+    // null -> backend_mod.native(). Lets callers swap in container/other backends
+    // without touching runJob's step-loop logic.
+    exec_backend: ?backend_mod.Backend = null,
 };
 
 const Shared = struct {
@@ -447,6 +450,15 @@ fn runJob(
         }
     }
 
+    const b = opts.exec_backend orelse backend_mod.native();
+    var handle = b.setupJob(alloc, job, cwd, opts.log) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        // infra failure: whole job fails before any step runs
+        logJob(opts, alloc, job, "backend setup failed for job");
+        return .{ .job_index = index, .display_name = job.display_name, .status = .failed, .steps = steps };
+    };
+    defer b.teardownJob(alloc, &handle);
+
     var job_status: JobStatus = .success;
     step_loop: for (job.steps, 0..) |step, si| {
         if (opts.step_filter) |f| if (!std.mem.eql(u8, f, step.id)) continue;
@@ -513,7 +525,7 @@ fn runJob(
         } else null;
 
         var err_msg: ?[]const u8 = null;
-        const outcome = native.runStep(alloc, patched, spawn_env.items, workdir, &err_msg) catch {
+        const outcome = b.runStep(alloc, &handle, patched, spawn_env.items, workdir, &err_msg) catch {
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
             if (!step.continue_on_error) job_status = .failed;
             continue;
