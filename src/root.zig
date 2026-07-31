@@ -4,6 +4,7 @@ pub const ir = @import("ir.zig");
 pub const expr = @import("expr.zig");
 pub const gha = @import("frontend/gha.zig");
 pub const native = @import("backend/native.zig");
+pub const engine = @import("engine.zig");
 
 test {
     _ = yaml;
@@ -11,4 +12,5 @@ test {
     _ = expr;
     _ = gha;
     _ = native;
+    _ = engine;
 }
