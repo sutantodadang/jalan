@@ -1,0 +1,4 @@
+.zig-cache/
+zig-out/
+.jalan/
+docs/superpowers/
