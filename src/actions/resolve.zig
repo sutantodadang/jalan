@@ -40,13 +40,29 @@ pub const Ref = union(enum) {
     };
 };
 
+/// True if any `/`-separated segment of `s` is empty, `.`, or `..` — the
+/// shapes that let a path component escape the directory it's joined into.
+fn hasTraversalSegment(s: []const u8) bool {
+    var it = std.mem.splitScalar(u8, s, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return true;
+    }
+    return false;
+}
+
 /// Parses a `uses:` value into a `Ref`.
 ///
 /// - `./local/path` -> `.local`
 /// - `docker://image:tag` -> `.docker_image`
 /// - `owner/repo[/subpath]@ref` -> `.github`
 ///
-/// Missing `@ref`, missing owner or repo, or an empty ref is `error.BadRef`.
+/// `owner`, `repo`, `ref`, and `subpath` all end up as path segments under
+/// `cacheRoot()` (see `fetch`), so this is also the traversal choke point:
+/// missing `@ref`, empty/`.`/`..` owner or repo, an empty ref, or any
+/// `.`/`..`/empty segment within `ref` or `subpath` (e.g. `a/b/../c@v1`,
+/// `a/b@..`) is `error.BadRef`. Multi-segment branch refs like
+/// `a/b@feature/foo` remain legal — only literal `.`/`..` segments are
+/// rejected.
 pub fn parseRef(uses: []const u8) !Ref {
     if (std.mem.startsWith(u8, uses, "./")) return .{ .local = uses };
     if (std.mem.startsWith(u8, uses, "docker://")) return .{ .docker_image = uses["docker://".len..] };
@@ -57,7 +73,12 @@ pub fn parseRef(uses: []const u8) !Ref {
     const owner = it.next() orelse return error.BadRef;
     const repo = it.next() orelse return error.BadRef;
     if (owner.len == 0 or repo.len == 0 or ref.len == 0) return error.BadRef;
-    return .{ .github = .{ .owner = owner, .repo = repo, .subpath = it.rest(), .ref = ref } };
+    if (std.mem.eql(u8, owner, ".") or std.mem.eql(u8, owner, "..")) return error.BadRef;
+    if (std.mem.eql(u8, repo, ".") or std.mem.eql(u8, repo, "..")) return error.BadRef;
+    const subpath = it.rest();
+    if (hasTraversalSegment(ref)) return error.BadRef;
+    if (subpath.len != 0 and hasTraversalSegment(subpath)) return error.BadRef;
+    return .{ .github = .{ .owner = owner, .repo = repo, .subpath = subpath, .ref = ref } };
 }
 
 /// Root directory for cached actions: `%LOCALAPPDATA%\jalan\actions` on
@@ -149,9 +170,10 @@ pub fn fetch(alloc: std.mem.Allocator, gh: Ref.Github, force_pull: bool, log: ?b
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompress: std.compress.flate.Decompress = .init(&gz_source, .gzip, &window);
 
-    // Forced re-pull (or a leftover partial download) may leave stale files
-    // that the new tarball no longer contains; start from a clean dir so
-    // extraction reflects exactly what's in the tarball.
+    // Forced re-pull, or a leftover from a prior attempt that failed partway
+    // through extraction (see the deleteTree below on the failure path),
+    // may leave stale files that the new tarball no longer contains; start
+    // from a clean dir so extraction reflects exactly what's in the tarball.
     if (dirExists(dir)) {
         std.fs.cwd().deleteTree(dir) catch |e| {
             err_msg.* = try std.fmt.allocPrint(alloc, "clearing stale cache dir {s} failed: {s}", .{ dir, @errorName(e) });
@@ -166,12 +188,20 @@ pub fn fetch(alloc: std.mem.Allocator, gh: Ref.Github, force_pull: bool, log: ?b
         err_msg.* = try std.fmt.allocPrint(alloc, "opening cache dir {s} failed: {s}", .{ dir, @errorName(e) });
         return e;
     };
-    defer out_dir.close();
-
-    std.tar.pipeToFileSystem(out_dir, &decompress.reader, .{ .strip_components = 1 }) catch |e| {
+    // Not a `defer`: on the failure branch below the dir handle must be
+    // closed *before* `deleteTree` runs (an open handle can block deletion),
+    // so both branches close it explicitly instead.
+    if (std.tar.pipeToFileSystem(out_dir, &decompress.reader, .{ .strip_components = 1 })) |_| {
+        out_dir.close();
+    } else |e| {
+        out_dir.close();
+        // Don't leave a partially-extracted dir behind: a later `fetch` with
+        // `force_pull = false` treats any existing dir as a cache hit and
+        // would silently hand back a broken action.
+        std.fs.cwd().deleteTree(dir) catch {};
         err_msg.* = try std.fmt.allocPrint(alloc, "extracting {s}/{s}@{s} failed: {s}", .{ gh.owner, gh.repo, gh.ref, @errorName(e) });
         return e;
-    };
+    }
 
     return withSubpath(alloc, dir, gh.subpath);
 }
@@ -204,6 +234,26 @@ test "parseRef: docker image" {
 
 test "parseRef: missing @ is BadRef" {
     try std.testing.expectError(error.BadRef, parseRef("owner/repo"));
+}
+
+test "parseRef: traversal in owner is BadRef" {
+    try std.testing.expectError(error.BadRef, parseRef("../../x@main"));
+}
+
+test "parseRef: traversal in ref is BadRef" {
+    try std.testing.expectError(error.BadRef, parseRef("a/b@.."));
+}
+
+test "parseRef: traversal in subpath is BadRef" {
+    try std.testing.expectError(error.BadRef, parseRef("a/b/../c@v1"));
+}
+
+test "parseRef: multi-segment branch ref stays legal" {
+    const r = try parseRef("a/b@feature/foo");
+    try std.testing.expectEqualStrings("a", r.github.owner);
+    try std.testing.expectEqualStrings("b", r.github.repo);
+    try std.testing.expectEqualStrings("", r.github.subpath);
+    try std.testing.expectEqualStrings("feature/foo", r.github.ref);
 }
 
 fn networkAvailable(alloc: std.mem.Allocator) bool {
