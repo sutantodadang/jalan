@@ -13,6 +13,7 @@ pub const docker_client = @import("docker/client.zig");
 pub const docker_backend = @import("backend/docker.zig");
 pub const nix_backend = @import("backend/nix.zig");
 pub const actions_resolve = @import("actions/resolve.zig");
+pub const actions_runner = @import("actions/runner.zig");
 
 test {
     _ = yaml;
@@ -29,5 +30,6 @@ test {
     _ = docker_backend;
     _ = nix_backend;
     _ = actions_resolve;
+    _ = actions_runner;
     _ = @import("golden_test.zig");
 }

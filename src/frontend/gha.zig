@@ -880,10 +880,20 @@ fn lowerStep(
         .uses_ref = uses_ref,
         .shell = if (n.get("shell")) |s| s.scalarOr("") else shell_default,
         .env = try envPairs(alloc, n.get("env")),
+        .with = if (uses_node != null) try envPairs(alloc, n.get("with")) else &.{},
         .workdir = if (n.get("working-directory")) |w| w.scalarOr("") else workdir_default,
         .cond = if (n.get("if")) |c| try condText(alloc, c.scalarOr(""), c.line, diags) else null,
         .continue_on_error = if (n.get("continue-on-error")) |c| std.mem.eql(u8, c.scalarOr(""), "true") else false,
         .timeout_minutes = timeout,
         .src_line = n.line,
     };
+}
+
+/// Lowers a single `runs.steps[]` node from a composite action.yml into an
+/// `ir.Step`, reusing the same step-shape rules as workflow steps (`run`,
+/// `uses`, `with`, `shell`, `if`, ...). No `shell`/`workdir` defaults apply
+/// inside a composite action — GitHub Actions composites don't inherit the
+/// caller workflow's `defaults:` block, so both are passed as `null`.
+pub fn lowerStepForComposite(alloc: std.mem.Allocator, n: yaml.Node, index: usize, diags: *yaml.Diags) !ir.Step {
+    return lowerStep(alloc, n, index, null, null, diags);
 }

@@ -19,6 +19,7 @@ pub const Step = struct {
     uses_ref: []const u8 = "",
     shell: ?[]const u8 = null,
     env: []EnvPair = &.{},
+    with: []EnvPair = &.{},
     workdir: ?[]const u8 = null,
     cond: ?[]const u8 = null,
     continue_on_error: bool = false,
