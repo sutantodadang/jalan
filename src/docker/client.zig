@@ -299,11 +299,46 @@ pub fn demuxFrames(alloc: std.mem.Allocator, body: []const u8) !struct { stdout:
 
 pub const ExecResult = struct { exit_code: i32, stdout: []u8, stderr: []u8 };
 
+/// Pure poll-decision helper for `execRun`'s exit-code loop, factored out so
+/// it's unit-testable without a daemon. Given the latest exec-inspect
+/// response fields and whether the poll budget is exhausted, decides:
+/// - once `running` is false: the reported `code`, or `-1` if Docker gave no
+///   `ExitCode` (an unexpected-but-possible shape — `-1` signals
+///   "unknown/failed", not the misleading default of `0`/success);
+/// - while `running` is still true and the poll budget is exhausted:
+///   `error.ExecTimeout`, so a hung exec can't silently report exit 0;
+/// - while `running` is still true and there's budget left: `null`, telling
+///   the caller to sleep and poll again.
+fn resolveExit(running: bool, code: ?i32, exhausted: bool) !?i32 {
+    if (!running) return code orelse -1;
+    if (exhausted) return error.ExecTimeout;
+    return null;
+}
+
+test "resolveExit: running=false with code returns the code" {
+    try std.testing.expectEqual(@as(?i32, 7), try resolveExit(false, 7, false));
+}
+
+test "resolveExit: running=false with no ExitCode returns -1, not 0" {
+    try std.testing.expectEqual(@as(?i32, -1), try resolveExit(false, null, false));
+}
+
+test "resolveExit: running=true and exhausted returns error.ExecTimeout" {
+    try std.testing.expectError(error.ExecTimeout, resolveExit(true, null, true));
+}
+
+test "resolveExit: running=true with budget left returns null (keep polling)" {
+    try std.testing.expectEqual(@as(?i32, null), try resolveExit(true, null, false));
+}
+
 /// Runs `cmd` inside an already-running container via the Docker exec API:
 /// `POST {prefix}/containers/{id}/exec` to create, `POST {prefix}/exec/{id}/start`
 /// to run it (the response body is the raw multiplexed stdout/stderr stream,
 /// demuxed with `demuxFrames`), then polls `GET {prefix}/exec/{id}/json` (up
-/// to 50x100ms while `Running`) for the exit code.
+/// to 50x100ms while `Running`) for the exit code via `resolveExit`. If the
+/// exec is still `Running` after the full poll budget, returns
+/// `error.ExecTimeout` (with `err.*` set) rather than reporting a fabricated
+/// success — a hung exec must not read as exit code 0 downstream.
 pub fn execRun(alloc: std.mem.Allocator, c: Client, container_id: []const u8, cmd: []const []const u8, env: []const []const u8, workdir: ?[]const u8, err: *?[]const u8) !ExecResult {
     var body: std.ArrayList(u8) = .empty;
     try body.appendSlice(alloc, "{\"AttachStdout\":true,\"AttachStderr\":true,\"Cmd\":[");
@@ -343,13 +378,19 @@ pub fn execRun(alloc: std.mem.Allocator, c: Client, container_id: []const u8, cm
     const demuxed = try demuxFrames(alloc, start_resp.body);
 
     const inspect_path = try std.fmt.allocPrint(alloc, "{s}/exec/{s}/json", .{ api_prefix, eid });
-    var exit_code: i32 = 0;
+    const max_poll_attempts: usize = 50;
+    var exit_code: i32 = -1;
     var attempt: usize = 0;
-    while (attempt < 50) : (attempt += 1) {
+    while (attempt < max_poll_attempts) : (attempt += 1) {
         const inspect_resp = try apiCall(alloc, c, .{ .method = "GET", .path = inspect_path }, err);
         const parsed = std.json.parseFromSliceLeaky(struct { ExitCode: ?i32 = null, Running: bool = false }, alloc, inspect_resp.body, .{ .ignore_unknown_fields = true }) catch return error.DockerApi;
-        if (!parsed.Running) {
-            exit_code = parsed.ExitCode orelse 0;
+        const exhausted = attempt == max_poll_attempts - 1;
+        const resolved = resolveExit(parsed.Running, parsed.ExitCode, exhausted) catch |e| {
+            err.* = try std.fmt.allocPrint(alloc, "exec still running after 5s poll window", .{});
+            return e;
+        };
+        if (resolved) |code| {
+            exit_code = code;
             break;
         }
         std.Thread.sleep(100 * std.time.ns_per_ms);
