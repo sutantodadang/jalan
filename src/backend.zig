@@ -2,6 +2,7 @@
 //! (and, for phase 2 task 2, only) implementation — it forwards to the
 //! existing subprocess-based step runner in `backend/native.zig`.
 const std = @import("std");
+const builtin = @import("builtin");
 const ir = @import("ir.zig");
 
 pub const StepOutcome = struct {
@@ -16,6 +17,9 @@ pub const JobHandle = struct {
     network_id: []const u8 = "",
     service_ids: []const []const u8 = &.{},
     workspace: []const u8 = "",
+    /// Immutable execution identity prepared by backends whose runtime is
+    /// resolved during setup (for example Docker image IDs).
+    cache_identity: []const u8 = "",
     /// Extra nix packages this job needs on top of `NixBackend.cfg`'s own
     /// (`Config.nix_packages`/`default_packages`) — populated by `runUses`'s
     /// `setup-node`/`setup-python`/`setup-go` interception on the nix
@@ -39,6 +43,31 @@ pub const LogFn = *const fn (line: []const u8) void;
 /// package installs (`.nix` only).
 pub const Kind = enum { native, docker, nix };
 
+pub fn hostEnvironmentIdentity(alloc: std.mem.Allocator) ![]const u8 {
+    var env = try std.process.getEnvMap(alloc);
+    defer env.deinit();
+    var pairs: std.ArrayList(ir.EnvPair) = .empty;
+    var it = env.hash_map.iterator();
+    while (it.next()) |entry|
+        try pairs.append(alloc, .{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+    std.mem.sort(ir.EnvPair, pairs.items, {}, struct {
+        fn less(_: void, a: ir.EnvPair, b: ir.EnvPair) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.less);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (pairs.items) |pair| {
+        hash.update(pair.name);
+        hash.update(&.{0});
+        hash.update(pair.value);
+        hash.update(&.{0});
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return alloc.dupe(u8, &hex);
+}
+
 pub const Backend = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -57,6 +86,9 @@ pub const Backend = struct {
         /// Open an interactive shell in the live job environment. Optional
         /// so custom/fake backends can explicitly decline debugger shells.
         openShell: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, handle: *JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) anyerror!void = null,
+        /// Stable identity of the effective execution environment used by
+        /// cache keys (selected Docker image, effective Nix packages, etc.).
+        cacheIdentity: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, handle: *JobHandle, step: ir.Step) anyerror![]const u8 = null,
     };
 
     pub fn setupJob(self: Backend, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: []const u8, log: ?LogFn) !JobHandle {
@@ -77,6 +109,10 @@ pub const Backend = struct {
     pub fn openShell(self: Backend, alloc: std.mem.Allocator, handle: *JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) !void {
         return self.vtable.openShell.?(self.ctx, alloc, handle, workdir, env);
     }
+    pub fn cacheIdentity(self: Backend, alloc: std.mem.Allocator, job: ir.Job, handle: *JobHandle, step: ir.Step) ![]const u8 {
+        if (self.vtable.cacheIdentity) |identity| return identity(self.ctx, alloc, job, handle, step);
+        return @tagName(self.kind);
+    }
 };
 
 var native_ctx: u8 = 0;
@@ -86,6 +122,7 @@ const native_vtable = Backend.VTable{
     .runStep = nativeRun,
     .teardownJob = nativeTeardown,
     .openShell = nativeOpenShell,
+    .cacheIdentity = nativeCacheIdentity,
 };
 
 pub fn native() Backend {
@@ -101,6 +138,13 @@ fn nativeRun(_: *anyopaque, alloc: std.mem.Allocator, _: *JobHandle, step: ir.St
 fn nativeTeardown(_: *anyopaque, _: std.mem.Allocator, _: *JobHandle) void {}
 fn nativeOpenShell(_: *anyopaque, alloc: std.mem.Allocator, _: *JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) anyerror!void {
     return native_impl.openShell(alloc, workdir, env);
+}
+fn nativeCacheIdentity(_: *anyopaque, alloc: std.mem.Allocator, _: ir.Job, _: *JobHandle, _: ir.Step) anyerror![]const u8 {
+    return std.fmt.allocPrint(alloc, "{s}-{s}-{s}", .{
+        @tagName(builtin.os.tag),
+        @tagName(builtin.cpu.arch),
+        try hostEnvironmentIdentity(alloc),
+    });
 }
 
 const native_impl = @import("backend/native.zig");

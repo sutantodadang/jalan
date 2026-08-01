@@ -29,7 +29,7 @@ pub fn writeRequest(alloc: std.mem.Allocator, req: Request) ![]u8 {
         try out.appendSlice(alloc, h.value);
         try out.appendSlice(alloc, "\r\n");
     }
-    if (req.body.len > 0) {
+    if (req.body.len > 0 or std.mem.eql(u8, req.method, "POST") or std.mem.eql(u8, req.method, "PUT")) {
         try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Content-Length: {d}\r\n", .{req.body.len}));
     }
     try out.appendSlice(alloc, "\r\n");
@@ -83,7 +83,13 @@ pub fn parseResponse(alloc: std.mem.Allocator, reader: anytype) !Response {
     }
 
     var body: std.ArrayList(u8) = .empty;
-    if (chunked) {
+    // RFC 9110 forbids response content for these statuses. Docker commonly
+    // returns 204 without Content-Length on successful start/remove calls and
+    // keeps its named-pipe connection open, so reading until EOF would hang.
+    const status_has_no_body = status < 200 or status == 204 or status == 304;
+    if (status_has_no_body) {
+        // Intentionally empty.
+    } else if (chunked) {
         while (true) {
             const size_line = try readLine(alloc, reader);
             const size = std.fmt.parseInt(usize, size_line, 16) catch return error.BadResponse;
@@ -123,6 +129,13 @@ test "writeRequest serializes POST with body" {
     try std.testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n{\"Image\":\"alpine\"}"));
 }
 
+test "writeRequest sends an explicit zero length for empty POST" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const out = try writeRequest(arena.allocator(), .{ .method = "POST", .path = "/wait" });
+    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Length: 0\r\n") != null);
+}
+
 test "parseResponse handles content-length body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -143,4 +156,13 @@ test "parseResponse dechunks transfer-encoding chunked" {
     var reader = std.Io.Reader.fixed(raw);
     const resp = try parseResponse(a, &reader);
     try std.testing.expectEqualStrings("hello world", resp.body);
+}
+
+test "parseResponse does not wait for EOF on bodyless status" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var reader = std.Io.Reader.fixed("HTTP/1.1 204 No Content\r\n\r\nignored connection bytes");
+    const resp = try parseResponse(arena.allocator(), &reader);
+    try std.testing.expectEqual(@as(u16, 204), resp.status);
+    try std.testing.expectEqualStrings("", resp.body);
 }

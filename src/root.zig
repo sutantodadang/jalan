@@ -15,6 +15,8 @@ pub const nix_backend = @import("backend/nix.zig");
 pub const actions_resolve = @import("actions/resolve.zig");
 pub const actions_runner = @import("actions/runner.zig");
 pub const snap_store = @import("snap/store.zig");
+pub const snap_path = @import("snap/path.zig");
+pub const snap_atomic = @import("snap/atomic.zig");
 pub const snap_manifest = @import("snap/manifest.zig");
 pub const snap_restore = @import("snap/restore.zig");
 pub const snap_runrecord = @import("snap/runrecord.zig");
@@ -38,6 +40,8 @@ test {
     _ = actions_resolve;
     _ = actions_runner;
     _ = snap_store;
+    _ = snap_path;
+    _ = snap_atomic;
     _ = snap_manifest;
     _ = snap_restore;
     _ = snap_runrecord;

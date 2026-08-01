@@ -9,6 +9,8 @@ const std = @import("std");
 const ir = @import("../ir.zig");
 const expr = @import("../expr.zig");
 const store = @import("store.zig");
+const safe_path = @import("path.zig");
+const atomic = @import("atomic.zig");
 
 pub const Error = error{ OutOfMemory, StoreIo };
 
@@ -18,6 +20,7 @@ pub const FileEntry = struct {
     size: u64 = 0,
     mode: u32 = 0o644,
     link_target: ?[]const u8 = null,
+    is_dir: bool = false,
 };
 
 pub const Manifest = struct {
@@ -55,7 +58,11 @@ pub fn treeHash(alloc: std.mem.Allocator, files: []FileEntry) ![]u8 {
     for (sorted) |f| {
         h.update(f.path);
         h.update(&.{0});
-        if (f.link_target) |t| {
+        if (f.is_dir) {
+            h.update("dir:");
+            var mode_buf: [16]u8 = undefined;
+            h.update(std.fmt.bufPrint(&mode_buf, "{o}", .{f.mode}) catch "0");
+        } else if (f.link_target) |t| {
             h.update("->");
             h.update(t);
         } else {
@@ -110,6 +117,12 @@ pub fn scanTree(alloc: std.mem.Allocator, root: []const u8, workspace_abs: []con
                 const target = dir.readLink(e.path, &buf) catch continue;
                 try out.append(alloc, .{ .path = norm, .link_target = try alloc.dupe(u8, target) });
             },
+            .directory => {
+                var child = dir.openDir(e.path, .{}) catch return error.StoreIo;
+                defer child.close();
+                const st = child.stat() catch return error.StoreIo;
+                try out.append(alloc, .{ .path = norm, .mode = @intCast(st.mode & 0o777), .is_dir = true });
+            },
             else => {},
         }
     }
@@ -130,7 +143,7 @@ fn sanitize(alloc: std.mem.Allocator, id: []const u8) ![]const u8 {
 /// `snapshots/<run_id>/<job>/<NNN>-<step_id>.json`.
 pub fn relPath(alloc: std.mem.Allocator, run_id: []const u8, job_id: []const u8, step_index: u32, step_id: []const u8) ![]const u8 {
     return std.fmt.allocPrint(alloc, "snapshots/{s}/{s}/{d:0>3}-{s}.json", .{
-        run_id, try sanitize(alloc, job_id), step_index, try sanitize(alloc, step_id),
+        try sanitize(alloc, run_id), try sanitize(alloc, job_id), step_index, try sanitize(alloc, step_id),
     });
 }
 
@@ -165,11 +178,9 @@ pub fn capture(
     const abs = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, rel });
     if (std.fs.path.dirname(abs)) |d| std.fs.cwd().makePath(d) catch return error.StoreIo;
     const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp{x}", .{ abs, std.crypto.random.int(u32) });
+    errdefer std.fs.cwd().deleteFile(tmp) catch {};
     std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = json }) catch return error.StoreIo;
-    std.fs.cwd().rename(tmp, abs) catch {
-        std.fs.cwd().deleteFile(abs) catch {};
-        std.fs.cwd().rename(tmp, abs) catch return error.StoreIo;
-    };
+    atomic.replaceFile(tmp, abs) catch return error.StoreIo;
     return .{ .m = m, .rel_path = rel };
 }
 
@@ -219,6 +230,7 @@ pub fn toJson(alloc: std.mem.Allocator, m: Manifest) ![]u8 {
             try out.appendSlice(alloc, ",\"link_target\":");
             try jsonStr(&out, alloc, t);
         }
+        if (f.is_dir) try out.appendSlice(alloc, ",\"is_dir\":true");
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "]}");
@@ -228,11 +240,20 @@ pub fn toJson(alloc: std.mem.Allocator, m: Manifest) ![]u8 {
 /// Parse manifest JSON. Slices borrow from the arena-backed parse result.
 pub fn parse(alloc: std.mem.Allocator, text: []const u8) Error!Manifest {
     const parsed = std.json.parseFromSlice(Manifest, alloc, text, .{ .ignore_unknown_fields = true }) catch return error.StoreIo;
+    for (parsed.value.files) |f| {
+        if (!safe_path.isSafeRelative(f.path)) return error.StoreIo;
+        if (f.mode > 0o777 or (f.is_dir and f.link_target != null)) return error.StoreIo;
+        if (!f.is_dir and f.link_target == null and !store.isValidHex(f.blob)) return error.StoreIo;
+    }
+    if (!store.isValidHex(parsed.value.tree_hash)) return error.StoreIo;
+    const expected = treeHash(alloc, parsed.value.files) catch return error.StoreIo;
+    if (!std.mem.eql(u8, expected, parsed.value.tree_hash)) return error.StoreIo;
     return parsed.value;
 }
 
 /// Load a manifest from a store-root-relative path.
 pub fn load(alloc: std.mem.Allocator, root: []const u8, rel: []const u8) Error!Manifest {
+    if (!safe_path.isSafeRelative(rel) or !std.mem.startsWith(u8, rel, "snapshots/")) return error.StoreIo;
     const abs = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, rel });
     const text = std.fs.cwd().readFileAlloc(alloc, abs, 64 * 1024 * 1024) catch return error.StoreIo;
     return parse(alloc, text);
@@ -278,9 +299,11 @@ test "capture writes manifest, excludes .git and .jalan, json round-trips" {
     const env_pairs = [_]ir.EnvPair{.{ .name = "github.ref", .value = "refs/heads/main" }};
     const cap = try capture(a, root, ws_abs, "run-1", "build", 2, "compile", &env_pairs);
     try std.testing.expectEqualStrings("snapshots/run-1/build/002-compile.json", cap.rel_path);
-    try std.testing.expectEqual(@as(usize, 2), cap.m.files.len);
+    try std.testing.expectEqual(@as(usize, 3), cap.m.files.len);
     try std.testing.expectEqualStrings("README", cap.m.files[0].path);
-    try std.testing.expectEqualStrings("src/main.zig", cap.m.files[1].path);
+    try std.testing.expectEqualStrings("src", cap.m.files[1].path);
+    try std.testing.expect(cap.m.files[1].is_dir);
+    try std.testing.expectEqualStrings("src/main.zig", cap.m.files[2].path);
 
     const loaded = try load(a, root, cap.rel_path);
     try std.testing.expectEqualStrings("run-1", loaded.run_id);
@@ -289,8 +312,8 @@ test "capture writes manifest, excludes .git and .jalan, json round-trips" {
     try std.testing.expectEqualStrings(cap.m.tree_hash, loaded.tree_hash);
     try std.testing.expectEqual(@as(usize, 1), loaded.env.len);
     try std.testing.expectEqualStrings("refs/heads/main", loaded.env[0].value);
-    try std.testing.expectEqual(@as(usize, 2), loaded.files.len);
-    try std.testing.expectEqualStrings("src/main.zig", loaded.files[1].path);
+    try std.testing.expectEqual(@as(usize, 3), loaded.files.len);
+    try std.testing.expectEqualStrings("src/main.zig", loaded.files[2].path);
     std.fs.cwd().deleteTree(base) catch {};
 }
 

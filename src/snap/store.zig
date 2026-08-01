@@ -7,8 +7,15 @@
 //! the write is skipped — dedup is automatic by addressing.
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const atomic = @import("atomic.zig");
 
 pub const Error = error{ OutOfMemory, StoreIo };
+
+pub fn isValidHex(hex: []const u8) bool {
+    if (hex.len != 64) return false;
+    for (hex) |c| if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    return true;
+}
 
 /// Lowercase hex sha256 of `data` (64 chars, caller's allocator).
 pub fn sha256Hex(alloc: std.mem.Allocator, data: []const u8) Error![]u8 {
@@ -37,7 +44,7 @@ pub fn sha256FileHex(alloc: std.mem.Allocator, abs_path: []const u8) Error![]u8 
 
 /// `<root>/blobs/<hex[0..2]>/<hex>`.
 pub fn blobPath(alloc: std.mem.Allocator, root: []const u8, hex: []const u8) Error![]u8 {
-    if (hex.len < 2) return error.StoreIo;
+    if (!isValidHex(hex)) return error.StoreIo;
     return std.fmt.allocPrint(alloc, "{s}/blobs/{s}/{s}", .{ root, hex[0..2], hex }) catch return error.OutOfMemory;
 }
 
@@ -45,18 +52,6 @@ fn ensureParent(root_dir: std.fs.Dir, path: []const u8) Error!void {
     if (std.fs.path.dirname(path)) |dir| {
         root_dir.makePath(dir) catch return error.StoreIo;
     }
-}
-
-/// Atomic rename within `root`: write-through-tmp callers produce `tmp_rel`;
-/// the final path may already exist (dedup) — Windows rename refuses to
-/// overwrite, so an existing destination with identical length is simply
-/// kept (same content = same address by construction).
-fn commitTmp(root_dir: std.fs.Dir, tmp_rel: []const u8, final_rel: []const u8) Error!void {
-    root_dir.access(final_rel, .{}) catch {
-        root_dir.rename(tmp_rel, final_rel) catch return error.StoreIo;
-        return;
-    };
-    root_dir.deleteFile(tmp_rel) catch {};
 }
 
 fn tmpPath(alloc: std.mem.Allocator, root: []const u8) Error![]u8 {
@@ -72,30 +67,118 @@ pub fn writeBlob(alloc: std.mem.Allocator, root: []const u8, data: []const u8) E
     const final_rel = try blobPath(alloc, root, hex);
     var root_dir = std.fs.cwd().openDir(".", .{}) catch return error.StoreIo;
     defer root_dir.close();
-    root_dir.access(final_rel, .{}) catch {
-        const tmp_rel = try tmpPath(alloc, root);
-        try ensureParent(root_dir, tmp_rel);
-        root_dir.writeFile(.{ .sub_path = tmp_rel, .data = data }) catch return error.StoreIo;
-        try ensureParent(root_dir, final_rel);
-        try commitTmp(root_dir, tmp_rel, final_rel);
-        return hex;
-    };
+    if (root_dir.access(final_rel, .{})) |_| {
+        if (verifyBlob(alloc, root, hex)) |_| return hex else |_| {}
+    } else |_| {}
+    const tmp_rel = try tmpPath(alloc, root);
+    try ensureParent(root_dir, tmp_rel);
+    root_dir.writeFile(.{ .sub_path = tmp_rel, .data = data }) catch return error.StoreIo;
+    errdefer root_dir.deleteFile(tmp_rel) catch {};
+    try ensureParent(root_dir, final_rel);
+    atomic.replaceFile(tmp_rel, final_rel) catch return error.StoreIo;
     return hex;
 }
 
 /// Read a blob by digest.
 pub fn readBlob(alloc: std.mem.Allocator, root: []const u8, hex: []const u8) Error![]u8 {
     const path = try blobPath(alloc, root, hex);
-    return std.fs.cwd().readFileAlloc(alloc, path, 1 << 31) catch return error.StoreIo;
+    const data = std.fs.cwd().readFileAlloc(alloc, path, 1 << 31) catch return error.StoreIo;
+    var digest: [32]u8 = undefined;
+    Sha256.hash(data, &digest, .{});
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual, hex)) return error.StoreIo;
+    return data;
 }
 
 pub const CopiedFile = struct { hex: []u8, size: u64 };
 
-/// Hash a file and store its contents as a blob in one pass.
+/// Hash a file while streaming it into the store. File contents never enter
+/// the caller's arena, which keeps repeated step snapshots bounded-memory.
 pub fn copyFileToBlob(alloc: std.mem.Allocator, root: []const u8, src_abs: []const u8) Error!CopiedFile {
-    const data = std.fs.cwd().readFileAlloc(alloc, src_abs, 1 << 31) catch return error.StoreIo;
-    const hex = try writeBlob(alloc, root, data);
-    return .{ .hex = hex, .size = data.len };
+    const src = std.fs.openFileAbsolute(src_abs, .{}) catch return error.StoreIo;
+    defer src.close();
+    const tmp_rel = try tmpPath(alloc, root);
+    var cwd = std.fs.cwd();
+    try ensureParent(cwd, tmp_rel);
+    var tmp = cwd.createFile(tmp_rel, .{}) catch return error.StoreIo;
+    var tmp_open = true;
+    defer if (tmp_open) tmp.close();
+    errdefer cwd.deleteFile(tmp_rel) catch {};
+
+    var h = Sha256.init(.{});
+    var size: u64 = 0;
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = src.read(&buf) catch return error.StoreIo;
+        if (n == 0) break;
+        h.update(buf[0..n]);
+        tmp.writeAll(buf[0..n]) catch return error.StoreIo;
+        size += n;
+    }
+    tmp.close();
+    tmp_open = false;
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    const hex_arr = std.fmt.bytesToHex(digest, .lower);
+    const hex = alloc.dupe(u8, &hex_arr) catch return error.OutOfMemory;
+    const final_rel = try blobPath(alloc, root, hex);
+    try ensureParent(cwd, final_rel);
+    if (verifyBlob(alloc, root, hex)) |_| {
+        cwd.deleteFile(tmp_rel) catch {};
+    } else |_| {
+        atomic.replaceFile(tmp_rel, final_rel) catch return error.StoreIo;
+    }
+    return .{ .hex = hex, .size = size };
+}
+
+/// Verify that a blob exists and its bytes match its content address.
+pub fn verifyBlob(alloc: std.mem.Allocator, root: []const u8, hex: []const u8) Error!void {
+    const path = try blobPath(alloc, root, hex);
+    const f = std.fs.cwd().openFile(path, .{}) catch return error.StoreIo;
+    defer f.close();
+    var h = Sha256.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = f.read(&buf) catch return error.StoreIo;
+        if (n == 0) break;
+        h.update(buf[0..n]);
+    }
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual, hex)) return error.StoreIo;
+}
+
+/// Stream a verified blob into an already-safe destination directory. The
+/// destination is replaced only after the complete blob hash is validated.
+pub fn copyBlobToFile(alloc: std.mem.Allocator, root: []const u8, hex: []const u8, dst_dir: std.fs.Dir, dst_name: []const u8) Error!void {
+    const path = try blobPath(alloc, root, hex);
+    const src = std.fs.cwd().openFile(path, .{}) catch return error.StoreIo;
+    defer src.close();
+    const tmp_name = try std.fmt.allocPrint(alloc, ".jalan-restore-{x}", .{std.crypto.random.int(u64)});
+    var tmp = dst_dir.createFile(tmp_name, .{ .exclusive = true }) catch return error.StoreIo;
+    var tmp_open = true;
+    defer if (tmp_open) tmp.close();
+    errdefer dst_dir.deleteFile(tmp_name) catch {};
+
+    var h = Sha256.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = src.read(&buf) catch return error.StoreIo;
+        if (n == 0) break;
+        h.update(buf[0..n]);
+        tmp.writeAll(buf[0..n]) catch return error.StoreIo;
+    }
+    tmp.close();
+    tmp_open = false;
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, &actual, hex)) return error.StoreIo;
+    dst_dir.rename(tmp_name, dst_name) catch {
+        dst_dir.deleteFile(dst_name) catch {};
+        dst_dir.rename(tmp_name, dst_name) catch return error.StoreIo;
+    };
 }
 
 test "sha256Hex matches known vector" {
@@ -143,6 +226,8 @@ test "blobPath fans out on first two hex chars" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const p = try blobPath(a, ".jalan/store", "abcdef0123");
-    try std.testing.expect(std.mem.indexOf(u8, p, "blobs/ab/abcdef0123") != null);
+    const hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const p = try blobPath(a, ".jalan/store", hex);
+    try std.testing.expect(std.mem.indexOf(u8, p, "blobs/ab/") != null);
+    try std.testing.expectError(error.StoreIo, blobPath(a, ".jalan/store", "../../escape"));
 }

@@ -10,12 +10,73 @@ const builtin = @import("builtin");
 const backend = @import("../backend.zig");
 const manifest_mod = @import("manifest.zig");
 const store = @import("store.zig");
+const safe_path = @import("path.zig");
 
 pub const Error = error{ OutOfMemory, StoreIo, RestoreFailed };
 
 fn excluded(path: []const u8) bool {
     return std.mem.eql(u8, path, ".git") or std.mem.startsWith(u8, path, ".git/") or
         std.mem.eql(u8, path, ".jalan") or std.mem.startsWith(u8, path, ".jalan/");
+}
+
+fn hashFile(alloc: std.mem.Allocator, dir: std.fs.Dir, name: []const u8) ![]u8 {
+    const f = try dir.openFile(name, .{});
+    defer f.close();
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try f.read(&buf);
+        if (n == 0) break;
+        h.update(buf[0..n]);
+    }
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return alloc.dupe(u8, &hex);
+}
+
+fn copySymlinkTarget(alloc: std.mem.Allocator, workspace_abs: []const u8, path: []const u8, target: []const u8) !void {
+    const link_dir = std.fs.path.dirname(path) orelse "";
+    const target_abs = try std.fs.path.resolve(alloc, &.{ workspace_abs, link_dir, target });
+    const target_real = try std.fs.cwd().realpathAlloc(alloc, target_abs);
+    const rel = try std.fs.path.relative(alloc, workspace_abs, target_real);
+    if (!safe_path.isSafeRelative(rel)) return error.UnsafePath;
+
+    const src = try std.fs.openFileAbsolute(target_real, .{});
+    defer src.close();
+    var parent = try safe_path.openParent(workspace_abs, path, true);
+    defer parent.close();
+    var dst = try parent.dir.createFile(parent.basename, .{});
+    defer dst.close();
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        const n = try src.read(&buf);
+        if (n == 0) break;
+        try dst.writeAll(buf[0..n]);
+    }
+}
+
+fn restoreLink(alloc: std.mem.Allocator, workspace_abs: []const u8, path: []const u8, target: []const u8, log: ?backend.LogFn, force_fallback: bool) !bool {
+    var parent = try safe_path.openParent(workspace_abs, path, true);
+    parent.dir.deleteFile(parent.basename) catch {};
+    parent.dir.deleteTree(parent.basename) catch {};
+    if (!force_fallback) {
+        if (parent.dir.symLink(target, parent.basename, .{})) |_| {
+            parent.close();
+            return true;
+        } else |_| {}
+    }
+    parent.close();
+    copySymlinkTarget(alloc, workspace_abs, path, target) catch {
+        if (log) |l| l(try std.fmt.allocPrint(alloc, "restore: cannot recreate symlink {s} or copy its target", .{path}));
+        return error.UnsafePath;
+    };
+    if (log) |l| l(try std.fmt.allocPrint(alloc, "restore: symlink {s} restored as target content", .{path}));
+    return false;
+}
+
+pub fn restoreSymlink(alloc: std.mem.Allocator, workspace_abs: []const u8, path: []const u8, target: []const u8, log: ?backend.LogFn) Error!void {
+    _ = restoreLink(alloc, workspace_abs, path, target, log, false) catch return error.RestoreFailed;
 }
 
 pub fn restore(
@@ -26,7 +87,22 @@ pub fn restore(
     log: ?backend.LogFn,
 ) Error!void {
     var wanted: std.StringHashMapUnmanaged(manifest_mod.FileEntry) = .empty;
-    for (m.files) |f| try wanted.put(alloc, f.path, f);
+    for (m.files) |f| {
+        if (!safe_path.isSafeRelative(f.path)) return error.RestoreFailed;
+        if (f.mode > 0o777 or (f.is_dir and f.link_target != null)) return error.RestoreFailed;
+        if (!f.is_dir and f.link_target == null and !store.isValidHex(f.blob)) return error.RestoreFailed;
+        try wanted.put(alloc, f.path, f);
+    }
+    if (!store.isValidHex(m.tree_hash)) return error.RestoreFailed;
+    const declared_hash = manifest_mod.treeHash(alloc, m.files) catch return error.RestoreFailed;
+    if (!std.mem.eql(u8, declared_hash, m.tree_hash)) return error.RestoreFailed;
+
+    // Prove every required regular-file blob exists and matches its digest
+    // before deleting or overwriting anything in the workspace.
+    for (m.files) |f| {
+        if (!f.is_dir and f.link_target == null)
+            store.verifyBlob(alloc, root, f.blob) catch return error.RestoreFailed;
+    }
 
     // Pass 1: delete files the manifest doesn't know about.
     var dirs: std.ArrayList([]const u8) = .empty;
@@ -45,7 +121,7 @@ pub fn restore(
                 .file, .sym_link => {
                     if (!wanted.contains(norm)) dir.deleteFile(e.path) catch return error.StoreIo;
                 },
-                .directory => try dirs.append(alloc, norm),
+                .directory => if (!wanted.contains(norm)) try dirs.append(alloc, norm),
                 else => {},
             }
         }
@@ -68,30 +144,62 @@ pub fn restore(
         }
     }
 
-    // Pass 2: write back changed/missing files.
+    // Pass 2: materialize recorded directories before their children.
     for (m.files) |f| {
-        const abs = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ workspace_abs, f.path });
-        if (f.link_target) |t| {
-            // Symlink entry: recreate where permitted; otherwise warn.
-            std.fs.cwd().deleteFile(abs) catch {};
-            std.fs.cwd().symLink(t, abs, .{}) catch {
-                if (log) |l| l(try std.fmt.allocPrint(alloc, "restore: cannot recreate symlink {s} — skipped", .{f.path}));
-            };
-            continue;
+        if (!f.is_dir) continue;
+        var parent = safe_path.openParent(workspace_abs, f.path, true) catch return error.RestoreFailed;
+        defer parent.close();
+        parent.dir.makeDir(parent.basename) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                parent.dir.deleteFile(parent.basename) catch {};
+                parent.dir.makeDir(parent.basename) catch return error.RestoreFailed;
+            },
+        };
+        if (builtin.os.tag != .windows) {
+            if (parent.dir.openDir(parent.basename, .{})) |opened| {
+                var restored = opened;
+                defer restored.close();
+                restored.chmod(@intCast(f.mode)) catch {};
+            } else |_| {}
         }
+    }
+
+    // Pass 3: write back changed/missing regular files first. This ensures a
+    // symlink fallback can copy the restored target's contents afterward.
+    for (m.files) |f| {
+        if (f.is_dir or f.link_target != null) continue;
+        var parent = safe_path.openParent(workspace_abs, f.path, true) catch return error.RestoreFailed;
+        defer parent.close();
         var need_write = true;
-        if (std.fs.cwd().access(abs, .{})) |_| {
-            const cur = store.sha256FileHex(alloc, abs) catch "";
+        if (parent.dir.access(parent.basename, .{})) |_| {
+            const cur = hashFile(alloc, parent.dir, parent.basename) catch "";
             need_write = !std.mem.eql(u8, cur, f.blob);
         } else |_| {}
-        if (!need_write) continue;
-        const data = store.readBlob(alloc, root, f.blob) catch return error.RestoreFailed;
-        if (std.fs.path.dirname(abs)) |d| std.fs.cwd().makePath(d) catch return error.StoreIo;
-        std.fs.cwd().writeFile(.{ .sub_path = abs, .data = data }) catch return error.StoreIo;
-        if (builtin.os.tag != .windows and f.mode & 0o111 != 0) {
-            const abs_z = try alloc.dupeZ(u8, abs);
-            _ = std.c.chmod(abs_z, @intCast(f.mode));
+        if (need_write)
+            store.copyBlobToFile(alloc, root, f.blob, parent.dir, parent.basename) catch return error.RestoreFailed;
+        if (builtin.os.tag != .windows) {
+            // File.chmod uses Zig's platform layer directly; std.c.chmod
+            // would make otherwise-standalone cross builds require libc.
+            if (parent.dir.openFile(parent.basename, .{ .mode = .read_write })) |restored| {
+                defer restored.close();
+                restored.chmod(@intCast(f.mode)) catch {};
+            } else |_| {}
         }
+    }
+
+    // Pass 4: links after regular files so fallback copies see their target.
+    var exact_links = true;
+    for (m.files) |f| {
+        if (f.link_target) |target| {
+            const exact = restoreLink(alloc, workspace_abs, f.path, target, log, false) catch return error.RestoreFailed;
+            exact_links = exact_links and exact;
+        }
+    }
+    if (exact_links) {
+        const restored = manifest_mod.scanTree(alloc, root, workspace_abs, false) catch return error.RestoreFailed;
+        const restored_hash = manifest_mod.treeHash(alloc, restored) catch return error.RestoreFailed;
+        if (!std.mem.eql(u8, restored_hash, m.tree_hash)) return error.RestoreFailed;
     }
 }
 
@@ -155,4 +263,32 @@ test "restore fails with RestoreFailed when a blob is missing" {
     };
     try std.testing.expectError(error.RestoreFailed, restore(a, root, ws_abs, m, null));
     std.fs.cwd().deleteTree(base) catch {};
+}
+
+test "symlink fallback copies target content" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/restore-link-fallback";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    try std.fs.cwd().makePath(base);
+    try std.fs.cwd().writeFile(.{ .sub_path = base ++ "/target.txt", .data = "target bytes" });
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, base);
+    try std.testing.expect(!(try restoreLink(a, ws_abs, "copy.txt", "target.txt", null, true)));
+    try std.testing.expectEqualStrings("target bytes", try std.fs.cwd().readFileAlloc(a, base ++ "/copy.txt", 1024));
+}
+
+test "restore rejects persisted path traversal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/restore-traversal";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    try std.fs.cwd().makePath(base);
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, base);
+    var files = [_]manifest_mod.FileEntry{.{ .path = "../outside.txt", .blob = "0000000000000000000000000000000000000000000000000000000000000000" }};
+    const m = manifest_mod.Manifest{ .run_id = "r", .job_id = "j", .step_index = 0, .step_id = "s", .created_unix = 0, .tree_hash = "x", .files = &files };
+    try std.testing.expectError(error.RestoreFailed, restore(a, ".jalan/store", ws_abs, m, null));
 }

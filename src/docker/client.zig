@@ -138,6 +138,16 @@ pub fn imageExists(alloc: std.mem.Allocator, c: Client, image: []const u8, err: 
     return error.DockerApi;
 }
 
+/// Resolve an image reference (including a mutable tag) to Docker's immutable
+/// content ID. Cache keys use this only after setup has ensured the image is
+/// present locally.
+pub fn imageIdentity(alloc: std.mem.Allocator, c: Client, image: []const u8, err: *?[]const u8) ![]const u8 {
+    const path = try std.fmt.allocPrint(alloc, "{s}/images/{s}/json", .{ api_prefix, image });
+    const resp = try apiCall(alloc, c, .{ .method = "GET", .path = path }, err);
+    const parsed = std.json.parseFromSliceLeaky(struct { Id: []const u8 }, alloc, resp.body, .{ .ignore_unknown_fields = true }) catch return error.DockerApi;
+    return parsed.Id;
+}
+
 /// `POST {prefix}/images/create?fromImage=<name>&tag=<tag>`: body is a
 /// stream of JSON-lines progress events. Reads the full body, then emits one
 /// log line per unique `status` string (in first-seen order).
@@ -187,13 +197,40 @@ pub fn containerRemove(alloc: std.mem.Allocator, c: Client, id: []const u8, err:
     _ = try apiCall(alloc, c, .{ .method = "DELETE", .path = path }, err);
 }
 
-/// `POST {prefix}/containers/{id}/wait`: returns the container's exit code,
-/// parsed from `{"StatusCode":...}`.
+/// Poll container state until it exits. The Engine's streaming `/wait`
+/// response can keep raw named-pipe connections open indefinitely on some
+/// Docker Desktop versions, so inspect polling is more robust. This remains
+/// unbounded because jalan has no configured step/action timeout yet and a
+/// legitimate container action may run for longer than a minute.
 pub fn containerWait(alloc: std.mem.Allocator, c: Client, id: []const u8, err: *?[]const u8) !i32 {
-    const path = try std.fmt.allocPrint(alloc, "{s}/containers/{s}/wait", .{ api_prefix, id });
-    const resp = try apiCall(alloc, c, .{ .method = "POST", .path = path }, err);
-    const parsed = std.json.parseFromSliceLeaky(struct { StatusCode: i32 }, alloc, resp.body, .{ .ignore_unknown_fields = true }) catch return error.DockerApi;
-    return parsed.StatusCode;
+    while (true) {
+        const state = try containerState(alloc, c, id, err);
+        if (!state.running) return state.exit_code;
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+}
+
+const ContainerState = struct { running: bool, exit_code: i32 };
+
+/// One bounded inspect poll. All request/JSON allocations die before this
+/// returns, so an unbounded container wait has constant memory usage.
+fn containerState(_: std.mem.Allocator, c: Client, id: []const u8, err: *?[]const u8) !ContainerState {
+    var poll_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer poll_arena.deinit();
+    const a = poll_arena.allocator();
+    const path = try std.fmt.allocPrint(a, "{s}/containers/{s}/json", .{ api_prefix, id });
+    var poll_err: ?[]const u8 = null;
+    const resp = apiCall(a, c, .{ .method = "GET", .path = path }, &poll_err) catch |e| {
+        err.* = "docker container inspect failed";
+        return e;
+    };
+    const parsed = std.json.parseFromSliceLeaky(struct {
+        State: struct { Running: bool = true, ExitCode: i32 = -1 },
+    }, a, resp.body, .{ .ignore_unknown_fields = true }) catch {
+        err.* = "invalid docker container inspect response";
+        return error.DockerApi;
+    };
+    return .{ .running = parsed.State.Running, .exit_code = parsed.State.ExitCode };
 }
 
 /// `POST {prefix}/networks/create`: returns the new network's id.
@@ -451,11 +488,42 @@ pub fn execRun(alloc: std.mem.Allocator, c: Client, container_id: []const u8, cm
     return .{ .exit_code = exit_code, .stdout = demuxed.stdout, .stderr = demuxed.stderr };
 }
 
-fn execIsRunning(alloc: std.mem.Allocator, c: Client, exec_id: []const u8, err: *?[]const u8) !bool {
+fn execIsRunning(_: std.mem.Allocator, c: Client, exec_id: []const u8, err: *?[]const u8) !bool {
+    var poll_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer poll_arena.deinit();
+    const alloc = poll_arena.allocator();
     const inspect_path = try std.fmt.allocPrint(alloc, "{s}/exec/{s}/json", .{ api_prefix, exec_id });
-    const resp = try apiCall(alloc, c, .{ .method = "GET", .path = inspect_path }, err);
-    const parsed = std.json.parseFromSliceLeaky(struct { Running: bool = false }, alloc, resp.body, .{ .ignore_unknown_fields = true }) catch return error.DockerApi;
+    var poll_err: ?[]const u8 = null;
+    const resp = apiCall(alloc, c, .{ .method = "GET", .path = inspect_path }, &poll_err) catch |e| {
+        err.* = "docker exec inspect failed";
+        return e;
+    };
+    const parsed = std.json.parseFromSliceLeaky(struct { Running: bool = false }, alloc, resp.body, .{ .ignore_unknown_fields = true }) catch {
+        err.* = "invalid docker exec inspect response";
+        return error.DockerApi;
+    };
     return parsed.Running;
+}
+
+extern "kernel32" fn PeekNamedPipe(
+    handle: std.os.windows.HANDLE,
+    buffer: ?*anyopaque,
+    buffer_size: std.os.windows.DWORD,
+    bytes_read: ?*std.os.windows.DWORD,
+    bytes_available: ?*std.os.windows.DWORD,
+    bytes_left: ?*std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.BOOL;
+
+/// Returns null once Docker has closed the hijacked named pipe.
+fn windowsPipeAvailable(file: std.fs.File) !?usize {
+    var available: std.os.windows.DWORD = 0;
+    if (PeekNamedPipe(file.handle, null, 0, null, &available, null) == 0) {
+        return switch (std.os.windows.GetLastError()) {
+            .BROKEN_PIPE, .HANDLE_EOF => null,
+            else => |win_err| std.os.windows.unexpectedError(win_err),
+        };
+    }
+    return available;
 }
 
 fn readUpgradeHeader(alloc: std.mem.Allocator, file: std.fs.File) ![]u8 {
@@ -531,41 +599,65 @@ pub fn execInteractive(
         return error.DockerApi;
     }
 
-    const Relay = struct {
-        fn output(file: std.fs.File) void {
-            var buf: [4096]u8 = undefined;
-            while (true) {
-                const n = file.read(&buf) catch return;
-                if (n == 0) return;
-                std.fs.File.stdout().writeAll(buf[0..n]) catch return;
+    // Windows' async poller currently logs ERROR_HANDLE_EOF as an unexpected
+    // error for named pipes. Peek/read the Docker pipe there instead: the
+    // synchronous ReadFile wrapper handles both HANDLE_EOF and BROKEN_PIPE as
+    // a clean zero-byte read. Interactive input is a TTY-only operation.
+    if (builtin.os.tag == .windows) {
+        const Input = enum { stdin };
+        const stdin = std.fs.File.stdin();
+        var input_poller = std.Io.poll(alloc, Input, .{ .stdin = stdin });
+        defer input_poller.deinit();
+        var docker_buf: [4096]u8 = undefined;
+        while (try execIsRunning(alloc, c, created.Id, err)) {
+            const available = (try windowsPipeAvailable(conn.file)) orelse break;
+            if (available > 0) {
+                const n = try conn.file.read(docker_buf[0..@min(available, docker_buf.len)]);
+                if (n == 0) break;
+                try std.fs.File.stdout().writeAll(docker_buf[0..n]);
+            }
+            if (stdin.isTty()) {
+                _ = try input_poller.pollTimeout(25 * std.time.ns_per_ms);
+                const from_stdin = input_poller.reader(.stdin).buffered();
+                if (from_stdin.len > 0) {
+                    try conn.file.writeAll(from_stdin);
+                    input_poller.reader(.stdin).toss(from_stdin.len);
+                }
+            } else {
+                std.Thread.sleep(25 * std.time.ns_per_ms);
             }
         }
-    };
-    const output_thread = try std.Thread.spawn(.{}, Relay.output, .{conn.file});
-
-    var stdin_reader = std.fs.File.stdin().deprecatedReader();
-    var line_buf: [4096]u8 = undefined;
-    while (true) {
-        const line = stdin_reader.readUntilDelimiterOrEof(&line_buf, '\n') catch null;
-        if (line == null) {
-            conn.file.writeAll(&.{4}) catch {};
-            break;
+        // Flush bytes Docker queued immediately before marking the exec done.
+        while (((try windowsPipeAvailable(conn.file)) orelse 0) > 0) {
+            const available = (try windowsPipeAvailable(conn.file)) orelse break;
+            const n = try conn.file.read(docker_buf[0..@min(available, docker_buf.len)]);
+            if (n == 0) break;
+            try std.fs.File.stdout().writeAll(docker_buf[0..n]);
         }
-        conn.file.writeAll(line.?) catch break;
-        conn.file.writeAll("\n") catch break;
-
-        // Give the shell a short window to process `exit`, then determine
-        // whether to return to jalan's prompt or read another input line.
-        var poll: usize = 0;
-        var running = true;
-        while (poll < 5) : (poll += 1) {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
-            running = execIsRunning(alloc, c, created.Id, err) catch true;
-            if (!running) break;
-        }
-        if (!running) break;
+        return;
     }
-    output_thread.join();
+
+    // Poll stdin and the hijacked Docker stream together. This preserves raw
+    // terminal control bytes and, critically, checks remote completion even
+    // while the user is not typing, so a shell that exits asynchronously
+    // cannot leave jalan blocked on the next stdin line.
+    const Stream = enum { stdin, docker };
+    var poller = std.Io.poll(alloc, Stream, .{ .stdin = std.fs.File.stdin(), .docker = conn.file });
+    defer poller.deinit();
+    while (true) {
+        const alive = try poller.pollTimeout(50 * std.time.ns_per_ms);
+        const from_docker = poller.reader(.docker).buffered();
+        if (from_docker.len > 0) {
+            try std.fs.File.stdout().writeAll(from_docker);
+            poller.reader(.docker).toss(from_docker.len);
+        }
+        const from_stdin = poller.reader(.stdin).buffered();
+        if (from_stdin.len > 0) {
+            try conn.file.writeAll(from_stdin);
+            poller.reader(.stdin).toss(from_stdin.len);
+        }
+        if (!alive or !(try execIsRunning(alloc, c, created.Id, err))) break;
+    }
 }
 
 test "detectSocket precedence: config over default" {
@@ -664,4 +756,20 @@ test "exec in live container captures output and exit code (skips without daemon
     try std.testing.expectEqual(@as(i32, 7), r.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "hi") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "bad") != null);
+}
+
+test "interactive exec observes remote exit without waiting for stdin (skips without daemon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = Client{ .socket_path = detectSocket(a, .{}).? };
+    if (!ping(a, c)) return error.SkipZigTest;
+    var err: ?[]const u8 = null;
+    if (!try imageExists(a, c, "busybox:latest", &err)) try imagePull(a, c, "busybox:latest", null, &err);
+    const id = try containerCreate(a, c,
+        \\{"Image":"busybox:latest","Cmd":["sleep","30"]}
+    , null, &err);
+    defer containerRemove(a, c, id, &err) catch {};
+    try containerStart(a, c, id, &err);
+    try execInteractive(a, c, id, &.{ "sh", "-c", "exit 0" }, &.{}, null, &err);
 }

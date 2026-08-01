@@ -199,7 +199,18 @@ const vtable = backend_iface.Backend.VTable{
     .teardownJob = teardown,
     .runContainerAction = runContainerAction,
     .openShell = openShell,
+    .cacheIdentity = cacheIdentity,
 };
+
+fn cacheIdentity(ctx: *anyopaque, alloc: std.mem.Allocator, _: ir.Job, handle: *backend_iface.JobHandle, step: ir.Step) anyerror![]const u8 {
+    const self: *DockerBackend = @ptrCast(@alignCast(ctx));
+    if (std.mem.startsWith(u8, step.uses_ref, "docker://")) {
+        var err: ?[]const u8 = null;
+        const action_id = try client.imageIdentity(alloc, self.client, step.uses_ref["docker://".len..], &err);
+        return std.fmt.allocPrint(alloc, "{s};action:{s}", .{ handle.cache_identity, action_id });
+    }
+    return handle.cache_identity;
+}
 
 /// Best-effort teardown of whatever service containers + network got
 /// created before a later step in `setup` failed (or during normal
@@ -285,6 +296,12 @@ fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: 
         };
     }
 
+    var runtime_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    const image_id = try client.imageIdentity(alloc, self.client, image, &err);
+    runtime_hash.update("job\x00");
+    runtime_hash.update(image_id);
+    runtime_hash.update(&.{0});
+
     var network_id: []const u8 = "";
     var service_ids: std.ArrayList([]const u8) = .empty;
 
@@ -307,6 +324,22 @@ fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: 
                     cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
                     return e;
                 };
+            }
+            const service_image_id = client.imageIdentity(alloc, self.client, svc.image, &err) catch |e| {
+                if (log) |l| if (err) |m| l(m);
+                cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
+                return e;
+            };
+            runtime_hash.update("service\x00");
+            runtime_hash.update(svc.name);
+            runtime_hash.update(&.{0});
+            runtime_hash.update(service_image_id);
+            runtime_hash.update(&.{0});
+            for (svc.env) |pair| {
+                runtime_hash.update(pair.name);
+                runtime_hash.update(&.{0});
+                runtime_hash.update(pair.value);
+                runtime_hash.update(&.{0});
             }
             const svc_env = try formatEnvPairs(alloc, svc.env, &.{});
             const svc_spec = try buildContainerCreateSpec(alloc, svc.image, null, svc_env, null, network_id, &.{svc.name});
@@ -341,7 +374,16 @@ fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: 
         return e;
     };
 
-    return .{ .container_id = id, .workspace = workspace_abs, .network_id = network_id, .service_ids = try service_ids.toOwnedSlice(alloc) };
+    var runtime_digest: [32]u8 = undefined;
+    runtime_hash.final(&runtime_digest);
+    const runtime_hex = std.fmt.bytesToHex(runtime_digest, .lower);
+    return .{
+        .container_id = id,
+        .workspace = workspace_abs,
+        .network_id = network_id,
+        .service_ids = try service_ids.toOwnedSlice(alloc),
+        .cache_identity = try std.fmt.allocPrint(alloc, "runtime:{s}", .{&runtime_hex}),
+    };
 }
 
 fn run(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHandle, step: ir.Step, env: []const ir.EnvPair, workdir: ?[]const u8, err_msg: *?[]const u8) anyerror!backend_iface.StepOutcome {

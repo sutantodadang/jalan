@@ -7,6 +7,7 @@
 //! crashed run still resumes up to its last completed job.
 const std = @import("std");
 const ir = @import("../ir.zig");
+const atomic = @import("atomic.zig");
 
 pub const Error = error{ OutOfMemory, StoreIo };
 
@@ -31,7 +32,15 @@ pub const RunRecord = struct {
     job_outputs: []ir.EnvPair = &.{},
 };
 
-/// `<unix-seconds>-<8 random hex>` — sortable, collision-free.
+fn validRunId(run_id: []const u8) bool {
+    if (run_id.len == 0) return false;
+    for (run_id) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+    }
+    return true;
+}
+
+/// `<unix-seconds>-<8 random hex>` — sortable and probabilistically unique.
 pub fn newId(alloc: std.mem.Allocator) ![]u8 {
     var rand_buf: [4]u8 = undefined;
     std.crypto.random.bytes(&rand_buf);
@@ -39,21 +48,20 @@ pub fn newId(alloc: std.mem.Allocator) ![]u8 {
 }
 
 fn recordPath(alloc: std.mem.Allocator, root: []const u8, run_id: []const u8) ![]u8 {
+    if (!validRunId(run_id)) return error.StoreIo;
     return std.fmt.allocPrint(alloc, "{s}/runs/{s}.json", .{ root, run_id });
 }
 
-/// Atomic write: tmp file + rename (delete-first on Windows, where rename
-/// refuses to overwrite — the record is rewritten after every job).
+/// Atomic write: tmp file + platform-native atomic replacement. The record is
+/// rewritten after every job without exposing a missing-file window.
 pub fn write(alloc: std.mem.Allocator, root: []const u8, rec: *const RunRecord) Error!void {
     const json = try toJson(alloc, rec.*);
     const abs = try recordPath(alloc, root, rec.run_id);
     if (std.fs.path.dirname(abs)) |d| std.fs.cwd().makePath(d) catch return error.StoreIo;
     const tmp = try std.fmt.allocPrint(alloc, "{s}.tmp{x}", .{ abs, std.crypto.random.int(u32) });
+    errdefer std.fs.cwd().deleteFile(tmp) catch {};
     std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = json }) catch return error.StoreIo;
-    std.fs.cwd().rename(tmp, abs) catch {
-        std.fs.cwd().deleteFile(abs) catch {};
-        std.fs.cwd().rename(tmp, abs) catch return error.StoreIo;
-    };
+    atomic.replaceFile(tmp, abs) catch return error.StoreIo;
 }
 
 pub fn load(alloc: std.mem.Allocator, root: []const u8, run_id: []const u8) Error!RunRecord {
@@ -155,6 +163,12 @@ test "newId has <unix>-<hex8> shape" {
     const dash = std.mem.indexOfScalar(u8, id, '-').?;
     try std.testing.expect(dash > 0);
     try std.testing.expectEqual(@as(usize, 8), id.len - dash - 1);
+}
+
+test "run ids cannot traverse outside the store" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.StoreIo, load(arena.allocator(), ".jalan/store", "../../outside"));
 }
 
 test "write → load round-trip" {

@@ -11,9 +11,11 @@ const yaml = @import("yaml.zig");
 const expr = @import("expr.zig");
 const backend_mod = @import("backend.zig");
 const runner = @import("actions/runner.zig");
+const action_resolve = @import("actions/resolve.zig");
 const snap_manifest = @import("snap/manifest.zig");
 const snap_store = @import("snap/store.zig");
 const snap_restore = @import("snap/restore.zig");
+const safe_path = @import("snap/path.zig");
 const runrecord = @import("snap/runrecord.zig");
 const cache = @import("cache.zig");
 const debug_mod = @import("debug.zig");
@@ -440,6 +442,98 @@ test "cache: secret-referencing steps are never cached" {
     try std.testing.expectEqualStrings("exec\nexec\n", count);
 }
 
+test "cache: secret-derived job env is never persisted or replayed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/engcache-job-secret";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const ws = try std.fmt.allocPrint(a, "{s}/ws", .{base});
+    try std.fs.cwd().makePath(ws);
+    const store_root = try std.fmt.allocPrint(a, "{s}/store", .{base});
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, ws);
+    const wf = try std.fmt.allocPrint(a,
+        \\env:
+        \\  TOKEN: ${{{{ Secrets.TOKEN }}}}
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: s1
+        \\        run: echo "$TOKEN" >> ../executions.txt
+        \\        shell: sh
+        \\        working-directory: {s}
+        \\
+    , .{ws});
+    const p = try parseFixture(a, wf);
+    const secrets = [_]ir.EnvPair{.{ .name = "TOKEN", .value = "top-secret" }};
+    const opts = RunOptions{ .cache = true, .store_root = store_root, .workspace_abs = ws_abs, .secrets = &secrets };
+    _ = try run(a, p, opts);
+    _ = try run(a, p, opts);
+    const executions = try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/executions.txt", .{base}), 1024);
+    try std.testing.expectEqualStrings("top-secret\ntop-secret\n", executions);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(try std.fmt.allocPrint(a, "{s}/cache", .{store_root}), .{}));
+}
+
+test "persisted environment secret placeholders round-trip without plaintext" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const secrets = [_]ir.EnvPair{.{ .name = "TOKEN", .value = "hunter2" }};
+    const pairs = [_]ir.EnvPair{
+        .{ .name = "secrets.TOKEN", .value = "hunter2" },
+        .{ .name = "env.AUTH", .value = "Bearer hunter2" },
+    };
+    const protected = try protectPairs(a, &pairs, &secrets);
+    for (protected) |pair| try std.testing.expect(std.mem.indexOf(u8, pair.value, "hunter2") == null);
+    const restored = try rehydratePairs(a, protected, &secrets);
+    try std.testing.expectEqualStrings("hunter2", restored[0].value);
+    try std.testing.expectEqualStrings("Bearer hunter2", restored[1].value);
+    try std.testing.expectError(error.MissingSecret, rehydrateSecretValue(a, protected[0].value, &.{}));
+    try std.testing.expect(isSecretValue(.{ .secrets = &secrets }, "Bearer hunter2"));
+}
+
+test "cache materialization preflights all blobs before changing workspace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/cache-preflight";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const ws = try std.fmt.allocPrint(a, "{s}/ws", .{base});
+    const root = try std.fmt.allocPrint(a, "{s}/store", .{base});
+    try std.fs.cwd().makePath(ws);
+    try std.fs.cwd().writeFile(.{ .sub_path = try std.fmt.allocPrint(a, "{s}/first.txt", .{ws}), .data = "original" });
+    const good = try snap_store.writeBlob(a, root, "cached");
+    const missing = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const wrote = [_]cache.WroteFile{
+        .{ .path = "first.txt", .blob = good },
+        .{ .path = "second.txt", .blob = missing },
+    };
+    try std.testing.expectError(error.StoreIo, materializeEntry(a, root, try std.fs.cwd().realpathAlloc(a, ws), .{ .exit_code = 0, .wrote = &wrote }));
+    try std.testing.expectEqualStrings("original", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/first.txt", .{ws}), 1024));
+}
+
+test "cache materialization recreates and deletes empty directories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/cache-empty-dir";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const ws = try std.fmt.allocPrint(a, "{s}/ws", .{base});
+    try std.fs.cwd().makePath(try std.fmt.allocPrint(a, "{s}/old-empty", .{ws}));
+    const wrote = [_]cache.WroteFile{.{ .path = "new-empty", .mode = 0o755, .is_dir = true }};
+    try materializeEntry(a, try std.fmt.allocPrint(a, "{s}/store", .{base}), try std.fs.cwd().realpathAlloc(a, ws), .{
+        .exit_code = 0,
+        .wrote = &wrote,
+        .deleted = &.{"old-empty"},
+    });
+    var dir = try std.fs.cwd().openDir(try std.fmt.allocPrint(a, "{s}/new-empty", .{ws}), .{});
+    dir.close();
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(try std.fmt.allocPrint(a, "{s}/old-empty", .{ws}), .{}));
+}
+
 test "resume: failed run resumes at the fixed step with restored workspace" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -544,6 +638,12 @@ test "resume: recorded job outputs feed the target and later jobs run" {
         \\        run: echo "ver=42" >> "$GITHUB_OUTPUT"
         \\        shell: sh
         \\        working-directory: {s}
+        \\  sibling:
+        \\    steps:
+        \\      - id: emit
+        \\        run: echo "side=branch" >> "$GITHUB_OUTPUT"
+        \\        shell: sh
+        \\        working-directory: {s}
         \\  target:
         \\    needs: producer
         \\    steps:
@@ -552,18 +652,23 @@ test "resume: recorded job outputs feed the target and later jobs run" {
         \\        shell: sh
         \\        working-directory: {s}
         \\      - id: fixme
-        \\        run: exit 1
+        \\        run: echo "stale=bad" >> "$GITHUB_OUTPUT"; exit 1
         \\        shell: sh
         \\        working-directory: {s}
         \\  later:
-        \\    needs: target
+        \\    needs: [target, sibling]
         \\    steps:
         \\      - id: consume
         \\        run: echo never > later.txt
         \\        shell: sh
         \\        working-directory: {s}
+        \\  unrelated:
+        \\    steps:
+        \\      - run: echo ran >> ../unrelated-count.txt
+        \\        shell: sh
+        \\        working-directory: {s}
         \\
-    , .{ ws, ws, ws, ws });
+    , .{ ws, ws, ws, ws, ws, ws });
     const first = try run(a, try parseFixture(a, wf_v1), .{
         .snapshot = true,
         .store_root = store_root,
@@ -571,7 +676,7 @@ test "resume: recorded job outputs feed the target and later jobs run" {
         .run_id = "resume-chain",
     });
     try std.testing.expect(!first.ok());
-    try std.testing.expectEqual(JobStatus.skipped, first.jobs[2].status);
+    try std.testing.expectEqual(JobStatus.skipped, first.jobs[3].status);
 
     const wf_v2 = try std.fmt.allocPrint(a,
         \\jobs:
@@ -579,6 +684,12 @@ test "resume: recorded job outputs feed the target and later jobs run" {
         \\    steps:
         \\      - id: emit
         \\        run: echo "ver=42" >> "$GITHUB_OUTPUT"
+        \\        shell: sh
+        \\        working-directory: {s}
+        \\  sibling:
+        \\    steps:
+        \\      - id: emit
+        \\        run: echo "side=branch" >> "$GITHUB_OUTPUT"
         \\        shell: sh
         \\        working-directory: {s}
         \\  target:
@@ -593,14 +704,19 @@ test "resume: recorded job outputs feed the target and later jobs run" {
         \\        shell: sh
         \\        working-directory: {s}
         \\  later:
-        \\    needs: target
+        \\    needs: [target, sibling]
         \\    steps:
         \\      - id: consume
-        \\        run: echo "${{{{ needs.target.outputs.answer }}}}" > later.txt
+        \\        run: echo "${{{{ needs.target.outputs.answer }}}}" > later.txt; echo "<${{{{ needs.target.outputs.stale }}}}>" > stale.txt; echo "${{{{ needs.sibling.outputs.side }}}}" > sibling.txt
+        \\        shell: sh
+        \\        working-directory: {s}
+        \\  unrelated:
+        \\    steps:
+        \\      - run: echo ran >> ../unrelated-count.txt
         \\        shell: sh
         \\        working-directory: {s}
         \\
-    , .{ ws, ws, ws, ws });
+    , .{ ws, ws, ws, ws, ws, ws });
     const resumed = try run(a, try parseFixture(a, wf_v2), .{
         .store_root = store_root,
         .workspace_abs = ws_abs,
@@ -608,10 +724,15 @@ test "resume: recorded job outputs feed the target and later jobs run" {
     });
     try std.testing.expect(resumed.ok());
     try std.testing.expectEqual(JobStatus.skipped, resumed.jobs[0].status);
-    try std.testing.expectEqual(StepStatus.skipped, resumed.jobs[1].steps[0].status);
-    try std.testing.expectEqual(JobStatus.success, resumed.jobs[2].status);
+    try std.testing.expectEqual(JobStatus.skipped, resumed.jobs[1].status);
+    try std.testing.expectEqual(StepStatus.skipped, resumed.jobs[2].steps[0].status);
+    try std.testing.expectEqual(JobStatus.success, resumed.jobs[3].status);
+    try std.testing.expectEqual(JobStatus.skipped, resumed.jobs[4].status);
     try std.testing.expectEqualStrings("42\n", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/resumed.txt", .{ws}), 1 << 20));
     try std.testing.expectEqualStrings("ok\n", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/later.txt", .{ws}), 1 << 20));
+    try std.testing.expectEqualStrings("<>\n", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/stale.txt", .{ws}), 1 << 20));
+    try std.testing.expectEqualStrings("branch\n", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/sibling.txt", .{ws}), 1 << 20));
+    try std.testing.expectEqualStrings("ran\n", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/unrelated-count.txt", .{base}), 1 << 20));
 }
 
 test "resume: structural workflow edit rebuilds the same run timeline" {
@@ -659,6 +780,67 @@ test "resume: structural workflow edit rebuilds the same run timeline" {
     const rec = try runrecord.load(a, store_root, "resume-edit");
     try std.testing.expectEqualStrings("resume-edit", rec.run_id);
     try std.testing.expectEqual(@as(usize, 2), rec.jobs[0].steps.len);
+}
+
+test "resume: stable step id survives reorder while numeric selector rejects it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/engresume-reorder";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const ws = try std.fmt.allocPrint(a, "{s}/ws", .{base});
+    try std.fs.cwd().makePath(ws);
+    const store_root = try std.fmt.allocPrint(a, "{s}/store", .{base});
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, ws);
+    const before = try std.fmt.allocPrint(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: prepare
+        \\        run: echo from-prepare > marker.txt; echo "value=old" >> "$GITHUB_OUTPUT"
+        \\        shell: sh
+        \\        working-directory: {s}
+        \\      - id: retry
+        \\        run: unreachable
+        \\        shell: nosuchshell
+        \\        working-directory: {s}
+        \\
+    , .{ ws, ws });
+    _ = try run(a, try parseFixture(a, before), .{
+        .snapshot = true,
+        .store_root = store_root,
+        .workspace_abs = ws_abs,
+        .run_id = "resume-reorder",
+    });
+
+    const reordered = try std.fmt.allocPrint(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: retry
+        \\        run: echo "<${{{{ steps.prepare.outputs.value }}}}>" > seen.txt
+        \\        shell: sh
+        \\        working-directory: {s}
+        \\      - id: prepare
+        \\        run: true
+        \\        shell: sh
+        \\        working-directory: {s}
+        \\
+    , .{ ws, ws });
+    const edited = try parseFixture(a, reordered);
+    try std.testing.expectError(error.ResumeInvalid, run(a, edited, .{
+        .store_root = store_root,
+        .workspace_abs = ws_abs,
+        .resume_from = .{ .run_id = "resume-reorder", .job_id = "j", .step = "0" },
+    }));
+    const resumed = try run(a, edited, .{
+        .store_root = store_root,
+        .workspace_abs = ws_abs,
+        .resume_from = .{ .run_id = "resume-reorder", .job_id = "j", .step = "retry" },
+    });
+    try std.testing.expect(resumed.ok());
+    try std.testing.expectEqualStrings("<>\n", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/seen.txt", .{ws}), 1024));
 }
 
 test "resume: unknown run id is ResumeInvalid" {
@@ -755,18 +937,20 @@ test "on-failure shell dispatches through backend and retries once" {
     const Fake = struct {
         runs: usize = 0,
         shells: usize = 0,
+        saw_stale_retry_output: bool = false,
 
         fn setup(_: *anyopaque, _: std.mem.Allocator, _: ir.Job, workspace: []const u8, _: ?backend_mod.LogFn) anyerror!backend_mod.JobHandle {
             return .{ .workspace = workspace };
         }
-        fn runStep(ctx: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, _: ir.Step, _: []const ir.EnvPair, _: ?[]const u8, _: *?[]const u8) anyerror!backend_mod.StepOutcome {
+        fn runStep(ctx: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, step: ir.Step, _: []const ir.EnvPair, _: ?[]const u8, _: *?[]const u8) anyerror!backend_mod.StepOutcome {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.runs += 1;
+            if (self.runs >= 3 and std.mem.indexOf(u8, step.script, "bad") != null) self.saw_stale_retry_output = true;
             return .{
                 .exit_code = if (self.runs == 1) 1 else 0,
                 .stdout = if (self.runs == 1) "failed" else "retried",
                 .stderr = "",
-                .outputs = &.{},
+                .outputs = if (self.runs == 1) &.{.{ .name = "stale", .value = "bad" }} else &.{},
             };
         }
         fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle) void {}
@@ -789,6 +973,10 @@ test "on-failure shell dispatches through backend and retries once" {
         \\    steps:
         \\      - id: flaky
         \\        run: fake
+        \\  later:
+        \\    needs: j
+        \\    steps:
+        \\      - run: echo "${{ needs.j.outputs.stale }}"
     );
     const commands = [_]debug_mod.PromptCmd{.retry};
     var script = TestPromptScript{ .commands = &commands };
@@ -799,9 +987,10 @@ test "on-failure shell dispatches through backend and retries once" {
         .prompt_ctx = &script,
     });
     try std.testing.expect(report.ok());
-    try std.testing.expectEqual(@as(usize, 2), fake.runs);
+    try std.testing.expectEqual(@as(usize, 3), fake.runs);
     try std.testing.expectEqual(@as(usize, 1), fake.shells);
     try std.testing.expectEqualStrings("retried", report.jobs[0].steps[0].stdout);
+    try std.testing.expect(!fake.saw_stale_retry_output);
 }
 
 pub const StepStatus = enum { success, failed, skipped };
@@ -882,6 +1071,74 @@ pub const ResumePoint = struct {
     step: []const u8,
 };
 
+const secret_marker_prefix = "__JALAN_SECRET[";
+
+fn secretMarker(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(alloc, secret_marker_prefix ++ "{s}]__", .{name});
+}
+
+/// Replace configured secret bytes with named placeholders before persisted
+/// metadata is serialized. Longest values are replaced first so overlapping
+/// secrets cannot leave a suffix behind.
+fn protectSecretValue(alloc: std.mem.Allocator, value: []const u8, secrets: []const ir.EnvPair) ![]const u8 {
+    const sorted = try alloc.dupe(ir.EnvPair, secrets);
+    std.mem.sort(ir.EnvPair, sorted, {}, struct {
+        fn longer(_: void, a: ir.EnvPair, b: ir.EnvPair) bool {
+            return a.value.len > b.value.len;
+        }
+    }.longer);
+    var out = try alloc.dupe(u8, value);
+    for (sorted) |secret| {
+        if (secret.value.len == 0 or std.mem.indexOf(u8, out, secret.value) == null) continue;
+        out = try std.mem.replaceOwned(u8, alloc, out, secret.value, try secretMarker(alloc, secret.name));
+    }
+    return out;
+}
+
+fn rehydrateSecretValue(alloc: std.mem.Allocator, value: []const u8, secrets: []const ir.EnvPair) ![]const u8 {
+    var out = try alloc.dupe(u8, value);
+    for (secrets) |secret| {
+        const marker = try secretMarker(alloc, secret.name);
+        if (std.mem.indexOf(u8, out, marker) != null)
+            out = try std.mem.replaceOwned(u8, alloc, out, marker, secret.value);
+    }
+    if (std.mem.indexOf(u8, out, secret_marker_prefix) != null) return error.MissingSecret;
+    return out;
+}
+
+fn protectPairs(alloc: std.mem.Allocator, pairs: []const ir.EnvPair, secrets: []const ir.EnvPair) ![]ir.EnvPair {
+    const out = try alloc.alloc(ir.EnvPair, pairs.len);
+    for (pairs, out) |pair, *dst| dst.* = .{ .name = pair.name, .value = try protectSecretValue(alloc, pair.value, secrets) };
+    return out;
+}
+
+fn rehydratePairs(alloc: std.mem.Allocator, pairs: []const ir.EnvPair, secrets: []const ir.EnvPair) ![]ir.EnvPair {
+    const out = try alloc.alloc(ir.EnvPair, pairs.len);
+    for (pairs, out) |pair, *dst| dst.* = .{ .name = pair.name, .value = try rehydrateSecretValue(alloc, pair.value, secrets) };
+    return out;
+}
+
+fn filterResumePairs(alloc: std.mem.Allocator, pairs: []const ir.EnvPair, job: ir.Job, target_index: usize) ![]ir.EnvPair {
+    var out: std.ArrayList(ir.EnvPair) = .empty;
+    pair_loop: for (pairs) |pair| {
+        // needs.* is rebuilt from the current graph's recorded prerequisite
+        // outputs below, never trusted from an older snapshot shape.
+        if (std.mem.startsWith(u8, pair.name, "needs.")) continue;
+        if (std.mem.startsWith(u8, pair.name, "steps.")) {
+            for (job.steps[0..target_index]) |prior| {
+                const prefix = try std.fmt.allocPrint(alloc, "steps.{s}.", .{prior.id});
+                if (std.mem.startsWith(u8, pair.name, prefix)) {
+                    try out.append(alloc, pair);
+                    continue :pair_loop;
+                }
+            }
+            continue;
+        }
+        try out.append(alloc, pair);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 /// Resolve a resume selector against the current job. Explicit ids win over
 /// decimal indexes so a step whose id is "0" remains addressable by id.
 fn resumeStepIndex(job: ir.Job, selector: []const u8) ?usize {
@@ -890,6 +1147,68 @@ fn resumeStepIndex(job: ir.Job, selector: []const u8) ?usize {
     }
     const index = std.fmt.parseUnsigned(usize, selector, 10) catch return null;
     return if (index < job.steps.len) index else null;
+}
+
+/// Matrix copies deliberately share the workflow job id. Persistence needs a
+/// stable per-copy selector so parallel copies cannot overwrite each other's
+/// snapshots or run-record entries.
+fn jobInstanceId(alloc: std.mem.Allocator, job: ir.Job) ![]const u8 {
+    if (job.matrix.len == 0) return job.id;
+    const matrix = try alloc.dupe(ir.EnvPair, job.matrix);
+    std.mem.sort(ir.EnvPair, matrix, {}, struct {
+        fn less(_: void, a: ir.EnvPair, b: ir.EnvPair) bool {
+            const by_name = std.mem.order(u8, a.name, b.name);
+            return if (by_name == .eq) std.mem.lessThan(u8, a.value, b.value) else by_name == .lt;
+        }
+    }.less);
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (matrix) |pair| {
+        hash.update(pair.name);
+        hash.update(&.{0});
+        hash.update(pair.value);
+        hash.update(&.{0});
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(alloc, "{s}-{s}", .{ job.id, &hex });
+}
+
+test "matrix job instance ids are stable unique persistence selectors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var first = [_]ir.EnvPair{ .{ .name = "os", .value = "linux" }, .{ .name = "node", .value = "20" } };
+    var reordered = [_]ir.EnvPair{ .{ .name = "node", .value = "20" }, .{ .name = "os", .value = "linux" } };
+    var second = [_]ir.EnvPair{ .{ .name = "os", .value = "windows" }, .{ .name = "node", .value = "20" } };
+    const j1 = ir.Job{ .id = "build", .display_name = "build (linux, 20)", .matrix = &first, .steps = &.{} };
+    const j1_reordered = ir.Job{ .id = "build", .display_name = "build (20, linux)", .matrix = &reordered, .steps = &.{} };
+    const j2 = ir.Job{ .id = "build", .display_name = "build (windows, 20)", .matrix = &second, .steps = &.{} };
+    try std.testing.expectEqualStrings(try jobInstanceId(a, j1), try jobInstanceId(a, j1_reordered));
+    try std.testing.expect(!std.mem.eql(u8, try jobInstanceId(a, j1), try jobInstanceId(a, j2)));
+    try std.testing.expectEqualStrings("plain", try jobInstanceId(a, .{ .id = "plain", .display_name = "plain", .steps = &.{} }));
+}
+
+test "resume rejects a run recorded by another backend" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = ".jalan/tmp/resume-backend-mismatch";
+    std.fs.cwd().deleteTree(root) catch {};
+    defer std.fs.cwd().deleteTree(root) catch {};
+    const rec = runrecord.RunRecord{
+        .run_id = "foreign-backend",
+        .workflow = "ci.yml",
+        .backend = "docker",
+        .started_unix = 1,
+    };
+    try runrecord.write(a, root, &rec);
+    var jobs = [_]ir.Job{.{ .id = "j", .display_name = "j", .steps = &.{} }};
+    const pipeline = ir.Pipeline{ .name = "x", .source_path = "ci.yml", .jobs = &jobs };
+    try std.testing.expectError(error.ResumeInvalid, run(a, pipeline, .{
+        .store_root = root,
+        .resume_from = .{ .run_id = "foreign-backend", .job_id = "j", .step = "0" },
+    }));
 }
 
 const Shared = struct {
@@ -907,9 +1226,12 @@ const Shared = struct {
     // Resume state: the target step's pre-step manifest (env + workspace
     // tree), loaded once in run() before any job starts.
     resume_manifest: ?snap_manifest.Manifest = null,
-    resume_job: []const u8 = "",
     // Only one worker may own stdin/the interactive prompt at a time.
     prompt_mutex: std.Thread.Mutex = .{},
+    // Snapshots/cache observe one shared checkout. Hold this across the
+    // complete step transaction so parallel jobs cannot contaminate another
+    // step's pre/post trees or persisted boundary.
+    workspace_mutex: std.Thread.Mutex = .{},
     non_tty_break_warned: bool = false,
     halt: std.atomic.Value(bool) = .init(false),
 };
@@ -927,9 +1249,12 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
     var mutex = std.Thread.Mutex{};
     var completed: usize = 0;
     const max_par = @max(eff_opts.max_parallel, 1);
+    if ((eff_opts.snapshot or eff_opts.cache) and max_par > 1) {
+        if (eff_opts.log) |l| l("warning: snapshots/cache serialize step execution because jobs share one workspace");
+    }
 
     // Phase 3: workspace walk root for snapshots and/or cache.
-    if (eff_opts.snapshot or eff_opts.cache or eff_opts.breakpoints.len > 0) {
+    if (eff_opts.snapshot or eff_opts.cache or eff_opts.breakpoints.len > 0 or eff_opts.workspace_abs != null) {
         shared.workspace_abs = eff_opts.workspace_abs orelse (std.fs.cwd().realpathAlloc(alloc, ".") catch ".");
     }
 
@@ -943,9 +1268,11 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
         // when an edited workflow forces us to rebuild the record skeleton.
         eff_opts.run_id = rp.run_id;
         const rec = runrecord.load(alloc, eff_opts.store_root, rp.run_id) catch return error.ResumeInvalid;
+        const current_backend = if (eff_opts.exec_backend) |b| @tagName(b.kind) else "native";
+        if (!std.mem.eql(u8, rec.backend, current_backend)) return error.ResumeInvalid;
         var target: ?usize = null;
         for (p.jobs, 0..) |j, i| {
-            if (std.mem.eql(u8, j.id, rp.job_id)) target = i;
+            if (std.mem.eql(u8, try jobInstanceId(alloc, j), rp.job_id)) target = i;
         }
         const tji = target orelse return error.ResumeInvalid;
         const tsi = resumeStepIndex(p.jobs[tji], rp.step) orelse return error.ResumeInvalid;
@@ -954,14 +1281,102 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
             if (std.mem.eql(u8, je.id, rp.job_id)) rec_job = je;
         }
         const rje = rec_job orelse return error.ResumeInvalid;
-        if (tsi >= rje.steps.len) return error.ResumeInvalid;
-        const snap_rel = rje.steps[tsi].snapshot;
+        const selector_is_id = for (p.jobs[tji].steps) |step| {
+            if (std.mem.eql(u8, step.id, rp.step)) break true;
+        } else false;
+        var recorded_si: ?usize = null;
+        if (selector_is_id) {
+            for (rje.steps, 0..) |step, i| if (std.mem.eql(u8, step.id, p.jobs[tji].steps[tsi].id)) {
+                recorded_si = i;
+                break;
+            };
+        } else if (tsi < rje.steps.len and std.mem.eql(u8, rje.steps[tsi].id, p.jobs[tji].steps[tsi].id)) {
+            // Numeric selectors are positional and therefore only safe when
+            // the recorded and current step at that index have the same id.
+            recorded_si = tsi;
+        }
+        const rsi = recorded_si orelse return error.ResumeInvalid;
+        const snap_rel = rje.steps[rsi].snapshot;
         if (snap_rel.len == 0) return error.ResumeInvalid;
-        const m = snap_manifest.load(alloc, eff_opts.store_root, snap_rel) catch return error.ResumeInvalid;
+        var m = snap_manifest.load(alloc, eff_opts.store_root, snap_rel) catch return error.ResumeInvalid;
+        if (!std.mem.eql(u8, m.run_id, rp.run_id) or
+            !std.mem.eql(u8, m.job_id, rp.job_id) or
+            !std.mem.eql(u8, m.step_id, rje.steps[rsi].id) or
+            m.step_index != rsi) return error.ResumeInvalid;
+        m.env = rehydratePairs(alloc, m.env, eff_opts.secrets) catch return error.ResumeInvalid;
+        m.env = try filterResumePairs(alloc, m.env, p.jobs[tji], tsi);
         try snap_restore.restore(alloc, eff_opts.store_root, shared.workspace_abs, m, eff_opts.log);
         shared.resume_manifest = m;
-        shared.resume_job = rp.job_id;
-        for (rec.job_outputs) |po| try shared.job_outputs.put(alloc, po.name, po.value);
+
+        // Rebuild target-job outputs that were produced strictly before the
+        // selected boundary from the snapshot's step environment. Outputs at
+        // or after the boundary are intentionally absent and must be emitted
+        // again by the rerun.
+        for (p.jobs[tji].steps[0..tsi]) |prior_step| {
+            const step_prefix = try std.fmt.allocPrint(alloc, "steps.{s}.outputs.", .{prior_step.id});
+            for (m.env) |pair| {
+                if (!std.mem.startsWith(u8, pair.name, step_prefix)) continue;
+                const job_key = try std.fmt.allocPrint(alloc, "{s}.outputs.{s}", .{ p.jobs[tji].id, pair.name[step_prefix.len..] });
+                try shared.job_outputs.put(alloc, job_key, pair.value);
+            }
+        }
+
+        // Execute only the target and its transitive dependents. Separately
+        // identify the target's transitive prerequisites so only outputs that
+        // existed before this boundary are seeded; target/later outputs are
+        // deliberately cleared to prevent values from the future leaking in.
+        const active = try alloc.alloc(bool, p.jobs.len);
+        const upstream = try alloc.alloc(bool, p.jobs.len);
+        @memset(active, false);
+        @memset(upstream, false);
+        active[tji] = true;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (p.jobs, 0..) |job, i| {
+                if (active[i]) continue;
+                for (job.needs) |need| {
+                    for (p.jobs, 0..) |dep, di| if (std.mem.eql(u8, dep.id, need) and active[di]) {
+                        active[i] = true;
+                        changed = true;
+                    };
+                }
+            }
+        }
+        upstream[tji] = true;
+        changed = true;
+        while (changed) {
+            changed = false;
+            for (p.jobs, 0..) |job, i| {
+                if (!upstream[i]) continue;
+                for (job.needs) |need| {
+                    for (p.jobs, 0..) |dep, di| if (std.mem.eql(u8, dep.id, need) and !upstream[di]) {
+                        upstream[di] = true;
+                        changed = true;
+                    };
+                }
+            }
+        }
+        upstream[tji] = false;
+        // An active dependent may also need a sibling branch that is not a
+        // prerequisite of the resume target itself. That branch stays
+        // skipped, so its recorded outputs must be seeded as well.
+        for (p.jobs, 0..) |job, i| {
+            if (!active[i]) continue;
+            for (job.needs) |need| {
+                for (p.jobs, 0..) |dep, di| {
+                    if (!active[di] and std.mem.eql(u8, dep.id, need)) upstream[di] = true;
+                }
+            }
+        }
+        for (rec.job_outputs) |po| {
+            for (p.jobs, 0..) |job, i| {
+                if (!upstream[i]) continue;
+                const prefix = try std.fmt.allocPrint(alloc, "{s}.outputs.", .{job.id});
+                if (std.mem.startsWith(u8, po.name, prefix))
+                    try shared.job_outputs.put(alloc, po.name, rehydrateSecretValue(alloc, po.value, eff_opts.secrets) catch return error.ResumeInvalid);
+            }
+        }
 
         // Reuse the loaded record as the live one only when its job/step
         // structure still aligns by index (script edits are fine; structural
@@ -969,7 +1384,7 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
         var aligned = rec.jobs.len == p.jobs.len;
         if (aligned) {
             for (rec.jobs, 0..) |je, i| {
-                if (!std.mem.eql(u8, je.id, p.jobs[i].id) or je.steps.len != p.jobs[i].steps.len) {
+                if (!std.mem.eql(u8, je.id, try jobInstanceId(alloc, p.jobs[i])) or je.steps.len != p.jobs[i].steps.len) {
                     aligned = false;
                     break;
                 }
@@ -987,10 +1402,10 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
             shared.record = &record;
         } else if (eff_opts.log) |l| l("warning: workflow changed since the recorded run — run record history resets");
 
-        // Jobs before the target stay skipped; the target and all later jobs
-        // run normally. Recorded outputs satisfy dependencies on skipped jobs.
+        // All non-participating jobs stay skipped. Recorded prerequisite
+        // outputs satisfy the target's dependencies.
         for (p.jobs, 0..) |j, i| {
-            if (i >= tji) continue;
+            if (active[i]) continue;
             results[i] = try skippedResult(alloc, j, i);
             done[i] = true;
             completed += 1;
@@ -1010,7 +1425,7 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
             for (p.jobs, 0..) |j, i| {
                 const step_entries = try alloc.alloc(runrecord.StepEntry, j.steps.len);
                 for (j.steps, 0..) |s, k| step_entries[k] = .{ .id = s.id };
-                jobs[i] = .{ .id = j.id, .steps = step_entries };
+                jobs[i] = .{ .id = try jobInstanceId(alloc, j), .steps = step_entries };
             }
             const kind = if (eff_opts.exec_backend) |b| @tagName(b.kind) else "native";
             record = .{
@@ -1125,7 +1540,10 @@ fn syncRecordAfterJob(sh: *Shared, opts: RunOptions, ji: usize, r: JobResult) vo
     // needs.* context without re-running completed jobs.
     var pairs: std.ArrayList(ir.EnvPair) = .empty;
     var it = sh.job_outputs.iterator();
-    while (it.next()) |e| pairs.append(sh.alloc, .{ .name = e.key_ptr.*, .value = e.value_ptr.* }) catch return;
+    while (it.next()) |e| pairs.append(sh.alloc, .{
+        .name = e.key_ptr.*,
+        .value = protectSecretValue(sh.alloc, e.value_ptr.*, opts.secrets) catch return,
+    }) catch return;
     rec.job_outputs = pairs.toOwnedSlice(sh.alloc) catch return;
     runrecord.write(sh.alloc, opts.store_root, rec) catch {
         if (opts.log) |l| l("warning: cannot write run record — snapshots disabled");
@@ -1136,19 +1554,20 @@ fn syncRecordAfterJob(sh: *Shared, opts: RunOptions, ji: usize, r: JobResult) vo
 /// Pre-step snapshot: workspace tree + serialized expr env at the step
 /// boundary. Failures degrade to a warning + snapshots off for the rest of
 /// the run (the store is an accelerator, never a hard dependency).
-fn captureStep(alloc: std.mem.Allocator, opts: RunOptions, sh: *Shared, job: ir.Job, ji: usize, step: ir.Step, si: usize, env: *expr.Env, alloc_mutex: *std.Thread.Mutex) void {
+fn captureStep(alloc: std.mem.Allocator, opts: RunOptions, sh: *Shared, job: ir.Job, ji: usize, step: ir.Step, si: usize, env: *expr.Env, alloc_mutex: *std.Thread.Mutex) ?snap_manifest.CaptureResult {
     sh.record_mutex.lock();
     const ok = sh.snapshot_ok;
     sh.record_mutex.unlock();
-    if (!ok) return;
+    if (!ok) return null;
     const rec = sh.record.?;
-    const pairs = expr.envToPairs(alloc, env) catch return;
-    const cap = snap_manifest.capture(alloc, opts.store_root, sh.workspace_abs, rec.run_id, job.id, @intCast(si), step.id, pairs) catch {
+    const raw_pairs = expr.envToPairs(alloc, env) catch return null;
+    const pairs = protectPairs(alloc, raw_pairs, opts.secrets) catch return null;
+    const cap = snap_manifest.capture(alloc, opts.store_root, sh.workspace_abs, rec.run_id, rec.jobs[ji].id, @intCast(si), step.id, pairs) catch {
         logJob(opts, alloc, job, "warning: snapshot capture failed — snapshots disabled for this run");
         sh.record_mutex.lock();
         sh.snapshot_ok = false;
         sh.record_mutex.unlock();
-        return;
+        return null;
     };
     // cap.rel_path belongs to this worker's short-lived arena. Copy it into
     // the caller arena before recording it so later jobs can safely rewrite
@@ -1160,12 +1579,13 @@ fn captureStep(alloc: std.mem.Allocator, opts: RunOptions, sh: *Shared, job: ir.
         sh.record_mutex.lock();
         sh.snapshot_ok = false;
         sh.record_mutex.unlock();
-        return;
+        return null;
     };
     alloc_mutex.unlock();
     sh.record_mutex.lock();
     rec.jobs[ji].steps[si].snapshot = rel_path;
     sh.record_mutex.unlock();
+    return cap;
 }
 
 const CacheBegin = struct {
@@ -1177,6 +1597,73 @@ const CacheBegin = struct {
     hit: ?cache.Entry = null,
 };
 
+fn rawPairsUseSecrets(pairs: []const ir.EnvPair) bool {
+    for (pairs) |pair| if (std.ascii.indexOfIgnoreCase(pair.value, "secrets.") != null) return true;
+    return false;
+}
+
+fn valueContainsConfiguredSecret(value: []const u8, secrets: []const ir.EnvPair) bool {
+    for (secrets) |secret| {
+        if (secret.value.len > 0 and std.mem.indexOf(u8, value, secret.value) != null) return true;
+    }
+    return false;
+}
+
+fn interpolatedInputsContainSecret(step: ir.Step, env: []const ir.EnvPair, secrets: []const ir.EnvPair) bool {
+    if (valueContainsConfiguredSecret(step.script, secrets) or valueContainsConfiguredSecret(step.uses_ref, secrets)) return true;
+    if (step.shell) |value| if (valueContainsConfiguredSecret(value, secrets)) return true;
+    if (step.workdir) |value| if (valueContainsConfiguredSecret(value, secrets)) return true;
+    for (step.with) |pair| if (valueContainsConfiguredSecret(pair.value, secrets)) return true;
+    for (step.env) |pair| if (valueContainsConfiguredSecret(pair.value, secrets)) return true;
+    for (env) |pair| if (valueContainsConfiguredSecret(pair.value, secrets)) return true;
+    return false;
+}
+
+fn resolvedUsesIdentity(alloc: std.mem.Allocator, opts: RunOptions, step: ir.Step) ?[]const u8 {
+    const ref = action_resolve.parseRef(step.uses_ref) catch return null;
+    return switch (ref) {
+        .github => |gh| blk: {
+            var err_msg: ?[]const u8 = null;
+            const dir = action_resolve.fetch(alloc, gh, opts.force_pull, opts.log, &err_msg) catch {
+                if (opts.log) |log| log(err_msg orelse "warning: action ref resolution failed — cache disabled for this step");
+                break :blk null;
+            };
+            const files = snap_manifest.scanTree(alloc, opts.store_root, dir, false) catch break :blk null;
+            const tree = snap_manifest.treeHash(alloc, files) catch break :blk null;
+            break :blk std.fmt.allocPrint(alloc, "{s}#tree={s}", .{ step.uses_ref, tree }) catch null;
+        },
+        .local, .docker_image => step.uses_ref,
+    };
+}
+
+fn nixSetupSideEffect(kind: backend_mod.Kind, uses_ref: []const u8) bool {
+    if (kind != .nix) return false;
+    const at = std.mem.indexOfScalar(u8, uses_ref, '@') orelse uses_ref.len;
+    const name = uses_ref[0..at];
+    return std.mem.eql(u8, name, "actions/setup-node") or
+        std.mem.eql(u8, name, "actions/setup-python") or
+        std.mem.eql(u8, name, "actions/setup-go");
+}
+
+fn gitWorkspaceIdentity(alloc: std.mem.Allocator, workspace: []const u8) ![]const u8 {
+    const head_path = try std.fmt.allocPrint(alloc, "{s}/.git/HEAD", .{workspace});
+    const head = std.fs.cwd().readFileAlloc(alloc, head_path, 1024 * 1024) catch return "no-git";
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(head);
+    const trimmed = std.mem.trim(u8, head, " \r\n");
+    if (std.mem.startsWith(u8, trimmed, "ref: ")) {
+        const ref = trimmed["ref: ".len..];
+        if (safe_path.isSafeRelative(ref)) {
+            const ref_path = try std.fmt.allocPrint(alloc, "{s}/.git/{s}", .{ workspace, ref });
+            if (std.fs.cwd().readFileAlloc(alloc, ref_path, 1024 * 1024)) |contents| hash.update(contents) else |_| {}
+        }
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return alloc.dupe(u8, &hex);
+}
+
 /// Compute the step's cache key and look it up. On hit, materializes the
 /// recorded file writes into the workspace (a blob failure demotes the hit
 /// to a miss-with-warning and re-executes). `raw_step` is the
@@ -1186,19 +1673,25 @@ fn cacheBegin(
     alloc: std.mem.Allocator,
     opts: RunOptions,
     job: ir.Job,
-    kind: []const u8,
+    exec_backend: backend_mod.Backend,
+    handle: *backend_mod.JobHandle,
     raw_step: ir.Step,
     key_step: ir.Step,
     eff_env: []const ir.EnvPair,
     workspace: []const u8,
+    snapshot: ?snap_manifest.CaptureResult,
+    eligible: bool,
 ) CacheBegin {
-    if (!opts.cache or cache.usesSecrets(raw_step)) return .{};
-    const pre = snap_manifest.scanTree(alloc, opts.store_root, workspace, false) catch {
+    if (!opts.cache or !eligible or cache.usesSecrets(raw_step) or rawPairsUseSecrets(job.env) or
+        interpolatedInputsContainSecret(key_step, eff_env, opts.secrets)) return .{};
+    const pre = if (snapshot) |cap| cap.m.files else snap_manifest.scanTree(alloc, opts.store_root, workspace, false) catch {
         logLine(opts, alloc, job, key_step, "warning: workspace scan failed — cache disabled for this step");
         return .{};
     };
-    const pre_hash = snap_manifest.treeHash(alloc, pre) catch return .{};
-    const hex = cache.inputHash(alloc, kind, job.container_image, key_step, eff_env, pre_hash) catch return .{};
+    const pre_hash = if (snapshot) |cap| cap.m.tree_hash else snap_manifest.treeHash(alloc, pre) catch return .{};
+    const backend_identity = exec_backend.cacheIdentity(alloc, job, handle, key_step) catch return .{};
+    const execution_identity = std.fmt.allocPrint(alloc, "{s};git:{s}", .{ backend_identity, gitWorkspaceIdentity(alloc, workspace) catch "unknown" }) catch return .{};
+    const hex = cache.inputHash(alloc, @tagName(exec_backend.kind), execution_identity, key_step, eff_env, pre_hash) catch return .{};
     const entry = (cache.readEntry(alloc, opts.store_root, hex) catch null) orelse
         return .{ .hex = hex, .pre = pre };
     materializeEntry(alloc, opts.store_root, workspace, entry) catch {
@@ -1209,15 +1702,52 @@ fn cacheBegin(
 }
 
 fn materializeEntry(alloc: std.mem.Allocator, root: []const u8, workspace: []const u8, entry: cache.Entry) !void {
+    // Windows symlink privilege/fallback behavior is not transactional. Treat
+    // such entries as a miss before changing any regular file.
+    if (@import("builtin").os.tag == .windows)
+        for (entry.wrote) |w| if (w.link_target != null) return error.UnsupportedSymlink;
+    for (entry.wrote) |w| if (!w.is_dir and w.link_target == null) try snap_store.verifyBlob(alloc, root, w.blob);
     for (entry.wrote) |w| {
-        const data = snap_store.readBlob(alloc, root, w.blob) catch return error.BlobMissing;
-        const abs = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ workspace, w.path });
-        if (std.fs.path.dirname(abs)) |d| std.fs.cwd().makePath(d) catch return error.StoreIo;
-        std.fs.cwd().writeFile(.{ .sub_path = abs, .data = data }) catch return error.StoreIo;
+        if (!w.is_dir) continue;
+        var parent = try safe_path.openParent(workspace, w.path, true);
+        defer parent.close();
+        parent.dir.makeDir(parent.basename) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                parent.dir.deleteFile(parent.basename) catch {};
+                try parent.dir.makeDir(parent.basename);
+            },
+        };
+        if (@import("builtin").os.tag != .windows) {
+            var dir = try parent.dir.openDir(parent.basename, .{});
+            defer dir.close();
+            dir.chmod(@intCast(w.mode)) catch {};
+        }
     }
-    for (entry.deleted) |d| {
-        const abs = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ workspace, d });
-        std.fs.cwd().deleteFile(abs) catch {};
+    for (entry.wrote) |w| {
+        if (w.is_dir or w.link_target != null) continue;
+        var parent = try safe_path.openParent(workspace, w.path, true);
+        defer parent.close();
+        parent.dir.deleteTree(parent.basename) catch {};
+        try snap_store.copyBlobToFile(alloc, root, w.blob, parent.dir, parent.basename);
+        if (@import("builtin").os.tag != .windows) {
+            if (parent.dir.openFile(parent.basename, .{ .mode = .read_write })) |file| {
+                defer file.close();
+                file.chmod(@intCast(w.mode)) catch {};
+            } else |_| {}
+        }
+    }
+    for (entry.wrote) |w| {
+        if (w.link_target) |target| try snap_restore.restoreSymlink(alloc, workspace, w.path, target, null);
+    }
+    const deleted = try alloc.dupe([]const u8, entry.deleted);
+    std.mem.sort([]const u8, deleted, {}, struct {
+        fn deeper(_: void, a: []const u8, b: []const u8) bool {
+            return a.len > b.len;
+        }
+    }.deeper);
+    for (deleted) |d| {
+        safe_path.deleteFile(workspace, d) catch safe_path.deleteTree(workspace, d) catch {};
     }
 }
 
@@ -1230,23 +1760,34 @@ fn cacheCommit(
     workspace: []const u8,
     hex: []const u8,
     pre: []snap_manifest.FileEntry,
-    ok: bool,
     outcome: backend_mod.StepOutcome,
 ) void {
-    if (!ok) return;
     const post = snap_manifest.scanTree(alloc, opts.store_root, workspace, false) catch return;
-    var pre_map: std.StringHashMapUnmanaged([]const u8) = .empty;
-    for (pre) |f| pre_map.put(alloc, f.path, f.blob) catch return;
+    var pre_map: std.StringHashMapUnmanaged(snap_manifest.FileEntry) = .empty;
+    for (pre) |f| pre_map.put(alloc, f.path, f) catch return;
     var post_paths: std.StringHashMapUnmanaged(void) = .empty;
     var wrote: std.ArrayList(cache.WroteFile) = .empty;
     for (post) |f| {
-        if (f.link_target != null) continue;
         post_paths.put(alloc, f.path, {}) catch return;
         const prev = pre_map.get(f.path);
-        if (prev != null and std.mem.eql(u8, prev.?, f.blob)) continue;
+        if (prev) |old| {
+            const same_link = if (old.link_target) |old_target|
+                if (f.link_target) |new_target| std.mem.eql(u8, old_target, new_target) else false
+            else
+                f.link_target == null;
+            if (same_link and old.is_dir == f.is_dir and std.mem.eql(u8, old.blob, f.blob) and old.mode == f.mode) continue;
+        }
+        if (f.is_dir) {
+            wrote.append(alloc, .{ .path = f.path, .mode = f.mode, .is_dir = true }) catch return;
+            continue;
+        }
+        if (f.link_target) |target| {
+            wrote.append(alloc, .{ .path = f.path, .mode = f.mode, .link_target = target }) catch return;
+            continue;
+        }
         const abs = std.fmt.allocPrint(alloc, "{s}/{s}", .{ workspace, f.path }) catch return;
         const c = snap_store.copyFileToBlob(alloc, opts.store_root, abs) catch return;
-        wrote.append(alloc, .{ .path = f.path, .blob = c.hex }) catch return;
+        wrote.append(alloc, .{ .path = f.path, .blob = c.hex, .mode = f.mode }) catch return;
     }
     var deleted: std.ArrayList([]const u8) = .empty;
     for (pre) |f| {
@@ -1323,7 +1864,7 @@ fn hasBreakpoint(opts: RunOptions, job: ir.Job, step: ir.Step, index: usize) boo
 
 fn isSecretValue(opts: RunOptions, value: []const u8) bool {
     for (opts.secrets) |secret| {
-        if (secret.value.len > 0 and std.mem.eql(u8, value, secret.value)) return true;
+        if (secret.value.len > 0 and std.mem.indexOf(u8, value, secret.value) != null) return true;
     }
     return false;
 }
@@ -1492,7 +2033,10 @@ fn runJob(
 
     // Build base expression environment for this job.
     var env = expr.Env{};
-    const cwd = std.fs.cwd().realpathAlloc(alloc, ".") catch ".";
+    const cwd = if (shared.workspace_abs.len > 0)
+        shared.workspace_abs
+    else
+        (std.fs.cwd().realpathAlloc(alloc, ".") catch ".");
     var merged_env: std.ArrayList(ir.EnvPair) = .empty;
     if (resume_m) |m| {
         env = try expr.envFromPairs(alloc, m.env);
@@ -1580,6 +2124,10 @@ fn runJob(
             continue;
         }
 
+        const lock_workspace = opts.snapshot or opts.cache;
+        if (lock_workspace) shared.workspace_mutex.lock();
+        defer if (lock_workspace) shared.workspace_mutex.unlock();
+
         if (hasBreakpoint(opts, job, step, si)) switch (handleBreakpoint(alloc, opts, shared, job, step, &env, b, &handle, merged_env.items)) {
             .continue_ => {},
             .skip => continue,
@@ -1591,7 +2139,10 @@ fn runJob(
             },
         };
 
-        if (opts.snapshot) captureStep(alloc, opts, shared, job, index, step, si, &env, mutex);
+        const snapshot_cap = if (opts.snapshot)
+            captureStep(alloc, opts, shared, job, index, step, si, &env, mutex)
+        else
+            null;
 
         if (step.kind == .uses) {
             // Interpolate each `with:` value against the step's expr Env — same
@@ -1629,7 +2180,21 @@ fn runJob(
             }
             var key_step = step;
             key_step.with = with_list.items;
-            const cb = cacheBegin(alloc, opts, job, @tagName(b.kind), step, key_step, step_env.items, shared.workspace_abs);
+            const uses_identity = if (opts.cache) resolvedUsesIdentity(alloc, opts, key_step) else key_step.uses_ref;
+            if (uses_identity) |identity| key_step.uses_ref = identity;
+            const cb = cacheBegin(
+                alloc,
+                opts,
+                job,
+                b,
+                &handle,
+                step,
+                key_step,
+                step_env.items,
+                shared.workspace_abs,
+                snapshot_cap,
+                uses_identity != null and !nixSetupSideEffect(b.kind, step.uses_ref),
+            );
             if (cb.hit) |entry| {
                 const cached_outcome = backend_mod.StepOutcome{ .exit_code = entry.exit_code, .stdout = entry.stdout, .stderr = entry.stderr, .outputs = entry.outputs };
                 const cok = try applyStepOutcome(alloc, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
@@ -1658,10 +2223,13 @@ fn runJob(
                 };
                 const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
                 if (ok) {
-                    if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, true, outcome);
+                    if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, outcome);
                     break :uses_attempt;
                 }
-                if (step.continue_on_error) break :uses_attempt;
+                if (step.continue_on_error) {
+                    try publishStepOutputs(alloc, step, outcome.outputs, job, shared, mutex, &env);
+                    break :uses_attempt;
+                }
                 const action = if (attempt == 0 or opts.on_failure == .stop)
                     handleStepFailure(alloc, opts, shared, b, &handle, job, step, null, step_env.items)
                 else
@@ -1670,6 +2238,7 @@ fn runJob(
                     attempt += 1;
                     continue :uses_attempt;
                 }
+                try publishStepOutputs(alloc, step, outcome.outputs, job, shared, mutex, &env);
                 job_status = .failed;
                 break :uses_attempt;
             }
@@ -1712,7 +2281,7 @@ fn runJob(
             continue;
         } else null;
 
-        const cb = cacheBegin(alloc, opts, job, @tagName(b.kind), step, patched, spawn_env.items, shared.workspace_abs);
+        const cb = cacheBegin(alloc, opts, job, b, &handle, step, patched, spawn_env.items, shared.workspace_abs, snapshot_cap, true);
         if (cb.hit) |entry| {
             const cached_outcome = backend_mod.StepOutcome{ .exit_code = entry.exit_code, .stdout = entry.stdout, .stderr = entry.stderr, .outputs = entry.outputs };
             const cok = try applyStepOutcome(alloc, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
@@ -1742,10 +2311,13 @@ fn runJob(
             };
             const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
             if (ok) {
-                if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, true, outcome);
+                if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, outcome);
                 break :run_attempt;
             }
-            if (step.continue_on_error) break :run_attempt;
+            if (step.continue_on_error) {
+                try publishStepOutputs(alloc, step, outcome.outputs, job, shared, mutex, &env);
+                break :run_attempt;
+            }
             const action = if (attempt == 0 or opts.on_failure == .stop)
                 handleStepFailure(alloc, opts, shared, b, &handle, job, step, workdir, spawn_env.items)
             else
@@ -1754,6 +2326,7 @@ fn runJob(
                 attempt += 1;
                 continue :run_attempt;
             }
+            try publishStepOutputs(alloc, step, outcome.outputs, job, shared, mutex, &env);
             job_status = .failed;
             break :run_attempt;
         }
@@ -1789,7 +2362,20 @@ fn applyStepOutcome(
         .stdout = outcome.stdout,
         .stderr = outcome.stderr,
     };
-    for (outcome.outputs) |o| {
+    if (ok) try publishStepOutputs(alloc, step, outcome.outputs, job, shared, mutex, env);
+    return ok;
+}
+
+fn publishStepOutputs(
+    alloc: std.mem.Allocator,
+    step: ir.Step,
+    outputs: []const ir.EnvPair,
+    job: ir.Job,
+    shared: *Shared,
+    mutex: *std.Thread.Mutex,
+    env: *expr.Env,
+) !void {
+    for (outputs) |o| {
         try env.put(alloc, try std.fmt.allocPrint(alloc, "steps.{s}.outputs.{s}", .{ step.id, o.name }), o.value);
         const jk = try std.fmt.allocPrint(alloc, "{s}.outputs.{s}", .{ job.id, o.name });
         // Values put INTO the shared map must be duped with shared.alloc (caller
@@ -1801,7 +2387,6 @@ fn applyStepOutcome(
         const val_dup = try shared.alloc.dupe(u8, o.value);
         try shared.job_outputs.put(shared.alloc, jk_dup, val_dup);
     }
-    return ok;
 }
 
 fn key2(alloc: std.mem.Allocator, root: []const u8, name: []const u8) ![]const u8 {
