@@ -563,6 +563,14 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         .exec_backend = picked.b,
         .force_pull = ra.pull,
     }) catch |e| switch (e) {
+        error.ResumeInvalid => {
+            _ = try print("error: invalid resume target\n");
+            return 2;
+        },
+        error.RestoreFailed, error.StoreIo => {
+            _ = try print("error: failed to restore resume snapshot\n");
+            return 3;
+        },
         error.InternalError => {
             _ = try print("internal error: engine failed\n");
             return 3;
