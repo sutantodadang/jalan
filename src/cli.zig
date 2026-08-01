@@ -10,6 +10,8 @@ const backend = @import("backend.zig");
 const docker_backend = @import("backend/docker.zig");
 const nix_backend = @import("backend/nix.zig");
 const client = @import("docker/client.zig");
+const runrecord = @import("snap/runrecord.zig");
+const debug_mod = @import("debug.zig");
 
 pub const Provider = enum { gha, unknown };
 
@@ -128,6 +130,12 @@ pub const RunArgs = struct {
     secret_file: ?[]const u8 = null,
     backend: []const u8 = "auto",
     pull: bool = false,
+    snapshot: ?bool = null,
+    cache: ?bool = null,
+    breaks: []const []const u8 = &.{},
+    on_failure: []const u8 = "continue",
+    resume_run: ?[]const u8 = null,
+    resume_at: ?[]const u8 = null,
 };
 
 test "parse run args" {
@@ -186,6 +194,42 @@ test "parseRunArgs rejects --backend with no value" {
     try std.testing.expectError(error.BadArgs, parseRunArgs(arena.allocator(), &[_][]const u8{"--backend"}));
 }
 
+test "parseRunArgs accepts phase 3 flags and repeated breakpoints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const args = [_][]const u8{
+        "wf.yml",       "--snapshot", "--cache",  "--break", "build/compile", "--break",       "test/0",
+        "--on-failure", "stop",       "--resume", "run-1",   "--at",          "build/compile",
+    };
+    const parsed = try parseRunArgs(arena.allocator(), &args);
+    try std.testing.expectEqual(true, parsed.snapshot.?);
+    try std.testing.expectEqual(true, parsed.cache.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.breaks.len);
+    try std.testing.expectEqualStrings("stop", parsed.on_failure);
+    try std.testing.expectEqualStrings("run-1", parsed.resume_run.?);
+    try std.testing.expectEqualStrings("build/compile", parsed.resume_at.?);
+}
+
+test "parseRunArgs validates phase 3 flag pairs and values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.BadArgs, parseRunArgs(a, &.{ "--resume", "r" }));
+    try std.testing.expectError(error.BadArgs, parseRunArgs(a, &.{ "--at", "j/s" }));
+    try std.testing.expectError(error.BadArgs, parseRunArgs(a, &.{ "--break", "missing-slash" }));
+    try std.testing.expectError(error.BadArgs, parseRunArgs(a, &.{ "--on-failure", "explode" }));
+    const toggles = try parseRunArgs(a, &.{ "--snapshot", "--no-snapshot", "--cache", "--no-cache" });
+    try std.testing.expectEqual(false, toggles.snapshot.?);
+    try std.testing.expectEqual(false, toggles.cache.?);
+}
+
+test "resolveToggle applies CLI over config over defaults" {
+    try std.testing.expect(resolveToggle(null, true));
+    try std.testing.expect(!resolveToggle(null, false));
+    try std.testing.expect(!resolveToggle(false, true));
+    try std.testing.expect(resolveToggle(true, false));
+}
+
 test "resolveBackendChoice: explicit CLI non-auto beats config beats auto" {
     // 1. explicit CLI wins even when config also has an explicit value.
     try std.testing.expectEqualStrings("docker", resolveBackendChoice("docker", "nix"));
@@ -229,6 +273,7 @@ pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs
     var r = RunArgs{};
     var env: std.ArrayList(ir.EnvPair) = .empty;
     var matrix: std.ArrayList(ir.EnvPair) = .empty;
+    var breaks: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -269,6 +314,30 @@ pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs
             r.backend = args[i];
         } else if (std.mem.eql(u8, arg, "--pull")) {
             r.pull = true;
+        } else if (std.mem.eql(u8, arg, "--snapshot")) {
+            r.snapshot = true;
+        } else if (std.mem.eql(u8, arg, "--no-snapshot")) {
+            r.snapshot = false;
+        } else if (std.mem.eql(u8, arg, "--cache")) {
+            r.cache = true;
+        } else if (std.mem.eql(u8, arg, "--no-cache")) {
+            r.cache = false;
+        } else if (std.mem.eql(u8, arg, "--break")) {
+            i += 1;
+            if (i >= args.len or splitSelector(args[i]) == null) return error.BadArgs;
+            try breaks.append(alloc, args[i]);
+        } else if (std.mem.eql(u8, arg, "--on-failure")) {
+            i += 1;
+            if (i >= args.len or !isValidOnFailure(args[i])) return error.BadArgs;
+            r.on_failure = args[i];
+        } else if (std.mem.eql(u8, arg, "--resume")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            r.resume_run = args[i];
+        } else if (std.mem.eql(u8, arg, "--at")) {
+            i += 1;
+            if (i >= args.len or splitSelector(args[i]) == null) return error.BadArgs;
+            r.resume_at = args[i];
         } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
             // Any other `-`/`--`-prefixed token (single-dash unknowns included,
             // e.g. `-x`) is an unrecognized flag, not a positional file path.
@@ -279,7 +348,23 @@ pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs
     }
     r.env = try env.toOwnedSlice(alloc);
     r.matrix = try matrix.toOwnedSlice(alloc);
+    r.breaks = try breaks.toOwnedSlice(alloc);
+    if ((r.resume_run == null) != (r.resume_at == null)) return error.BadArgs;
     return r;
+}
+
+fn isValidOnFailure(value: []const u8) bool {
+    return std.mem.eql(u8, value, "continue") or std.mem.eql(u8, value, "stop") or std.mem.eql(u8, value, "shell");
+}
+
+fn splitSelector(value: []const u8) ?struct { job: []const u8, step: []const u8 } {
+    const slash = std.mem.indexOfScalar(u8, value, '/') orelse return null;
+    if (slash == 0 or slash + 1 >= value.len or std.mem.indexOfScalar(u8, value[slash + 1 ..], '/') != null) return null;
+    return .{ .job = value[0..slash], .step = value[slash + 1 ..] };
+}
+
+pub fn resolveToggle(cli_value: ?bool, config_value: bool) bool {
+    return cli_value orelse config_value;
 }
 
 const backend_names = [_][]const u8{ "native", "docker", "podman", "nix", "auto" };
@@ -427,11 +512,69 @@ pub fn parseSecretsText(alloc: std.mem.Allocator, text: []const u8) ![]ir.EnvPai
     return out.toOwnedSlice(alloc);
 }
 
+const RunsArgs = struct { json: bool = false };
+
+fn parseRunsArgs(args: []const []const u8) error{BadArgs}!RunsArgs {
+    var result = RunsArgs{};
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json") and !result.json) {
+            result.json = true;
+        } else return error.BadArgs;
+    }
+    return result;
+}
+
+pub fn formatRuns(alloc: std.mem.Allocator, records: []const runrecord.RunRecord, json: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    if (json) {
+        try out.append(alloc, '[');
+        for (records, 0..) |record, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, try runrecord.toJson(alloc, record));
+        }
+        try out.appendSlice(alloc, "]\n");
+        return out.toOwnedSlice(alloc);
+    }
+    if (records.len == 0) {
+        try out.appendSlice(alloc, "no recorded runs\n");
+        return out.toOwnedSlice(alloc);
+    }
+    try out.appendSlice(alloc, "RUN ID\tSTARTED\tBACKEND\tWORKFLOW\tJOBS\n");
+    for (records) |record| {
+        var statuses: std.ArrayList([]const u8) = .empty;
+        for (record.jobs) |job|
+            try statuses.append(alloc, try std.fmt.allocPrint(alloc, "{s}={s}", .{ job.id, job.status }));
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s}\t{d}\t{s}\t{s}\t{s}\n", .{
+            record.run_id,
+            record.started_unix,
+            record.backend,
+            record.workflow,
+            try std.mem.join(alloc, ",", statuses.items),
+        }));
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn runsMain(alloc: std.mem.Allocator, args: RunsArgs) !u8 {
+    const records = runrecord.list(alloc, ".jalan/store") catch {
+        _ = try print("error: cannot read run store\n");
+        return 3;
+    };
+    return print(try formatRuns(alloc, records, args.json));
+}
+
 pub fn main(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
     if (args.len == 0) return help();
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help")) return help();
     if (std.mem.eql(u8, cmd, "version")) return print("jalan 0.1.0\n");
+    if (std.mem.eql(u8, cmd, "runs")) {
+        const runs_args = parseRunsArgs(args[1..]) catch {
+            _ = try print("error: bad arguments (see 'jalan help')\n");
+            return 2;
+        };
+        return runsMain(alloc, runs_args);
+    }
     if (std.mem.eql(u8, cmd, "lint")) {
         const la = parseLintArgs(args[1..]) catch {
             _ = try print("error: bad arguments (see 'jalan help')\n");
@@ -482,6 +625,10 @@ fn help() !u8 {
         \\  jalan run [file] [-j <job>] [--step <id>] [--dry-run] [--env K=V]...
         \\            [--secret-file <path>] [--matrix k=v]... [--max-parallel N]
         \\            [--strict] [--no-color] [--backend <name>] [--pull]
+        \\            [--snapshot|--no-snapshot] [--cache|--no-cache]
+        \\            [--break <job/step>]... [--on-failure shell|stop|continue]
+        \\            [--resume <run-id> --at <job/step>]
+        \\  jalan runs [--json]
         \\  jalan version
         \\  jalan help
         \\
@@ -499,8 +646,36 @@ fn colorsEnabled(alloc: std.mem.Allocator, ra: RunArgs) bool {
     return !has;
 }
 
+fn onFailureMode(value: []const u8) engine.OnFailure {
+    if (std.mem.eql(u8, value, "stop")) return .stop;
+    if (std.mem.eql(u8, value, "shell")) return .shell;
+    return .continue_;
+}
+
+fn printResumeInvalid(alloc: std.mem.Allocator, run_id: []const u8) !void {
+    _ = try print(try std.fmt.allocPrint(alloc, "error: invalid resume target for run '{s}'\n", .{run_id}));
+    const record = runrecord.load(alloc, ".jalan/store", run_id) catch return;
+    _ = try print("valid targets:\n");
+    for (record.jobs) |job| {
+        for (job.steps) |step| {
+            if (step.snapshot.len == 0) continue;
+            _ = try print(try std.fmt.allocPrint(alloc, "  {s}/{s}\n", .{ job.id, step.id }));
+        }
+    }
+}
+
 pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
-    const path = ra.file orelse (try findDefaultWorkflow(alloc)) orelse {
+    var recorded_workflow: ?[]const u8 = null;
+    if (ra.file == null) {
+        if (ra.resume_run) |run_id| {
+            const record = runrecord.load(alloc, ".jalan/store", run_id) catch {
+                try printResumeInvalid(alloc, run_id);
+                return 2;
+            };
+            recorded_workflow = record.workflow;
+        }
+    }
+    const path = ra.file orelse recorded_workflow orelse (try findDefaultWorkflow(alloc)) orelse {
         _ = try print("error: no workflow found in .github/workflows\n");
         return 2;
     };
@@ -530,12 +705,32 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
     if (ra.strict and diags.list.items.len > 0) return 2;
 
     const cfg = try config.load(alloc);
+    const snapshot = resolveToggle(ra.snapshot, cfg.snapshot);
+    const cache_enabled = resolveToggle(ra.cache, cfg.cache);
     const backend_choice = resolveBackendChoice(ra.backend, cfg.backend);
     const picked = pickBackend(alloc, backend_choice, cfg, &logToStderr) catch |e| switch (e) {
         error.BackendUnavailable => return 3, // message already printed by pickBackend
         else => return e,
     };
     _ = try print(try std.fmt.allocPrint(alloc, "backend: {s}\n", .{picked.desc}));
+
+    var breakpoints: std.ArrayList(debug_mod.Breakpoint) = .empty;
+    for (ra.breaks) |raw| {
+        const selector = splitSelector(raw).?;
+        try breakpoints.append(alloc, .{ .job_id = selector.job, .step = selector.step });
+    }
+    const resume_point: ?engine.ResumePoint = if (ra.resume_run) |run_id| blk: {
+        const selector = splitSelector(ra.resume_at.?).?;
+        break :blk .{ .run_id = run_id, .job_id = selector.job, .step = selector.step };
+    } else null;
+    const workspace_abs = std.fs.cwd().realpathAlloc(alloc, ".") catch {
+        _ = try print("error: cannot resolve workspace path\n");
+        return 3;
+    };
+    if (snapshot and picked.b.kind == .docker)
+        logToStderr("warning: snapshots capture only the bind-mounted workspace; container state outside it is not preserved");
+    if (resume_point != null and picked.b.kind == .docker)
+        logToStderr("warning: docker resume creates a fresh container; state outside the workspace is lost");
 
     var secrets: []ir.EnvPair = &.{};
     if (ra.secret_file) |sf| {
@@ -562,7 +757,22 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         .log = &logToStderr,
         .exec_backend = picked.b,
         .force_pull = ra.pull,
+        .snapshot = snapshot,
+        .cache = cache_enabled,
+        .workspace_abs = workspace_abs,
+        .breakpoints = breakpoints.items,
+        .on_failure = onFailureMode(ra.on_failure),
+        .resume_from = resume_point,
+        .prompt_fn = if (debug_mod.isTty()) debug_mod.promptOnce else null,
     }) catch |e| switch (e) {
+        error.ResumeInvalid => {
+            if (ra.resume_run) |run_id| try printResumeInvalid(alloc, run_id) else _ = try print("error: invalid resume target\n");
+            return 2;
+        },
+        error.RestoreFailed, error.StoreIo => {
+            _ = try print("error: failed to restore resume snapshot\n");
+            return 3;
+        },
         error.InternalError => {
             _ = try print("internal error: engine failed\n");
             return 3;
@@ -701,6 +911,35 @@ test "parseLintArgs accepts --backend, validates the name, defaults to auto" {
     try std.testing.expectEqualStrings("auto", (try parseLintArgs(&[_][]const u8{"wf.yml"})).backend);
     try std.testing.expectError(error.BadArgs, parseLintArgs(&[_][]const u8{ "--backend", "bogus" }));
     try std.testing.expectError(error.BadArgs, parseLintArgs(&[_][]const u8{"--backend"}));
+}
+
+test "runs formatting emits table and JSON; empty store is friendly" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var steps = [_]runrecord.StepEntry{.{ .id = "compile", .status = "success" }};
+    var jobs = [_]runrecord.JobEntry{.{ .id = "build", .status = "success", .steps = &steps }};
+    const records = [_]runrecord.RunRecord{.{
+        .run_id = "1234-abcd1234",
+        .workflow = ".github/workflows/ci.yml",
+        .backend = "native",
+        .started_unix = 1234,
+        .jobs = &jobs,
+    }};
+    const table = try formatRuns(a, &records, false);
+    try std.testing.expect(std.mem.indexOf(u8, table, "RUN ID\tSTARTED\tBACKEND") != null);
+    try std.testing.expect(std.mem.indexOf(u8, table, "build=success") != null);
+    const json = try formatRuns(a, &records, true);
+    try std.testing.expect(std.mem.startsWith(u8, json, "[{\"run_id\":\"1234-abcd1234\""));
+    try std.testing.expectEqualStrings("no recorded runs\n", try formatRuns(a, &.{}, false));
+    try std.testing.expectEqualStrings("[]\n", try formatRuns(a, &.{}, true));
+}
+
+test "parseRunsArgs accepts only one optional --json" {
+    try std.testing.expect(!(try parseRunsArgs(&.{})).json);
+    try std.testing.expect((try parseRunsArgs(&.{"--json"})).json);
+    try std.testing.expectError(error.BadArgs, parseRunsArgs(&.{"--bogus"}));
+    try std.testing.expectError(error.BadArgs, parseRunsArgs(&.{ "--json", "--json" }));
 }
 
 test "detect provider by path and content" {

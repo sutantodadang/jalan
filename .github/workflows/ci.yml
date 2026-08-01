@@ -24,6 +24,9 @@ jobs:
       - name: docker backend integration
         run: ./zig-out/bin/jalan run --backend docker testdata/workflows/docker.yml
         if: runner.os == 'Linux'
+      - name: phase 3 docker parity
+        run: zig test src/root.zig --test-filter "phase 3 docker"
+        if: runner.os == 'Linux'
       - name: install nix
         uses: cachix/install-nix-action@v27
         if: runner.os == 'Linux'

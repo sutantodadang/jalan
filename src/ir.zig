@@ -107,6 +107,7 @@ pub fn toJson(alloc: std.mem.Allocator, p: Pipeline) ![]u8 {
             try w.kv(&out, alloc, "script", s.script, true);
             try w.kv(&out, alloc, "shell", s.shell orelse "", true);
             try w.kv(&out, alloc, "if", s.cond orelse "", true);
+            if (s.input_hash) |hash| try w.kv(&out, alloc, "input_hash", hash, true);
             try out.append(alloc, '}');
         }
         try out.appendSlice(alloc, "]}");
@@ -136,4 +137,14 @@ test "pipeline serializes to json" {
     const json = try toJson(a, p);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"CI\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\\\"hi\\\"") != null);
+}
+
+test "pipeline json includes non-null step input_hash" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var steps = [_]Step{.{ .id = "s", .name = "s", .kind = .run, .script = "true", .input_hash = "abc123" }};
+    var jobs = [_]Job{.{ .id = "j", .display_name = "j", .steps = &steps }};
+    const json = try toJson(a, .{ .name = "x", .source_path = "x.yml", .jobs = &jobs });
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input_hash\":\"abc123\"") != null);
 }

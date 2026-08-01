@@ -1,0 +1,14 @@
+name: Phase 3 Docker
+jobs:
+  phase3:
+    runs-on: ubuntu-latest
+    container: busybox:latest
+    steps:
+      - id: write
+        shell: sh
+        run: |
+          echo executed > marker.txt
+          echo "value=ok" >> "$GITHUB_OUTPUT"
+      - id: consume
+        shell: sh
+        run: echo "${{ steps.write.outputs.value }}" > seen.txt

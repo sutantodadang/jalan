@@ -69,7 +69,39 @@ const vtable = backend_iface.Backend.VTable{
     .setupJob = setup,
     .runStep = run,
     .teardownJob = teardown,
+    .openShell = openShell,
+    .cacheIdentity = cacheIdentity,
 };
+
+fn cacheIdentity(ctx: *anyopaque, alloc: std.mem.Allocator, _: ir.Job, handle: *backend_iface.JobHandle, _: ir.Step) anyerror![]const u8 {
+    const self: *NixBackend = @ptrCast(@alignCast(ctx));
+    const packages = try effectivePackages(alloc, self.cfg.nix_packages, handle.nix_packages);
+    return std.fmt.allocPrint(alloc, "derivations:{s};host:{s}", .{
+        try resolvedPackageIdentity(alloc, packages),
+        try backend_iface.hostEnvironmentIdentity(alloc),
+    });
+}
+
+/// Resolve each registry package to its immutable Nix store output path.
+/// Failure disables caching for the step (the caller treats identity errors
+/// as a miss), which is safer than keying mutable `nixpkgs#name` references.
+fn resolvedPackageIdentity(alloc: std.mem.Allocator, packages: []const []const u8) ![]const u8 {
+    var paths: std.ArrayList([]const u8) = .empty;
+    for (packages) |package| {
+        const installable = try std.fmt.allocPrint(alloc, "nixpkgs#{s}.outPath", .{package});
+        const normal = [_][]const u8{ "nix", "eval", "--raw", installable };
+        var result = try std.process.Child.run(.{ .allocator = alloc, .argv = &normal });
+        if (result.term != .Exited or result.term.Exited != 0) {
+            const experimental = [_][]const u8{ "nix", "--extra-experimental-features", "nix-command flakes", "eval", "--raw", installable };
+            result = try std.process.Child.run(.{ .allocator = alloc, .argv = &experimental });
+        }
+        if (result.term != .Exited or result.term.Exited != 0) return error.NixIdentityUnavailable;
+        const path = std.mem.trim(u8, result.stdout, " \t\r\n");
+        if (path.len == 0) return error.NixIdentityUnavailable;
+        try paths.append(alloc, path);
+    }
+    return std.mem.join(alloc, ",", paths.items);
+}
 
 fn setup(_: *anyopaque, _: std.mem.Allocator, job: ir.Job, workspace_abs: []const u8, log: ?backend_iface.LogFn) anyerror!backend_iface.JobHandle {
     if (job.services.len > 0 or job.container_image.len > 0) {
@@ -79,6 +111,35 @@ fn setup(_: *anyopaque, _: std.mem.Allocator, job: ir.Job, workspace_abs: []cons
 }
 
 fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_iface.JobHandle) void {}
+
+fn openShell(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) anyerror!void {
+    const self: *NixBackend = @ptrCast(@alignCast(ctx));
+    const packages = try effectivePackages(alloc, self.cfg.nix_packages, handle.nix_packages);
+    var env_map = try std.process.getEnvMap(alloc);
+    for (env) |pair| try env_map.put(pair.name, pair.value);
+
+    const argv = try buildArgv(alloc, packages, &.{"bash"});
+    const code = try spawnInteractive(alloc, argv, workdir, &env_map);
+    if (code != 0) {
+        const retry_argv = try buildArgvExperimental(alloc, packages, &.{"bash"});
+        _ = try spawnInteractive(alloc, retry_argv, workdir, &env_map);
+    }
+}
+
+fn spawnInteractive(alloc: std.mem.Allocator, argv: []const []const u8, workdir: ?[]const u8, env_map: *const std.process.EnvMap) !i32 {
+    var child = std.process.Child.init(argv, alloc);
+    child.cwd = workdir;
+    child.env_map = env_map;
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    try child.spawn();
+    const term = try child.wait();
+    return switch (term) {
+        .Exited => |code| @intCast(code),
+        else => -1,
+    };
+}
 
 fn containsPkg(list: []const []const u8, name: []const u8) bool {
     for (list) |p| if (std.mem.eql(u8, p, name)) return true;
