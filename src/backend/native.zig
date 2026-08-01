@@ -31,7 +31,14 @@ fn whereExe(alloc: std.mem.Allocator, exe: []const u8) ?[]const u8 {
             var it = std.mem.splitScalar(u8, r.stdout, '\n');
             while (it.next()) |line| {
                 const t = std.mem.trim(u8, line, " \r\n");
-                if (t.len > 0) return t;
+                if (t.len == 0) continue;
+                if (std.ascii.indexOfIgnoreCase(t, "\\Program Files\\WindowsApps\\") != null) continue;
+                // `where` may return packaged WindowsApps paths before the
+                // per-user app alias. Some package directories are listed but
+                // deny traversal to ordinary processes; skip those candidates
+                // instead of handing Child.spawn a guaranteed AccessDenied.
+                std.fs.cwd().access(t, .{}) catch continue;
+                return t;
             }
         }
         return null;
@@ -178,6 +185,23 @@ pub fn runStep(
         .stderr = result.stderr,
         .outputs = outputs.toOwnedSlice(alloc) catch return error.OutOfMemory,
     };
+}
+
+/// Spawn the platform default shell with inherited stdio so the user can
+/// inspect and modify the same workspace/environment as the failed step.
+pub fn openShell(alloc: std.mem.Allocator, workdir: ?[]const u8, env: []const ir.EnvPair) RunError!void {
+    const shell = defaultShell(alloc);
+    var env_map = std.process.getEnvMap(alloc) catch return error.OutOfMemory;
+    for (env) |pair| env_map.put(pair.name, pair.value) catch return error.OutOfMemory;
+
+    var child = std.process.Child.init(&.{resolveExe(alloc, shell.name)}, alloc);
+    child.cwd = workdir;
+    child.env_map = &env_map;
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    child.spawn() catch return error.SpawnFailed;
+    _ = child.wait() catch return error.SpawnFailed;
 }
 
 test "run echo step captures stdout and exit code" {

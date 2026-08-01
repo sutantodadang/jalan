@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const ir = @import("../ir.zig");
 const config = @import("../config.zig");
 const backend_iface = @import("../backend.zig");
+const native_impl = @import("native.zig");
 
 /// Packages used when `Config.nix_packages` is empty. `bash` + `coreutils`
 /// cover the shell/script step this backend runs; `nodejs_20` mirrors the
@@ -69,6 +70,7 @@ const vtable = backend_iface.Backend.VTable{
     .setupJob = setup,
     .runStep = run,
     .teardownJob = teardown,
+    .openShell = openShell,
 };
 
 fn setup(_: *anyopaque, _: std.mem.Allocator, job: ir.Job, workspace_abs: []const u8, log: ?backend_iface.LogFn) anyerror!backend_iface.JobHandle {
@@ -79,6 +81,10 @@ fn setup(_: *anyopaque, _: std.mem.Allocator, job: ir.Job, workspace_abs: []cons
 }
 
 fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_iface.JobHandle) void {}
+
+fn openShell(_: *anyopaque, alloc: std.mem.Allocator, _: *backend_iface.JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) anyerror!void {
+    return native_impl.openShell(alloc, workdir, env);
+}
 
 fn containsPkg(list: []const []const u8, name: []const u8) bool {
     for (list) |p| if (std.mem.eql(u8, p, name)) return true;

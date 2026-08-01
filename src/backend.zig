@@ -54,6 +54,9 @@ pub const Backend = struct {
         /// calling it, warning + skipping `docker_image`-kind actions instead
         /// of dispatching into a backend that can't run them.
         runContainerAction: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, handle: *JobHandle, image: []const u8, cmd_args: []const []const u8, env_pairs: []const ir.EnvPair, err_msg: *?[]const u8) anyerror!StepOutcome = null,
+        /// Open an interactive shell in the live job environment. Optional
+        /// so custom/fake backends can explicitly decline debugger shells.
+        openShell: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, handle: *JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) anyerror!void = null,
     };
 
     pub fn setupJob(self: Backend, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: []const u8, log: ?LogFn) !JobHandle {
@@ -71,6 +74,9 @@ pub const Backend = struct {
     pub fn runContainerAction(self: Backend, alloc: std.mem.Allocator, handle: *JobHandle, image: []const u8, cmd_args: []const []const u8, env_pairs: []const ir.EnvPair, err_msg: *?[]const u8) !StepOutcome {
         return self.vtable.runContainerAction.?(self.ctx, alloc, handle, image, cmd_args, env_pairs, err_msg);
     }
+    pub fn openShell(self: Backend, alloc: std.mem.Allocator, handle: *JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) !void {
+        return self.vtable.openShell.?(self.ctx, alloc, handle, workdir, env);
+    }
 };
 
 var native_ctx: u8 = 0;
@@ -79,6 +85,7 @@ const native_vtable = Backend.VTable{
     .setupJob = nativeSetup,
     .runStep = nativeRun,
     .teardownJob = nativeTeardown,
+    .openShell = nativeOpenShell,
 };
 
 pub fn native() Backend {
@@ -92,6 +99,9 @@ fn nativeRun(_: *anyopaque, alloc: std.mem.Allocator, _: *JobHandle, step: ir.St
     return native_impl.runStep(alloc, step, env, workdir, err_msg);
 }
 fn nativeTeardown(_: *anyopaque, _: std.mem.Allocator, _: *JobHandle) void {}
+fn nativeOpenShell(_: *anyopaque, alloc: std.mem.Allocator, _: *JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) anyerror!void {
+    return native_impl.openShell(alloc, workdir, env);
+}
 
 const native_impl = @import("backend/native.zig");
 

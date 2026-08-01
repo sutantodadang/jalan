@@ -451,6 +451,123 @@ pub fn execRun(alloc: std.mem.Allocator, c: Client, container_id: []const u8, cm
     return .{ .exit_code = exit_code, .stdout = demuxed.stdout, .stderr = demuxed.stderr };
 }
 
+fn execIsRunning(alloc: std.mem.Allocator, c: Client, exec_id: []const u8, err: *?[]const u8) !bool {
+    const inspect_path = try std.fmt.allocPrint(alloc, "{s}/exec/{s}/json", .{ api_prefix, exec_id });
+    const resp = try apiCall(alloc, c, .{ .method = "GET", .path = inspect_path }, err);
+    const parsed = std.json.parseFromSliceLeaky(struct { Running: bool = false }, alloc, resp.body, .{ .ignore_unknown_fields = true }) catch return error.DockerApi;
+    return parsed.Running;
+}
+
+fn readUpgradeHeader(alloc: std.mem.Allocator, file: std.fs.File) ![]u8 {
+    var header: std.ArrayList(u8) = .empty;
+    var one: [1]u8 = undefined;
+    while (header.items.len < 64 * 1024) {
+        const n = try file.read(&one);
+        if (n == 0) return error.DockerApi;
+        try header.append(alloc, one[0]);
+        if (std.mem.endsWith(u8, header.items, "\r\n\r\n") or std.mem.endsWith(u8, header.items, "\n\n"))
+            return header.toOwnedSlice(alloc);
+    }
+    return error.DockerApi;
+}
+
+/// Interactive Docker exec over an HTTP-hijacked connection. Docker's TTY
+/// stream is unframed, so stdout/stderr can be copied directly. Input stays
+/// line-oriented (matching jalan's debugger); after each line we inspect the
+/// exec so an `exit` command returns control to the failure prompt.
+pub fn execInteractive(
+    alloc: std.mem.Allocator,
+    c: Client,
+    container_id: []const u8,
+    cmd: []const []const u8,
+    env: []const []const u8,
+    workdir: ?[]const u8,
+    err: *?[]const u8,
+) !void {
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(alloc, "{\"AttachStdin\":true,\"AttachStdout\":true,\"AttachStderr\":true,\"Tty\":true,\"Cmd\":[");
+    for (cmd, 0..) |arg, i| {
+        if (i > 0) try body.append(alloc, ',');
+        try jsonStrAppend(&body, alloc, arg);
+    }
+    try body.appendSlice(alloc, "],\"Env\":[");
+    for (env, 0..) |kv, i| {
+        if (i > 0) try body.append(alloc, ',');
+        try jsonStrAppend(&body, alloc, kv);
+    }
+    try body.append(alloc, ']');
+    if (workdir) |wd| {
+        try body.appendSlice(alloc, ",\"WorkingDir\":");
+        try jsonStrAppend(&body, alloc, wd);
+    }
+    try body.append(alloc, '}');
+
+    const create_path = try std.fmt.allocPrint(alloc, "{s}/containers/{s}/exec", .{ api_prefix, container_id });
+    const create_resp = try apiCall(alloc, c, .{
+        .method = "POST",
+        .path = create_path,
+        .headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        .body = try body.toOwnedSlice(alloc),
+    }, err);
+    const created = std.json.parseFromSliceLeaky(struct { Id: []const u8 }, alloc, create_resp.body, .{ .ignore_unknown_fields = true }) catch return error.DockerApi;
+
+    const conn = try connect(c);
+    defer conn.close();
+    const start_path = try std.fmt.allocPrint(alloc, "{s}/exec/{s}/start", .{ api_prefix, created.Id });
+    const raw = try http.writeRequest(alloc, .{
+        .method = "POST",
+        .path = start_path,
+        .headers = &.{
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "Connection", .value = "Upgrade" },
+            .{ .name = "Upgrade", .value = "tcp" },
+        },
+        .body = "{\"Detach\":false,\"Tty\":true}",
+    });
+    try conn.file.writeAll(raw);
+    const header = try readUpgradeHeader(alloc, conn.file);
+    if (!std.mem.startsWith(u8, header, "HTTP/1.1 101") and !std.mem.startsWith(u8, header, "HTTP/1.1 200")) {
+        err.* = "docker exec stream upgrade failed";
+        return error.DockerApi;
+    }
+
+    const Relay = struct {
+        fn output(file: std.fs.File) void {
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = file.read(&buf) catch return;
+                if (n == 0) return;
+                std.fs.File.stdout().writeAll(buf[0..n]) catch return;
+            }
+        }
+    };
+    const output_thread = try std.Thread.spawn(.{}, Relay.output, .{conn.file});
+
+    var stdin_reader = std.fs.File.stdin().deprecatedReader();
+    var line_buf: [4096]u8 = undefined;
+    while (true) {
+        const line = stdin_reader.readUntilDelimiterOrEof(&line_buf, '\n') catch null;
+        if (line == null) {
+            conn.file.writeAll(&.{4}) catch {};
+            break;
+        }
+        conn.file.writeAll(line.?) catch break;
+        conn.file.writeAll("\n") catch break;
+
+        // Give the shell a short window to process `exit`, then determine
+        // whether to return to jalan's prompt or read another input line.
+        var poll: usize = 0;
+        var running = true;
+        while (poll < 5) : (poll += 1) {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            running = execIsRunning(alloc, c, created.Id, err) catch true;
+            if (!running) break;
+        }
+        if (!running) break;
+    }
+    output_thread.join();
+}
+
 test "detectSocket precedence: config over default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

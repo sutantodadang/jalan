@@ -2,6 +2,8 @@
 //! behavior; this module keeps selector matching and prompt parsing pure and
 //! provides the real stdin reader used outside tests.
 const std = @import("std");
+const backend_mod = @import("backend.zig");
+const ir = @import("ir.zig");
 
 pub const Breakpoint = struct {
     job_id: []const u8,
@@ -51,6 +53,20 @@ pub fn promptOnce(_: ?*anyopaque) PromptCmd {
     var buf: [256]u8 = undefined;
     const line = std.fs.File.stdin().deprecatedReader().readUntilDelimiterOrEof(&buf, '\n') catch return .continue_;
     return parseCmd(line orelse return .continue_);
+}
+
+/// Dispatch an interactive shell through the selected backend. `false`
+/// means the backend deliberately has no shell implementation.
+pub fn shell(
+    alloc: std.mem.Allocator,
+    backend: backend_mod.Backend,
+    handle: *backend_mod.JobHandle,
+    workdir: ?[]const u8,
+    env: []const ir.EnvPair,
+) !bool {
+    if (backend.vtable.openShell == null) return false;
+    try backend.openShell(alloc, handle, workdir, env);
+    return true;
 }
 
 test "parseCmd accepts breakpoint commands and rejects unknown input" {

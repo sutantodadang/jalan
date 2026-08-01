@@ -198,6 +198,7 @@ const vtable = backend_iface.Backend.VTable{
     .runStep = run,
     .teardownJob = teardown,
     .runContainerAction = runContainerAction,
+    .openShell = openShell,
 };
 
 /// Best-effort teardown of whatever service containers + network got
@@ -381,6 +382,24 @@ fn run(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHand
         .stdout = exec_result.stdout,
         .stderr = exec_result.stderr,
         .outputs = outputs,
+    };
+}
+
+fn openShell(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) anyerror!void {
+    const self: *DockerBackend = @ptrCast(@alignCast(ctx));
+    const exec_env = try formatEnvPairs(alloc, env, &.{});
+    var err: ?[]const u8 = null;
+    client.execInteractive(
+        alloc,
+        self.client,
+        handle.container_id,
+        &.{ "sh", "-c", "command -v bash >/dev/null 2>&1 && exec bash || exec sh" },
+        exec_env,
+        workdir,
+        &err,
+    ) catch |e| {
+        if (err) |msg| std.debug.print("docker shell: {s}\n", .{msg});
+        return e;
     };
 }
 

@@ -727,6 +727,83 @@ test "breakpoint: injected prompt can inspect, continue, skip, or abort" {
     try std.testing.expectEqualStrings("aborted at breakpoint", aborted.jobs[0].steps[0].stderr);
 }
 
+test "on-failure stop skips jobs that have not started" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  first:
+        \\    steps:
+        \\      - run: echo unreachable
+        \\        shell: nosuchshell
+        \\  second:
+        \\    steps:
+        \\      - run: echo must-not-run
+        \\        shell: sh
+    );
+    const report = try run(a, p, .{ .max_parallel = 1, .on_failure = .stop });
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqual(JobStatus.failed, report.jobs[0].status);
+    try std.testing.expectEqual(JobStatus.skipped, report.jobs[1].status);
+}
+
+test "on-failure shell dispatches through backend and retries once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Fake = struct {
+        runs: usize = 0,
+        shells: usize = 0,
+
+        fn setup(_: *anyopaque, _: std.mem.Allocator, _: ir.Job, workspace: []const u8, _: ?backend_mod.LogFn) anyerror!backend_mod.JobHandle {
+            return .{ .workspace = workspace };
+        }
+        fn runStep(ctx: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, _: ir.Step, _: []const ir.EnvPair, _: ?[]const u8, _: *?[]const u8) anyerror!backend_mod.StepOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.runs += 1;
+            return .{
+                .exit_code = if (self.runs == 1) 1 else 0,
+                .stdout = if (self.runs == 1) "failed" else "retried",
+                .stderr = "",
+                .outputs = &.{},
+            };
+        }
+        fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle) void {}
+        fn openShell(ctx: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, _: ?[]const u8, _: []const ir.EnvPair) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.shells += 1;
+        }
+    };
+    const fake_vtable = backend_mod.Backend.VTable{
+        .setupJob = Fake.setup,
+        .runStep = Fake.runStep,
+        .teardownJob = Fake.teardown,
+        .openShell = Fake.openShell,
+    };
+    var fake = Fake{};
+    const fake_backend = backend_mod.Backend{ .ctx = @ptrCast(&fake), .vtable = &fake_vtable, .kind = .native };
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: flaky
+        \\        run: fake
+    );
+    const commands = [_]debug_mod.PromptCmd{.retry};
+    var script = TestPromptScript{ .commands = &commands };
+    const report = try run(a, p, .{
+        .exec_backend = fake_backend,
+        .on_failure = .shell,
+        .prompt_fn = &TestPromptScript.next,
+        .prompt_ctx = &script,
+    });
+    try std.testing.expect(report.ok());
+    try std.testing.expectEqual(@as(usize, 2), fake.runs);
+    try std.testing.expectEqual(@as(usize, 1), fake.shells);
+    try std.testing.expectEqualStrings("retried", report.jobs[0].steps[0].stdout);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -793,7 +870,10 @@ pub const RunOptions = struct {
     breakpoints: []const debug_mod.Breakpoint = &.{},
     prompt_fn: ?debug_mod.PromptFn = null,
     prompt_ctx: ?*anyopaque = null,
+    on_failure: OnFailure = .continue_,
 };
+
+pub const OnFailure = enum { continue_, stop, shell };
 
 pub const ResumePoint = struct {
     run_id: []const u8,
@@ -831,6 +911,7 @@ const Shared = struct {
     // Only one worker may own stdin/the interactive prompt at a time.
     prompt_mutex: std.Thread.Mutex = .{},
     non_tty_break_warned: bool = false,
+    halt: std.atomic.Value(bool) = .init(false),
 };
 
 pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ OutOfMemory, InternalError, ResumeInvalid, RestoreFailed, StoreIo }!Report {
@@ -1013,6 +1094,15 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
                 completed += 1;
             }
             batch_start += batch.len;
+            if (shared.halt.load(.acquire)) {
+                for (p.jobs, 0..) |job, ji| {
+                    if (done[ji]) continue;
+                    results[ji] = try skippedResult(alloc, job, ji);
+                    done[ji] = true;
+                    completed += 1;
+                }
+                break;
+            }
         }
     }
     return .{ .jobs = results };
@@ -1247,6 +1337,9 @@ fn handleBreakpoint(
     job: ir.Job,
     step: ir.Step,
     env: *expr.Env,
+    backend: backend_mod.Backend,
+    handle: *backend_mod.JobHandle,
+    base_env: []const ir.EnvPair,
 ) BreakAction {
     shared.prompt_mutex.lock();
     defer shared.prompt_mutex.unlock();
@@ -1282,8 +1375,73 @@ fn handleBreakpoint(
                 const line = std.fmt.allocPrint(alloc, "workspace={s} workdir={s}", .{ shared.workspace_abs, wd }) catch continue;
                 logLine(opts, alloc, job, step, line);
             },
-            .shell => logLine(opts, alloc, job, step, "drop-to-shell is not available yet on this backend"),
+            .shell => {
+                var shell_env: std.ArrayList(ir.EnvPair) = .empty;
+                shell_env.appendSlice(alloc, base_env) catch {
+                    logLine(opts, alloc, job, step, "warning: cannot build shell environment");
+                    continue;
+                };
+                for (step.env) |pair| {
+                    const value = expr.interpolate(alloc, pair.value, env) catch pair.value;
+                    shell_env.append(alloc, .{ .name = pair.name, .value = value }) catch continue;
+                }
+                const workdir = if (step.workdir) |raw| expr.interpolate(alloc, raw, env) catch raw else null;
+                const opened = debug_mod.shell(alloc, backend, handle, workdir, shell_env.items) catch {
+                    logLine(opts, alloc, job, step, "warning: drop-to-shell failed");
+                    continue;
+                };
+                if (!opened) logLine(opts, alloc, job, step, "drop-to-shell not supported on this backend");
+            },
             .retry, .invalid => logLine(opts, alloc, job, step, "invalid command; choose c, s, e, w, sh, or a"),
+        }
+    }
+}
+
+const FailureAction = enum { continue_, retry, abort };
+
+fn handleStepFailure(
+    alloc: std.mem.Allocator,
+    opts: RunOptions,
+    shared: *Shared,
+    backend: backend_mod.Backend,
+    handle: *backend_mod.JobHandle,
+    job: ir.Job,
+    step: ir.Step,
+    workdir: ?[]const u8,
+    env: []const ir.EnvPair,
+) FailureAction {
+    switch (opts.on_failure) {
+        .continue_ => return .continue_,
+        .stop => {
+            shared.halt.store(true, .release);
+            return .abort;
+        },
+        .shell => {},
+    }
+
+    shared.prompt_mutex.lock();
+    defer shared.prompt_mutex.unlock();
+    if (opts.prompt_fn == null and !debug_mod.isTty()) {
+        logLine(opts, alloc, job, step, "warning: --on-failure shell ignored because stdin is not a TTY");
+        return .continue_;
+    }
+
+    const opened = debug_mod.shell(alloc, backend, handle, workdir, env) catch blk: {
+        logLine(opts, alloc, job, step, "warning: drop-to-shell failed");
+        break :blk false;
+    };
+    if (!opened) logLine(opts, alloc, job, step, "drop-to-shell not supported on this backend");
+    logLine(opts, alloc, job, step, "failure shell exited — (c)ontinue (r)etry (a)bort");
+    while (true) {
+        const cmd = if (opts.prompt_fn) |prompt| prompt(opts.prompt_ctx) else debug_mod.promptOnce(null);
+        switch (cmd) {
+            .continue_ => return .continue_,
+            .retry => return .retry,
+            .abort => {
+                shared.halt.store(true, .release);
+                return .abort;
+            },
+            else => logLine(opts, alloc, job, step, "invalid command; choose c, r, or a"),
         }
     }
 }
@@ -1303,6 +1461,8 @@ fn runJob(
     for (steps, job.steps) |*r, s|
         r.* = .{ .name = s.name, .status = .skipped, .exit_code = 0, .duration_ms = 0, .stdout = "", .stderr = "" };
     const skipped = JobResult{ .job_index = index, .display_name = job.display_name, .status = .skipped, .steps = steps };
+
+    if (shared.halt.load(.acquire)) return skipped;
 
     if (opts.job_filter) |f| if (!std.mem.eql(u8, f, job.id)) return skipped;
     if (!gha.matrixMatches(job, opts.matrix_filter)) return skipped;
@@ -1395,6 +1555,7 @@ fn runJob(
 
     var job_status: JobStatus = .success;
     step_loop: for (job.steps, 0..) |step, si| {
+        if (shared.halt.load(.acquire)) break;
         if (opts.step_filter) |f| if (!std.mem.eql(u8, f, step.id)) continue;
         if (si < resume_start) continue; // resume: steps before the target stay skipped
         if (job_status == .failed) break;
@@ -1419,12 +1580,13 @@ fn runJob(
             continue;
         }
 
-        if (hasBreakpoint(opts, job, step, si)) switch (handleBreakpoint(alloc, opts, shared, job, step, &env)) {
+        if (hasBreakpoint(opts, job, step, si)) switch (handleBreakpoint(alloc, opts, shared, job, step, &env, b, &handle, merged_env.items)) {
             .continue_ => {},
             .skip => continue,
             .abort => {
                 steps[si] = .{ .name = step.name, .status = .failed, .exit_code = 1, .duration_ms = 0, .stdout = "", .stderr = "aborted at breakpoint" };
                 job_status = .failed;
+                shared.halt.store(true, .release);
                 break :step_loop;
             },
         };
@@ -1476,16 +1638,42 @@ fn runJob(
                 continue;
             }
 
-            var err_msg: ?[]const u8 = null;
-            const outcome = runner.runUses(alloc, step, with_list.items, step_env.items, b, &handle, &env, opts.log, opts.force_pull, &err_msg) catch {
-                steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
-                if (!step.continue_on_error) job_status = .failed;
-                continue;
-            };
-            const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
-            if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, ok, outcome);
-            if (!ok and !step.continue_on_error) job_status = .failed;
-            continue;
+            var attempt: usize = 0;
+            uses_attempt: while (true) {
+                var err_msg: ?[]const u8 = null;
+                const outcome = runner.runUses(alloc, step, with_list.items, step_env.items, b, &handle, &env, opts.log, opts.force_pull, &err_msg) catch {
+                    steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
+                    if (!step.continue_on_error) {
+                        const action = if (attempt == 0 or opts.on_failure == .stop)
+                            handleStepFailure(alloc, opts, shared, b, &handle, job, step, null, step_env.items)
+                        else
+                            FailureAction.continue_;
+                        if (action == .retry and attempt == 0) {
+                            attempt += 1;
+                            continue :uses_attempt;
+                        }
+                        job_status = .failed;
+                    }
+                    break :uses_attempt;
+                };
+                const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
+                if (ok) {
+                    if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, true, outcome);
+                    break :uses_attempt;
+                }
+                if (step.continue_on_error) break :uses_attempt;
+                const action = if (attempt == 0 or opts.on_failure == .stop)
+                    handleStepFailure(alloc, opts, shared, b, &handle, job, step, null, step_env.items)
+                else
+                    FailureAction.continue_;
+                if (action == .retry and attempt == 0) {
+                    attempt += 1;
+                    continue :uses_attempt;
+                }
+                job_status = .failed;
+                break :uses_attempt;
+            }
+            continue :step_loop;
         }
 
         // Interpolate script, env values, workdir. Any expression error here means
@@ -1534,15 +1722,41 @@ fn runJob(
         }
         if (cb.hex) |hex| patched.input_hash = hex;
 
-        var err_msg: ?[]const u8 = null;
-        const outcome = b.runStep(alloc, &handle, patched, spawn_env.items, workdir, &err_msg) catch {
-            steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
-            if (!step.continue_on_error) job_status = .failed;
-            continue;
-        };
-        const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
-        if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, ok, outcome);
-        if (!ok and !step.continue_on_error) job_status = .failed;
+        var attempt: usize = 0;
+        run_attempt: while (true) {
+            var err_msg: ?[]const u8 = null;
+            const outcome = b.runStep(alloc, &handle, patched, spawn_env.items, workdir, &err_msg) catch {
+                steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
+                if (!step.continue_on_error) {
+                    const action = if (attempt == 0 or opts.on_failure == .stop)
+                        handleStepFailure(alloc, opts, shared, b, &handle, job, step, workdir, spawn_env.items)
+                    else
+                        FailureAction.continue_;
+                    if (action == .retry and attempt == 0) {
+                        attempt += 1;
+                        continue :run_attempt;
+                    }
+                    job_status = .failed;
+                }
+                break :run_attempt;
+            };
+            const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
+            if (ok) {
+                if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, true, outcome);
+                break :run_attempt;
+            }
+            if (step.continue_on_error) break :run_attempt;
+            const action = if (attempt == 0 or opts.on_failure == .stop)
+                handleStepFailure(alloc, opts, shared, b, &handle, job, step, workdir, spawn_env.items)
+            else
+                FailureAction.continue_;
+            if (action == .retry and attempt == 0) {
+                attempt += 1;
+                continue :run_attempt;
+            }
+            job_status = .failed;
+            break :run_attempt;
+        }
     }
     return .{ .job_index = index, .display_name = job.display_name, .status = job_status, .steps = steps };
 }
