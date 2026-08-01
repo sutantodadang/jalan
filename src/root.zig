@@ -17,6 +17,7 @@ pub const actions_runner = @import("actions/runner.zig");
 pub const snap_store = @import("snap/store.zig");
 pub const snap_manifest = @import("snap/manifest.zig");
 pub const snap_restore = @import("snap/restore.zig");
+pub const snap_runrecord = @import("snap/runrecord.zig");
 
 test {
     _ = yaml;
@@ -37,5 +38,6 @@ test {
     _ = snap_store;
     _ = snap_manifest;
     _ = snap_restore;
+    _ = snap_runrecord;
     _ = @import("golden_test.zig");
 }
