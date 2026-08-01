@@ -12,7 +12,9 @@ const expr = @import("expr.zig");
 const backend_mod = @import("backend.zig");
 const runner = @import("actions/runner.zig");
 const snap_manifest = @import("snap/manifest.zig");
+const snap_store = @import("snap/store.zig");
 const runrecord = @import("snap/runrecord.zig");
+const cache = @import("cache.zig");
 
 fn parseFixture(a: std.mem.Allocator, src: []const u8) !ir.Pipeline {
     var diags = yaml.Diags.init(a);
@@ -336,6 +338,94 @@ test "snapshots off by default: no store writes" {
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(store_root, .{}));
 }
 
+test "cache: second run replays without re-executing, outputs still flow" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/engcache";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const ws = try std.fmt.allocPrint(a, "{s}/ws", .{base});
+    try std.fs.cwd().makePath(ws);
+    const store_root = try std.fmt.allocPrint(a, "{s}/store", .{base});
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, ws);
+
+    // s1 leaves proof of execution OUTSIDE the walked workspace (../execs.txt),
+    // writes a deterministic file inside it (made.txt), and publishes an
+    // output; s2 consumes the output. sh syntax (Git-Bash on this machine).
+    const wf = try std.fmt.allocPrint(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: s1
+        \\        run: echo exec >> ../execs.txt && echo made > made.txt && echo "ver=7" >> "$GITHUB_OUTPUT"
+        \\        shell: sh
+        \\        working-directory: {s}
+        \\      - id: s2
+        \\        run: echo "got ${{{{ steps.s1.outputs.ver }}}}"
+        \\        shell: sh
+        \\        working-directory: {s}
+        \\
+    , .{ ws, ws });
+    const p = try parseFixture(a, wf);
+    const opts = RunOptions{ .cache = true, .store_root = store_root, .workspace_abs = ws_abs };
+
+    const r1 = try run(a, p, opts);
+    try std.testing.expect(r1.ok());
+    try std.testing.expect(std.mem.indexOf(u8, r1.jobs[0].steps[1].stdout, "got 7") != null);
+
+    // Restore the workspace to run 1's starting state (empty) — the cache
+    // key covers the pre-step tree, so identical inputs are required for a
+    // hit. A non-idempotent step (e.g. appending in-workspace) correctly
+    // misses because its input state changed.
+    std.fs.cwd().deleteFile(try std.fmt.allocPrint(a, "{s}/made.txt", .{ws})) catch {};
+
+    const r2 = try run(a, p, opts);
+    try std.testing.expect(r2.ok());
+    // Cache hit: s1 never re-executed (execs.txt still one line), but its
+    // workspace write was materialized from the blob store and its outputs
+    // were replayed so s2 still printed got 7.
+    const execs = try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/execs.txt", .{base}), 1 << 20);
+    try std.testing.expectEqualStrings("exec\n", execs);
+    const made = try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/made.txt", .{ws}), 1 << 20);
+    try std.testing.expectEqualStrings("made\n", made);
+    try std.testing.expect(std.mem.indexOf(u8, r2.jobs[0].steps[1].stdout, "got 7") != null);
+}
+
+test "cache: secret-referencing steps are never cached" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/engcache-sec";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const ws = try std.fmt.allocPrint(a, "{s}/ws", .{base});
+    try std.fs.cwd().makePath(ws);
+    const store_root = try std.fmt.allocPrint(a, "{s}/store", .{base});
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, ws);
+
+    const wf = try std.fmt.allocPrint(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: s1
+        \\        run: echo exec >> count.txt
+        \\        shell: sh
+        \\        working-directory: {s}
+        \\        env:
+        \\          T: ${{{{ secrets.TOKEN }}}}
+        \\
+    , .{ws});
+    const p = try parseFixture(a, wf);
+    const secrets = [_]ir.EnvPair{.{ .name = "TOKEN", .value = "abc" }};
+    const opts = RunOptions{ .cache = true, .store_root = store_root, .workspace_abs = ws_abs, .secrets = &secrets };
+
+    _ = try run(a, p, opts);
+    _ = try run(a, p, opts);
+    const count = try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/count.txt", .{ws}), 1 << 20);
+    try std.testing.expectEqualStrings("exec\nexec\n", count);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -384,6 +474,10 @@ pub const RunOptions = struct {
     // write a run record under `store_root`. Store failures degrade to a
     // warning + snapshots off for the rest of the run — never exit 3.
     snapshot: bool = false,
+    // Phase 3: content-addressed step cache. Hit = replay outcome without
+    // executing; successful executions write entries. Secret-referencing
+    // steps are never cached.
+    cache: bool = false,
     store_root: []const u8 = ".jalan/store",
     // Explicit run id (resume reuses the original); null -> generate one.
     run_id: ?[]const u8 = null,
@@ -415,6 +509,11 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
     var completed: usize = 0;
     const max_par = @max(opts.max_parallel, 1);
 
+    // Phase 3: workspace walk root for snapshots and/or cache.
+    if (opts.snapshot or opts.cache) {
+        shared.workspace_abs = opts.workspace_abs orelse (std.fs.cwd().realpathAlloc(alloc, ".") catch ".");
+    }
+
     // Phase 3: run record skeleton (all steps "pending") when snapshots on.
     var record: runrecord.RunRecord = undefined;
     if (opts.snapshot) {
@@ -439,7 +538,6 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
                 .jobs = jobs,
             };
             shared.record = &record;
-            shared.workspace_abs = opts.workspace_abs orelse (std.fs.cwd().realpathAlloc(alloc, ".") catch ".");
             runrecord.write(alloc, opts.store_root, &record) catch {
                 if (opts.log) |l| l("warning: cannot write run record — snapshots disabled");
                 shared.snapshot_ok = false;
@@ -561,6 +659,102 @@ fn captureStep(alloc: std.mem.Allocator, opts: RunOptions, sh: *Shared, job: ir.
     sh.record_mutex.lock();
     rec.jobs[ji].steps[si].snapshot = cap.rel_path;
     sh.record_mutex.unlock();
+}
+
+const CacheBegin = struct {
+    /// Non-null when caching is active for this step (commit allowed).
+    hex: ?[]const u8 = null,
+    /// Pre-step workspace entries, needed by cacheCommit's diff.
+    pre: []snap_manifest.FileEntry = &.{},
+    /// Non-null on a cache hit: replay instead of executing.
+    hit: ?cache.Entry = null,
+};
+
+/// Compute the step's cache key and look it up. On hit, materializes the
+/// recorded file writes into the workspace (a blob failure demotes the hit
+/// to a miss-with-warning and re-executes). `raw_step` is the
+/// pre-interpolation step (secret scan); `key_step` carries interpolated
+/// script/with values (cache identity).
+fn cacheBegin(
+    alloc: std.mem.Allocator,
+    opts: RunOptions,
+    job: ir.Job,
+    kind: []const u8,
+    raw_step: ir.Step,
+    key_step: ir.Step,
+    eff_env: []const ir.EnvPair,
+    workspace: []const u8,
+) CacheBegin {
+    if (!opts.cache or cache.usesSecrets(raw_step)) return .{};
+    const pre = snap_manifest.scanTree(alloc, opts.store_root, workspace, false) catch {
+        logLine(opts, alloc, job, key_step, "warning: workspace scan failed — cache disabled for this step");
+        return .{};
+    };
+    const pre_hash = snap_manifest.treeHash(alloc, pre) catch return .{};
+    const hex = cache.inputHash(alloc, kind, job.container_image, key_step, eff_env, pre_hash) catch return .{};
+    const entry = (cache.readEntry(alloc, opts.store_root, hex) catch null) orelse
+        return .{ .hex = hex, .pre = pre };
+    materializeEntry(alloc, opts.store_root, workspace, entry) catch {
+        logLine(opts, alloc, job, key_step, "warning: cache entry blobs missing — re-executing");
+        return .{ .hex = hex, .pre = pre };
+    };
+    return .{ .hit = entry };
+}
+
+fn materializeEntry(alloc: std.mem.Allocator, root: []const u8, workspace: []const u8, entry: cache.Entry) !void {
+    for (entry.wrote) |w| {
+        const data = snap_store.readBlob(alloc, root, w.blob) catch return error.BlobMissing;
+        const abs = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ workspace, w.path });
+        if (std.fs.path.dirname(abs)) |d| std.fs.cwd().makePath(d) catch return error.StoreIo;
+        std.fs.cwd().writeFile(.{ .sub_path = abs, .data = data }) catch return error.StoreIo;
+    }
+    for (entry.deleted) |d| {
+        const abs = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ workspace, d });
+        std.fs.cwd().deleteFile(abs) catch {};
+    }
+}
+
+/// After a successful execution: diff pre/post workspace trees, store
+/// changed files as blobs, and write the cache entry. Best-effort — a
+/// commit failure only means the next run misses.
+fn cacheCommit(
+    alloc: std.mem.Allocator,
+    opts: RunOptions,
+    workspace: []const u8,
+    hex: []const u8,
+    pre: []snap_manifest.FileEntry,
+    ok: bool,
+    outcome: backend_mod.StepOutcome,
+) void {
+    if (!ok) return;
+    const post = snap_manifest.scanTree(alloc, opts.store_root, workspace, false) catch return;
+    var pre_map: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (pre) |f| pre_map.put(alloc, f.path, f.blob) catch return;
+    var post_paths: std.StringHashMapUnmanaged(void) = .empty;
+    var wrote: std.ArrayList(cache.WroteFile) = .empty;
+    for (post) |f| {
+        if (f.link_target != null) continue;
+        post_paths.put(alloc, f.path, {}) catch return;
+        const prev = pre_map.get(f.path);
+        if (prev != null and std.mem.eql(u8, prev.?, f.blob)) continue;
+        const abs = std.fmt.allocPrint(alloc, "{s}/{s}", .{ workspace, f.path }) catch return;
+        const c = snap_store.copyFileToBlob(alloc, opts.store_root, abs) catch return;
+        wrote.append(alloc, .{ .path = f.path, .blob = c.hex }) catch return;
+    }
+    var deleted: std.ArrayList([]const u8) = .empty;
+    for (pre) |f| {
+        if (!post_paths.contains(f.path)) deleted.append(alloc, f.path) catch return;
+    }
+    const post_hash = snap_manifest.treeHash(alloc, post) catch return;
+    cache.writeEntry(alloc, opts.store_root, hex, .{
+        .exit_code = outcome.exit_code,
+        .stdout = outcome.stdout,
+        .stderr = outcome.stderr,
+        .outputs = outcome.outputs,
+        .wrote = wrote.items,
+        .deleted = deleted.items,
+        .post_tree_hash = post_hash,
+    }) catch {};
 }
 
 fn copyResult(alloc: std.mem.Allocator, r: JobResult) !JobResult {
@@ -734,6 +928,17 @@ fn runJob(
                 try step_env.append(alloc, .{ .name = e.name, .value = val });
                 try env.put(alloc, try key2(alloc, "env", e.name), val);
             }
+            var key_step = step;
+            key_step.with = with_list.items;
+            const cb = cacheBegin(alloc, opts, job, @tagName(b.kind), step, key_step, step_env.items, shared.workspace_abs);
+            if (cb.hit) |entry| {
+                const cached_outcome = backend_mod.StepOutcome{ .exit_code = entry.exit_code, .stdout = entry.stdout, .stderr = entry.stderr, .outputs = entry.outputs };
+                const cok = try applyStepOutcome(alloc, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
+                logLine(opts, alloc, job, step, "(cached)");
+                if (!cok and !step.continue_on_error) job_status = .failed;
+                continue;
+            }
+
             var err_msg: ?[]const u8 = null;
             const outcome = runner.runUses(alloc, step, with_list.items, step_env.items, b, &handle, &env, opts.log, opts.force_pull, &err_msg) catch {
                 steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
@@ -741,6 +946,7 @@ fn runJob(
                 continue;
             };
             const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
+            if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, ok, outcome);
             if (!ok and !step.continue_on_error) job_status = .failed;
             continue;
         }
@@ -781,6 +987,16 @@ fn runJob(
             continue;
         } else null;
 
+        const cb = cacheBegin(alloc, opts, job, @tagName(b.kind), step, patched, spawn_env.items, shared.workspace_abs);
+        if (cb.hit) |entry| {
+            const cached_outcome = backend_mod.StepOutcome{ .exit_code = entry.exit_code, .stdout = entry.stdout, .stderr = entry.stderr, .outputs = entry.outputs };
+            const cok = try applyStepOutcome(alloc, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
+            logLine(opts, alloc, job, step, "(cached)");
+            if (!cok and !step.continue_on_error) job_status = .failed;
+            continue;
+        }
+        if (cb.hex) |hex| patched.input_hash = hex;
+
         var err_msg: ?[]const u8 = null;
         const outcome = b.runStep(alloc, &handle, patched, spawn_env.items, workdir, &err_msg) catch {
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
@@ -788,6 +1004,7 @@ fn runJob(
             continue;
         };
         const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
+        if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, ok, outcome);
         if (!ok and !step.continue_on_error) job_status = .failed;
     }
     return .{ .job_index = index, .display_name = job.display_name, .status = job_status, .steps = steps };

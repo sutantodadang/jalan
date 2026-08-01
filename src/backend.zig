@@ -6,9 +6,9 @@ const ir = @import("ir.zig");
 
 pub const StepOutcome = struct {
     exit_code: i32,
-    stdout: []u8,
-    stderr: []u8,
-    outputs: []ir.EnvPair,
+    stdout: []const u8,
+    stderr: []const u8,
+    outputs: []const ir.EnvPair,
 };
 
 pub const JobHandle = struct {
