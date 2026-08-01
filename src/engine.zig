@@ -11,6 +11,8 @@ const yaml = @import("yaml.zig");
 const expr = @import("expr.zig");
 const backend_mod = @import("backend.zig");
 const runner = @import("actions/runner.zig");
+const snap_manifest = @import("snap/manifest.zig");
+const runrecord = @import("snap/runrecord.zig");
 
 fn parseFixture(a: std.mem.Allocator, src: []const u8) !ir.Pipeline {
     var diags = yaml.Diags.init(a);
@@ -263,6 +265,77 @@ test "job env and step env flow into uses actions and composite children" {
     try std.testing.expect(std.mem.indexOf(u8, report.jobs[0].steps[0].stdout, "job=hello step=world") != null);
 }
 
+test "snapshots: step boundaries captured and run record written" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/engsnap";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const ws = try std.fmt.allocPrint(a, "{s}/ws", .{base});
+    try std.fs.cwd().makePath(ws);
+    try std.fs.cwd().writeFile(.{ .sub_path = try std.fmt.allocPrint(a, "{s}/f.txt", .{ws}), .data = "workspace-content" });
+    const store_root = try std.fmt.allocPrint(a, "{s}/store", .{base});
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, ws);
+
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: s1
+        \\        run: echo one
+        \\      - id: s2
+        \\        run: echo two
+    );
+    const report = try run(a, p, .{
+        .snapshot = true,
+        .store_root = store_root,
+        .workspace_abs = ws_abs,
+        .run_id = "test-run-1",
+    });
+    try std.testing.expect(report.ok());
+
+    // Both step-boundary manifests exist and carry the expr env.
+    const m0 = try snap_manifest.load(a, store_root, "snapshots/test-run-1/j/000-s1.json");
+    try std.testing.expectEqualStrings("s1", m0.step_id);
+    try std.testing.expectEqual(@as(u32, 0), m0.step_index);
+    var found_ref = false;
+    for (m0.env) |e| {
+        if (std.mem.eql(u8, e.name, "github.ref")) found_ref = true;
+    }
+    try std.testing.expect(found_ref);
+    try std.testing.expectEqual(@as(usize, 1), m0.files.len);
+    _ = try snap_manifest.load(a, store_root, "snapshots/test-run-1/j/001-s2.json");
+
+    // Run record: job + both steps success, snapshot paths recorded.
+    const rec = try runrecord.load(a, store_root, "test-run-1");
+    try std.testing.expectEqualStrings("test-run-1", rec.run_id);
+    try std.testing.expectEqualStrings("success", rec.jobs[0].status);
+    try std.testing.expectEqualStrings("success", rec.jobs[0].steps[0].status);
+    try std.testing.expect(std.mem.indexOf(u8, rec.jobs[0].steps[0].snapshot, "000-s1.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rec.jobs[0].steps[1].snapshot, "001-s2.json") != null);
+}
+
+test "snapshots off by default: no store writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/engsnap-off";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const store_root = try std.fmt.allocPrint(a, "{s}/store", .{base});
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: s1
+        \\        run: echo one
+    );
+    const report = try run(a, p, .{ .store_root = store_root, .workspace_abs = a.dupe(u8, base) catch unreachable });
+    try std.testing.expect(report.ok());
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(store_root, .{}));
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -307,12 +380,30 @@ pub const RunOptions = struct {
     // Threaded to runUses's ref-resolution cache; forces a fresh fetch of
     // GitHub-hosted actions instead of reusing a cached checkout.
     force_pull: bool = false,
+    // Phase 3: capture workspace+env snapshots at every step boundary and
+    // write a run record under `store_root`. Store failures degrade to a
+    // warning + snapshots off for the rest of the run — never exit 3.
+    snapshot: bool = false,
+    store_root: []const u8 = ".jalan/store",
+    // Explicit run id (resume reuses the original); null -> generate one.
+    run_id: ?[]const u8 = null,
+    // Snapshot/cache walk root. null -> process cwd (the CLI's behavior);
+    // tests point this at a temp fixture so the walk doesn't scan the repo.
+    workspace_abs: ?[]const u8 = null,
 };
 
 const Shared = struct {
     alloc: std.mem.Allocator,
     // "jobid.outputs.key" -> value, merged across matrix copies (last writer wins).
     job_outputs: std.StringHashMapUnmanaged([]const u8) = .empty,
+    // Phase 3 run record, non-null when snapshots are on. Guarded by
+    // record_mutex (a SEPARATE mutex from `mutex`: workers hold `mutex`
+    // while copying results and may also update the record, but nothing
+    // ever takes `mutex` while holding record_mutex — no lock-order cycle).
+    record: ?*runrecord.RunRecord = null,
+    record_mutex: std.Thread.Mutex = .{},
+    snapshot_ok: bool = true,
+    workspace_abs: []const u8 = "",
 };
 
 pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ OutOfMemory, InternalError }!Report {
@@ -323,6 +414,38 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
     var mutex = std.Thread.Mutex{};
     var completed: usize = 0;
     const max_par = @max(opts.max_parallel, 1);
+
+    // Phase 3: run record skeleton (all steps "pending") when snapshots on.
+    var record: runrecord.RunRecord = undefined;
+    if (opts.snapshot) {
+        const rid = opts.run_id orelse (runrecord.newId(alloc) catch blk: {
+            if (opts.log) |l| l("warning: cannot allocate run id — snapshots disabled");
+            shared.snapshot_ok = false;
+            break :blk "";
+        });
+        if (shared.snapshot_ok) {
+            const jobs = try alloc.alloc(runrecord.JobEntry, p.jobs.len);
+            for (p.jobs, 0..) |j, i| {
+                const step_entries = try alloc.alloc(runrecord.StepEntry, j.steps.len);
+                for (j.steps, 0..) |s, k| step_entries[k] = .{ .id = s.id };
+                jobs[i] = .{ .id = j.id, .steps = step_entries };
+            }
+            const kind = if (opts.exec_backend) |b| @tagName(b.kind) else "native";
+            record = .{
+                .run_id = rid,
+                .workflow = p.source_path,
+                .backend = kind,
+                .started_unix = std.time.timestamp(),
+                .jobs = jobs,
+            };
+            shared.record = &record;
+            shared.workspace_abs = opts.workspace_abs orelse (std.fs.cwd().realpathAlloc(alloc, ".") catch ".");
+            runrecord.write(alloc, opts.store_root, &record) catch {
+                if (opts.log) |l| l("warning: cannot write run record — snapshots disabled");
+                shared.snapshot_ok = false;
+            };
+        }
+    }
 
     while (completed < p.jobs.len) {
         var ready: std.ArrayList(usize) = .empty;
@@ -354,6 +477,7 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
                     const r = runJob(ta, pi, pi.jobs[ji], ji, o, sh, res, dn, mx) catch |e| {
                         out.* = .{ .job_index = ji, .display_name = pi.jobs[ji].display_name, .status = .failed, .steps = &.{} };
                         std.debug.print("internal error in job: {s}\n", .{@errorName(e)});
+                        syncRecordAfterJob(sh, o, ji, out.*);
                         return;
                     };
                     // Copy result out of the thread arena (which dies with this
@@ -371,6 +495,7 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
                         std.debug.print("failed to copy job result: {s}\n", .{@errorName(e)});
                         break :blk .{ .job_index = ji, .display_name = pi.jobs[ji].display_name, .status = .failed, .steps = &.{} };
                     };
+                    syncRecordAfterJob(sh, o, ji, out.*);
                 }
             };
             for (batch, 0..) |ji, bi| {
@@ -389,6 +514,53 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
         }
     }
     return .{ .jobs = results };
+}
+
+/// After a job finishes: fold its status + step statuses + the current
+/// job_outputs into the run record and rewrite it (tmp+rename inside
+/// runrecord.write). Called from worker threads; takes record_mutex.
+fn syncRecordAfterJob(sh: *Shared, opts: RunOptions, ji: usize, r: JobResult) void {
+    const rec = sh.record orelse return;
+    sh.record_mutex.lock();
+    defer sh.record_mutex.unlock();
+    if (!sh.snapshot_ok) return;
+    const je = &rec.jobs[ji];
+    je.status = @tagName(r.status);
+    for (r.steps, 0..) |s, k| {
+        if (k < je.steps.len) je.steps[k].status = @tagName(s.status);
+    }
+    // Refresh the flat job_outputs so a later --resume can rebuild the
+    // needs.* context without re-running completed jobs.
+    var pairs: std.ArrayList(ir.EnvPair) = .empty;
+    var it = sh.job_outputs.iterator();
+    while (it.next()) |e| pairs.append(sh.alloc, .{ .name = e.key_ptr.*, .value = e.value_ptr.* }) catch return;
+    rec.job_outputs = pairs.toOwnedSlice(sh.alloc) catch return;
+    runrecord.write(sh.alloc, opts.store_root, rec) catch {
+        if (opts.log) |l| l("warning: cannot write run record — snapshots disabled");
+        sh.snapshot_ok = false;
+    };
+}
+
+/// Pre-step snapshot: workspace tree + serialized expr env at the step
+/// boundary. Failures degrade to a warning + snapshots off for the rest of
+/// the run (the store is an accelerator, never a hard dependency).
+fn captureStep(alloc: std.mem.Allocator, opts: RunOptions, sh: *Shared, job: ir.Job, ji: usize, step: ir.Step, si: usize, env: *expr.Env) void {
+    sh.record_mutex.lock();
+    const ok = sh.snapshot_ok;
+    sh.record_mutex.unlock();
+    if (!ok) return;
+    const rec = sh.record.?;
+    const pairs = expr.envToPairs(alloc, env) catch return;
+    const cap = snap_manifest.capture(alloc, opts.store_root, sh.workspace_abs, rec.run_id, job.id, @intCast(si), step.id, pairs) catch {
+        logJob(opts, alloc, job, "warning: snapshot capture failed — snapshots disabled for this run");
+        sh.record_mutex.lock();
+        sh.snapshot_ok = false;
+        sh.record_mutex.unlock();
+        return;
+    };
+    sh.record_mutex.lock();
+    rec.jobs[ji].steps[si].snapshot = cap.rel_path;
+    sh.record_mutex.unlock();
 }
 
 fn copyResult(alloc: std.mem.Allocator, r: JobResult) !JobResult {
@@ -525,6 +697,8 @@ fn runJob(
             steps[si].status = .success;
             continue;
         }
+
+        if (opts.snapshot) captureStep(alloc, opts, shared, job, index, step, si, &env);
 
         if (step.kind == .uses) {
             // Interpolate each `with:` value against the step's expr Env — same
