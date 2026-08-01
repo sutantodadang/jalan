@@ -16,11 +16,24 @@ const snap_store = @import("snap/store.zig");
 const snap_restore = @import("snap/restore.zig");
 const runrecord = @import("snap/runrecord.zig");
 const cache = @import("cache.zig");
+const debug_mod = @import("debug.zig");
 
 fn parseFixture(a: std.mem.Allocator, src: []const u8) !ir.Pipeline {
     var diags = yaml.Diags.init(a);
     return gha.parseWorkflow(a, "t.yml", src, &diags);
 }
+
+const TestPromptScript = struct {
+    commands: []const debug_mod.PromptCmd,
+    index: usize = 0,
+
+    fn next(ctx: ?*anyopaque) debug_mod.PromptCmd {
+        const self: *TestPromptScript = @ptrCast(@alignCast(ctx.?));
+        if (self.index >= self.commands.len) return .continue_;
+        defer self.index += 1;
+        return self.commands[self.index];
+    }
+};
 
 test "jobs run in dependency order and outputs flow through needs" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -668,6 +681,52 @@ test "resume: unknown run id is ResumeInvalid" {
     }));
 }
 
+test "breakpoint: injected prompt can inspect, continue, skip, or abort" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: s
+        \\        run: echo breakpoint-ran
+        \\        shell: sh
+    );
+    const breakpoints = [_]debug_mod.Breakpoint{.{ .job_id = "j", .step = "s" }};
+
+    const inspect_commands = [_]debug_mod.PromptCmd{ .env, .workdir, .continue_ };
+    var inspect_script = TestPromptScript{ .commands = &inspect_commands };
+    const continued = try run(a, p, .{
+        .breakpoints = &breakpoints,
+        .prompt_fn = &TestPromptScript.next,
+        .prompt_ctx = &inspect_script,
+    });
+    try std.testing.expect(continued.ok());
+    try std.testing.expectEqual(StepStatus.success, continued.jobs[0].steps[0].status);
+
+    const skip_commands = [_]debug_mod.PromptCmd{.skip};
+    var skip_script = TestPromptScript{ .commands = &skip_commands };
+    const skipped = try run(a, p, .{
+        .breakpoints = &breakpoints,
+        .prompt_fn = &TestPromptScript.next,
+        .prompt_ctx = &skip_script,
+    });
+    try std.testing.expect(skipped.ok());
+    try std.testing.expectEqual(StepStatus.skipped, skipped.jobs[0].steps[0].status);
+
+    const abort_commands = [_]debug_mod.PromptCmd{.abort};
+    var abort_script = TestPromptScript{ .commands = &abort_commands };
+    const aborted = try run(a, p, .{
+        .breakpoints = &breakpoints,
+        .prompt_fn = &TestPromptScript.next,
+        .prompt_ctx = &abort_script,
+    });
+    try std.testing.expect(!aborted.ok());
+    try std.testing.expectEqual(StepStatus.failed, aborted.jobs[0].steps[0].status);
+    try std.testing.expectEqualStrings("aborted at breakpoint", aborted.jobs[0].steps[0].stderr);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -729,6 +788,11 @@ pub const RunOptions = struct {
     // Phase 3 time-travel: resume a recorded run at a step boundary.
     // Implies snapshot behavior (the resumed run keeps writing its record).
     resume_from: ?ResumePoint = null,
+    // Line-oriented debugger. prompt_fn/prompt_ctx make interaction injectable
+    // for tests; a real TTY falls back to debug.promptOnce.
+    breakpoints: []const debug_mod.Breakpoint = &.{},
+    prompt_fn: ?debug_mod.PromptFn = null,
+    prompt_ctx: ?*anyopaque = null,
 };
 
 pub const ResumePoint = struct {
@@ -764,6 +828,9 @@ const Shared = struct {
     // tree), loaded once in run() before any job starts.
     resume_manifest: ?snap_manifest.Manifest = null,
     resume_job: []const u8 = "",
+    // Only one worker may own stdin/the interactive prompt at a time.
+    prompt_mutex: std.Thread.Mutex = .{},
+    non_tty_break_warned: bool = false,
 };
 
 pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ OutOfMemory, InternalError, ResumeInvalid, RestoreFailed, StoreIo }!Report {
@@ -781,7 +848,7 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
     const max_par = @max(eff_opts.max_parallel, 1);
 
     // Phase 3: workspace walk root for snapshots and/or cache.
-    if (eff_opts.snapshot or eff_opts.cache) {
+    if (eff_opts.snapshot or eff_opts.cache or eff_opts.breakpoints.len > 0) {
         shared.workspace_abs = eff_opts.workspace_abs orelse (std.fs.cwd().realpathAlloc(alloc, ".") catch ".");
     }
 
@@ -1155,6 +1222,72 @@ fn needsFailed(p: ir.Pipeline, results: []JobResult, done: []bool, job: ir.Job) 
     return false;
 }
 
+const BreakAction = enum { continue_, skip, abort };
+
+fn hasBreakpoint(opts: RunOptions, job: ir.Job, step: ir.Step, index: usize) bool {
+    for (opts.breakpoints) |bp| {
+        if (debug_mod.matches(bp, job.id, step.id, index)) return true;
+    }
+    return false;
+}
+
+fn isSecretValue(opts: RunOptions, value: []const u8) bool {
+    for (opts.secrets) |secret| {
+        if (secret.value.len > 0 and std.mem.eql(u8, value, secret.value)) return true;
+    }
+    return false;
+}
+
+/// Own the global prompt until this breakpoint is resolved. Informational
+/// commands re-prompt; injected prompt functions bypass the TTY guard.
+fn handleBreakpoint(
+    alloc: std.mem.Allocator,
+    opts: RunOptions,
+    shared: *Shared,
+    job: ir.Job,
+    step: ir.Step,
+    env: *expr.Env,
+) BreakAction {
+    shared.prompt_mutex.lock();
+    defer shared.prompt_mutex.unlock();
+
+    if (opts.prompt_fn == null and !debug_mod.isTty()) {
+        if (!shared.non_tty_break_warned) {
+            logLine(opts, alloc, job, step, "warning: breakpoint ignored because stdin is not a TTY");
+            shared.non_tty_break_warned = true;
+        }
+        return .continue_;
+    }
+
+    logLine(opts, alloc, job, step, "breakpoint — (c)ontinue (s)kip (e)nv (w)orkdir (sh)ell (a)bort");
+    while (true) {
+        const cmd = if (opts.prompt_fn) |prompt| prompt(opts.prompt_ctx) else debug_mod.promptOnce(null);
+        switch (cmd) {
+            .continue_ => return .continue_,
+            .skip => return .skip,
+            .abort => return .abort,
+            .env => {
+                const pairs = expr.envToPairs(alloc, env) catch {
+                    logLine(opts, alloc, job, step, "warning: cannot format breakpoint environment");
+                    continue;
+                };
+                for (pairs) |pair| {
+                    const masked = std.mem.startsWith(u8, pair.name, "secrets.") or isSecretValue(opts, pair.value);
+                    const line = std.fmt.allocPrint(alloc, "env {s}={s}", .{ pair.name, if (masked) "***" else pair.value }) catch continue;
+                    logLine(opts, alloc, job, step, line);
+                }
+            },
+            .workdir => {
+                const wd = if (step.workdir) |raw| expr.interpolate(alloc, raw, env) catch raw else shared.workspace_abs;
+                const line = std.fmt.allocPrint(alloc, "workspace={s} workdir={s}", .{ shared.workspace_abs, wd }) catch continue;
+                logLine(opts, alloc, job, step, line);
+            },
+            .shell => logLine(opts, alloc, job, step, "drop-to-shell is not available yet on this backend"),
+            .retry, .invalid => logLine(opts, alloc, job, step, "invalid command; choose c, s, e, w, sh, or a"),
+        }
+    }
+}
+
 fn runJob(
     alloc: std.mem.Allocator,
     p: ir.Pipeline,
@@ -1285,6 +1418,16 @@ fn runJob(
             steps[si].status = .success;
             continue;
         }
+
+        if (hasBreakpoint(opts, job, step, si)) switch (handleBreakpoint(alloc, opts, shared, job, step, &env)) {
+            .continue_ => {},
+            .skip => continue,
+            .abort => {
+                steps[si] = .{ .name = step.name, .status = .failed, .exit_code = 1, .duration_ms = 0, .stdout = "", .stderr = "aborted at breakpoint" };
+                job_status = .failed;
+                break :step_loop;
+            },
+        };
 
         if (opts.snapshot) captureStep(alloc, opts, shared, job, index, step, si, &env, mutex);
 
