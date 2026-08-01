@@ -18,6 +18,7 @@ pub const snap_store = @import("snap/store.zig");
 pub const snap_manifest = @import("snap/manifest.zig");
 pub const snap_restore = @import("snap/restore.zig");
 pub const snap_runrecord = @import("snap/runrecord.zig");
+pub const cache = @import("cache.zig");
 
 test {
     _ = yaml;
@@ -39,5 +40,6 @@ test {
     _ = snap_manifest;
     _ = snap_restore;
     _ = snap_runrecord;
+    _ = cache;
     _ = @import("golden_test.zig");
 }
