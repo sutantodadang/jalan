@@ -626,6 +626,74 @@ test "docker backend runs a two-step job sharing filesystem (skips without daemo
     try std.testing.expect(std.mem.indexOf(u8, o2.stdout, "one") != null);
 }
 
+test "phase 3 docker snapshot cache and restore parity (skips without daemon)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const engine_mod = @import("../engine.zig");
+    const manifest_mod = @import("../snap/manifest.zig");
+    const restore_mod = @import("../snap/restore.zig");
+
+    const cl = client.Client{ .socket_path = client.detectSocket(a, .{}).? };
+    if (!client.ping(a, cl)) return error.SkipZigTest;
+    var db = DockerBackend{ .client = cl, .cfg = .{ .image_map = @constCast(&[_]config.ImagePair{.{ .runs_on = "ubuntu-latest", .image = "busybox:latest" }}) } };
+    const b = db.backend();
+
+    const base = ".jalan/tmp/phase3-docker";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const workspace = try std.fmt.allocPrint(a, "{s}/workspace", .{base});
+    try std.fs.cwd().makePath(workspace);
+    const workspace_abs = try std.fs.cwd().realpathAlloc(a, workspace);
+    const store_root = try std.fmt.allocPrint(a, "{s}/store", .{base});
+
+    var steps = [_]ir.Step{
+        .{ .id = "write", .name = "write", .kind = .run, .shell = "sh", .script = "echo executed > marker.txt; echo 'value=ok' >> \"$GITHUB_OUTPUT\"" },
+        .{ .id = "consume", .name = "consume", .kind = .run, .shell = "sh", .script = "echo '${{ steps.write.outputs.value }}' > seen.txt" },
+    };
+    var jobs = [_]ir.Job{.{ .id = "j", .display_name = "j", .runs_on = "ubuntu-latest", .steps = &steps }};
+    const pipeline = ir.Pipeline{ .name = "phase3-docker", .source_path = "testdata/workflows/phase3-docker.yml", .jobs = &jobs };
+
+    const first = try engine_mod.run(a, pipeline, .{
+        .exec_backend = b,
+        .snapshot = true,
+        .cache = true,
+        .store_root = store_root,
+        .workspace_abs = workspace_abs,
+        .run_id = "docker-phase3-1",
+        .max_parallel = 1,
+    });
+    try std.testing.expect(first.ok());
+    try std.testing.expectEqualStrings("ok\n", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/seen.txt", .{workspace}), 1 << 20));
+
+    // Restore the pre-first-step snapshot: both files disappear on the host,
+    // and therefore from the next container's bind-mounted workspace.
+    const manifest = try manifest_mod.load(a, store_root, "snapshots/docker-phase3-1/j/000-write.json");
+    try restore_mod.restore(a, store_root, workspace_abs, manifest, null);
+
+    const Capture = struct {
+        var hits: std.atomic.Value(usize) = .init(0);
+        fn log(line: []const u8) void {
+            if (std.mem.indexOf(u8, line, "(cached)") != null) _ = hits.fetchAdd(1, .monotonic);
+        }
+    };
+    Capture.hits.store(0, .release);
+    const second = try engine_mod.run(a, pipeline, .{
+        .exec_backend = b,
+        .snapshot = true,
+        .cache = true,
+        .store_root = store_root,
+        .workspace_abs = workspace_abs,
+        .run_id = "docker-phase3-2",
+        .max_parallel = 1,
+        .log = Capture.log,
+    });
+    try std.testing.expect(second.ok());
+    try std.testing.expectEqual(@as(usize, 2), Capture.hits.load(.acquire));
+    try std.testing.expectEqualStrings("executed\n", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/marker.txt", .{workspace}), 1 << 20));
+    try std.testing.expectEqualStrings("ok\n", try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/seen.txt", .{workspace}), 1 << 20));
+}
+
 test "docker backend service is reachable by DNS alias on the job network (skips without daemon)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
