@@ -1787,7 +1787,7 @@ fn materializeEntry(alloc: std.mem.Allocator, root: []const u8, workspace: []con
             },
         };
         if (@import("builtin").os.tag != .windows) {
-            var dir = try parent.dir.openDir(parent.basename, .{});
+            var dir = try parent.dir.openDir(parent.basename, .{ .iterate = true });
             defer dir.close();
             dir.chmod(@intCast(w.mode)) catch {};
         }
