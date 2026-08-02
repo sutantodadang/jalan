@@ -358,7 +358,10 @@ fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: 
         }
     }
 
-    const container_env = try formatEnvPairs(alloc, job.env, &.{ "CI=true", "GITHUB_ACTIONS=true", "JALAN=true" });
+    const container_env = if (job.provider == .gitlab)
+        try formatEnvPairs(alloc, job.env, &.{ "CI=true", "JALAN=true" })
+    else
+        try formatEnvPairs(alloc, job.env, &.{ "CI=true", "GITHUB_ACTIONS=true", "JALAN=true" });
     const job_network: ?[]const u8 = if (network_id.len > 0) network_id else null;
     const spec = try buildContainerCreateSpec(alloc, image, &.{ "sleep", "infinity" }, container_env, workspace_abs, job_network, &.{});
     const id = client.containerCreate(alloc, self.client, spec, null, &err) catch |e| {
