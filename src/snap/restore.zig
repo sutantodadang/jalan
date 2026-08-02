@@ -157,7 +157,7 @@ pub fn restore(
             },
         };
         if (builtin.os.tag != .windows) {
-            if (parent.dir.openDir(parent.basename, .{})) |opened| {
+            if (parent.dir.openDir(parent.basename, .{ .iterate = true })) |opened| {
                 var restored = opened;
                 defer restored.close();
                 restored.chmod(@intCast(f.mode)) catch {};

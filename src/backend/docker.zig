@@ -753,6 +753,7 @@ test "docker backend service is reachable by DNS alias on the job network (skips
     var em: ?[]const u8 = null;
     const s = ir.Step{ .id = "dns", .name = "dns", .kind = .run, .shell = "sh", .script = "getent hosts redis || nslookup redis" };
     const o = try b.runStep(a, &h, s, &.{}, null, &em);
+    if (o.exit_code != 0) std.debug.print("dns probe failed: stdout={s} stderr={s} error={s}\n", .{ o.stdout, o.stderr, em orelse "" });
     try std.testing.expectEqual(@as(i32, 0), o.exit_code);
 }
 
