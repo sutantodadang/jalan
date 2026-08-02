@@ -22,6 +22,7 @@ pub const snap_restore = @import("snap/restore.zig");
 pub const snap_runrecord = @import("snap/runrecord.zig");
 pub const cache = @import("cache.zig");
 pub const debug = @import("debug.zig");
+pub const tui = @import("tui.zig");
 
 test {
     _ = yaml;
@@ -47,5 +48,6 @@ test {
     _ = snap_runrecord;
     _ = cache;
     _ = debug;
+    _ = tui;
     _ = @import("golden_test.zig");
 }

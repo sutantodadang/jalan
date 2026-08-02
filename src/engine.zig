@@ -28,9 +28,27 @@ fn parseFixture(a: std.mem.Allocator, src: []const u8) !ir.Pipeline {
 const TestPromptScript = struct {
     commands: []const debug_mod.PromptCmd,
     index: usize = 0,
+    saw_state: bool = false,
+    saw_masked_secret: bool = false,
+    saw_env_foo: bool = false,
+    last_kind: ?debug_mod.PromptKind = null,
+    last_job_index: usize = 0,
+    last_job_id: []const u8 = "",
+    last_step_id: []const u8 = "",
+    last_step_index: usize = 0,
 
-    fn next(ctx: ?*anyopaque) debug_mod.PromptCmd {
+    fn next(ctx: ?*anyopaque, state: debug_mod.PromptState) debug_mod.PromptCmd {
         const self: *TestPromptScript = @ptrCast(@alignCast(ctx.?));
+        self.saw_state = true;
+        self.last_kind = state.kind;
+        self.last_job_index = state.job_index;
+        self.last_job_id = state.job_id;
+        self.last_step_id = state.step_id;
+        self.last_step_index = state.step_index;
+        for (state.effective_env) |pair| {
+            if (std.mem.eql(u8, pair.value, "***")) self.saw_masked_secret = true;
+            if (std.mem.eql(u8, pair.name, "env.FOO") and std.mem.eql(u8, pair.value, "bar")) self.saw_env_foo = true;
+        }
         if (self.index >= self.commands.len) return .continue_;
         defer self.index += 1;
         return self.commands[self.index];
@@ -909,6 +927,46 @@ test "breakpoint: injected prompt can inspect, continue, skip, or abort" {
     try std.testing.expectEqualStrings("aborted at breakpoint", aborted.jobs[0].steps[0].stderr);
 }
 
+test "debug_all_steps prompts with resolved masked state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: s
+        \\        name: inspect
+        \\        run: echo ok
+    );
+    const secrets = [_]ir.EnvPair{.{ .name = "TOKEN", .value = "hidden" }};
+    const commands = [_]debug_mod.PromptCmd{.continue_};
+    var script = TestPromptScript{ .commands = &commands };
+    const report = try run(a, p, .{
+        .debug_all_steps = true,
+        .secrets = &secrets,
+        .prompt_fn = &TestPromptScript.next,
+        .prompt_ctx = &script,
+    });
+    try std.testing.expect(report.ok());
+    try std.testing.expect(script.saw_state);
+    try std.testing.expectEqual(debug_mod.PromptKind.breakpoint, script.last_kind.?);
+    try std.testing.expectEqualStrings("j", script.last_job_id);
+    try std.testing.expectEqualStrings("s", script.last_step_id);
+    try std.testing.expectEqual(@as(usize, 0), script.last_step_index);
+    try std.testing.expect(script.saw_masked_secret);
+}
+
+test "prompt state masks a secret-derived workdir" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const secrets = [_]ir.EnvPair{.{ .name = "TOKEN", .value = "hidden" }};
+    const job = ir.Job{ .id = "j", .display_name = "job", .steps = &.{} };
+    const step = ir.Step{ .id = "s", .name = "step", .kind = .run, .script = "true" };
+    const state = try makePromptState(arena.allocator(), .{ .secrets = &secrets }, .breakpoint, "workspace", 0, job, step, 0, &.{}, "workspace/hidden");
+    try std.testing.expectEqualStrings("***", state.workdir.?);
+}
+
 test "on-failure stop skips jobs that have not started" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -979,16 +1037,25 @@ test "on-failure shell dispatches through backend and retries once" {
         \\      - run: echo "${{ needs.j.outputs.stale }}"
     );
     const commands = [_]debug_mod.PromptCmd{.retry};
+    const extra_env = [_]ir.EnvPair{.{ .name = "FOO", .value = "bar" }};
     var script = TestPromptScript{ .commands = &commands };
     const report = try run(a, p, .{
         .exec_backend = fake_backend,
         .on_failure = .shell,
+        .extra_env = &extra_env,
         .prompt_fn = &TestPromptScript.next,
         .prompt_ctx = &script,
     });
     try std.testing.expect(report.ok());
     try std.testing.expectEqual(@as(usize, 3), fake.runs);
     try std.testing.expectEqual(@as(usize, 1), fake.shells);
+    try std.testing.expect(script.saw_state);
+    try std.testing.expectEqual(debug_mod.PromptKind.failure, script.last_kind.?);
+    try std.testing.expectEqual(@as(usize, 0), script.last_job_index);
+    try std.testing.expectEqualStrings("j", script.last_job_id);
+    try std.testing.expectEqualStrings("flaky", script.last_step_id);
+    try std.testing.expectEqual(@as(usize, 0), script.last_step_index);
+    try std.testing.expect(script.saw_env_foo);
     try std.testing.expectEqualStrings("retried", report.jobs[0].steps[0].stdout);
     try std.testing.expect(!fake.saw_stale_retry_output);
 }
@@ -1057,6 +1124,7 @@ pub const RunOptions = struct {
     // Line-oriented debugger. prompt_fn/prompt_ctx make interaction injectable
     // for tests; a real TTY falls back to debug.promptOnce.
     breakpoints: []const debug_mod.Breakpoint = &.{},
+    debug_all_steps: bool = false,
     prompt_fn: ?debug_mod.PromptFn = null,
     prompt_ctx: ?*anyopaque = null,
     on_failure: OnFailure = .continue_,
@@ -1254,7 +1322,7 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
     }
 
     // Phase 3: workspace walk root for snapshots and/or cache.
-    if (eff_opts.snapshot or eff_opts.cache or eff_opts.breakpoints.len > 0 or eff_opts.workspace_abs != null) {
+    if (eff_opts.snapshot or eff_opts.cache or eff_opts.breakpoints.len > 0 or eff_opts.debug_all_steps or eff_opts.workspace_abs != null) {
         shared.workspace_abs = eff_opts.workspace_abs orelse (std.fs.cwd().realpathAlloc(alloc, ".") catch ".");
     }
 
@@ -1869,14 +1937,57 @@ fn isSecretValue(opts: RunOptions, value: []const u8) bool {
     return false;
 }
 
+fn makePromptState(
+    alloc: std.mem.Allocator,
+    opts: RunOptions,
+    kind: debug_mod.PromptKind,
+    workspace: []const u8,
+    job_index: usize,
+    job: ir.Job,
+    step: ir.Step,
+    step_index: usize,
+    env: []const ir.EnvPair,
+    workdir: ?[]const u8,
+) !debug_mod.PromptState {
+    var effective: std.ArrayList(ir.EnvPair) = .empty;
+    for (env) |pair| {
+        const value = if (std.mem.startsWith(u8, pair.name, "secrets.") or isSecretValue(opts, pair.value)) "***" else pair.value;
+        try effective.append(alloc, .{ .name = pair.name, .value = value });
+    }
+    return .{
+        .kind = kind,
+        .job_index = job_index,
+        .job_id = job.id,
+        .job_name = job.display_name,
+        .step_id = step.id,
+        .step_name = step.name,
+        .step_index = step_index,
+        .workspace = workspace,
+        .workdir = if (workdir) |value| if (isSecretValue(opts, value)) "***" else value else null,
+        .effective_env = effective.items,
+    };
+}
+
+fn putPromptEnv(alloc: std.mem.Allocator, pairs: *std.ArrayList(ir.EnvPair), pair: ir.EnvPair) !void {
+    const name = try std.fmt.allocPrint(alloc, "env.{s}", .{pair.name});
+    for (pairs.items) |*existing| {
+        if (!std.mem.eql(u8, existing.name, name)) continue;
+        existing.value = pair.value;
+        return;
+    }
+    try pairs.append(alloc, .{ .name = name, .value = pair.value });
+}
+
 /// Own the global prompt until this breakpoint is resolved. Informational
 /// commands re-prompt; injected prompt functions bypass the TTY guard.
 fn handleBreakpoint(
     alloc: std.mem.Allocator,
     opts: RunOptions,
     shared: *Shared,
+    job_index: usize,
     job: ir.Job,
     step: ir.Step,
+    step_index: usize,
     env: *expr.Env,
     backend: backend_mod.Backend,
     handle: *backend_mod.JobHandle,
@@ -1893,9 +2004,22 @@ fn handleBreakpoint(
         return .continue_;
     }
 
+    var state_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer state_arena.deinit();
+    const state_alloc = state_arena.allocator();
+    const prompt_workdir = if (step.workdir) |raw| expr.interpolate(state_alloc, raw, env) catch raw else shared.workspace_abs;
+    const prompt_pairs = expr.envToPairs(state_alloc, env) catch base_env;
+    var prompt_env: std.ArrayList(ir.EnvPair) = .empty;
+    prompt_env.appendSlice(state_alloc, prompt_pairs) catch return .continue_;
+    for (step.env) |pair| {
+        const value = expr.interpolate(state_alloc, pair.value, env) catch pair.value;
+        putPromptEnv(state_alloc, &prompt_env, .{ .name = pair.name, .value = value }) catch return .continue_;
+    }
+    const state = makePromptState(state_alloc, opts, .breakpoint, shared.workspace_abs, job_index, job, step, step_index, prompt_env.items, prompt_workdir) catch return .continue_;
+
     logLine(opts, alloc, job, step, "breakpoint — (c)ontinue (s)kip (e)nv (w)orkdir (sh)ell (a)bort");
     while (true) {
-        const cmd = if (opts.prompt_fn) |prompt| prompt(opts.prompt_ctx) else debug_mod.promptOnce(null);
+        const cmd = if (opts.prompt_fn) |prompt| prompt(opts.prompt_ctx, state) else debug_mod.promptOnce(null, state);
         switch (cmd) {
             .continue_ => return .continue_,
             .skip => return .skip,
@@ -1913,7 +2037,7 @@ fn handleBreakpoint(
             },
             .workdir => {
                 const wd = if (step.workdir) |raw| expr.interpolate(alloc, raw, env) catch raw else shared.workspace_abs;
-                const line = std.fmt.allocPrint(alloc, "workspace={s} workdir={s}", .{ shared.workspace_abs, wd }) catch continue;
+                const line = std.fmt.allocPrint(alloc, "workspace={s} workdir={s}", .{ shared.workspace_abs, if (isSecretValue(opts, wd)) "***" else wd }) catch continue;
                 logLine(opts, alloc, job, step, line);
             },
             .shell => {
@@ -1944,10 +2068,12 @@ fn handleStepFailure(
     alloc: std.mem.Allocator,
     opts: RunOptions,
     shared: *Shared,
+    job_index: usize,
     backend: backend_mod.Backend,
     handle: *backend_mod.JobHandle,
     job: ir.Job,
     step: ir.Step,
+    step_index: usize,
     workdir: ?[]const u8,
     env: []const ir.EnvPair,
 ) FailureAction {
@@ -1973,8 +2099,14 @@ fn handleStepFailure(
     };
     if (!opened) logLine(opts, alloc, job, step, "drop-to-shell not supported on this backend");
     logLine(opts, alloc, job, step, "failure shell exited — (c)ontinue (r)etry (a)bort");
+    var state_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer state_arena.deinit();
+    const state_alloc = state_arena.allocator();
+    var prompt_env: std.ArrayList(ir.EnvPair) = .empty;
+    for (env) |pair| putPromptEnv(state_alloc, &prompt_env, pair) catch return .continue_;
+    const state = makePromptState(state_alloc, opts, .failure, shared.workspace_abs, job_index, job, step, step_index, prompt_env.items, workdir) catch return .continue_;
     while (true) {
-        const cmd = if (opts.prompt_fn) |prompt| prompt(opts.prompt_ctx) else debug_mod.promptOnce(null);
+        const cmd = if (opts.prompt_fn) |prompt| prompt(opts.prompt_ctx, state) else debug_mod.promptOnce(null, state);
         switch (cmd) {
             .continue_ => return .continue_,
             .retry => return .retry,
@@ -2128,7 +2260,7 @@ fn runJob(
         if (lock_workspace) shared.workspace_mutex.lock();
         defer if (lock_workspace) shared.workspace_mutex.unlock();
 
-        if (hasBreakpoint(opts, job, step, si)) switch (handleBreakpoint(alloc, opts, shared, job, step, &env, b, &handle, merged_env.items)) {
+        if (opts.debug_all_steps or hasBreakpoint(opts, job, step, si)) switch (handleBreakpoint(alloc, opts, shared, index, job, step, si, &env, b, &handle, merged_env.items)) {
             .continue_ => {},
             .skip => continue,
             .abort => {
@@ -2210,7 +2342,7 @@ fn runJob(
                     steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
                     if (!step.continue_on_error) {
                         const action = if (attempt == 0 or opts.on_failure == .stop)
-                            handleStepFailure(alloc, opts, shared, b, &handle, job, step, null, step_env.items)
+                            handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, null, step_env.items)
                         else
                             FailureAction.continue_;
                         if (action == .retry and attempt == 0) {
@@ -2231,7 +2363,7 @@ fn runJob(
                     break :uses_attempt;
                 }
                 const action = if (attempt == 0 or opts.on_failure == .stop)
-                    handleStepFailure(alloc, opts, shared, b, &handle, job, step, null, step_env.items)
+                    handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, null, step_env.items)
                 else
                     FailureAction.continue_;
                 if (action == .retry and attempt == 0) {
@@ -2298,7 +2430,7 @@ fn runJob(
                 steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
                 if (!step.continue_on_error) {
                     const action = if (attempt == 0 or opts.on_failure == .stop)
-                        handleStepFailure(alloc, opts, shared, b, &handle, job, step, workdir, spawn_env.items)
+                        handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, workdir, spawn_env.items)
                     else
                         FailureAction.continue_;
                     if (action == .retry and attempt == 0) {
@@ -2319,7 +2451,7 @@ fn runJob(
                 break :run_attempt;
             }
             const action = if (attempt == 0 or opts.on_failure == .stop)
-                handleStepFailure(alloc, opts, shared, b, &handle, job, step, workdir, spawn_env.items)
+                handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, workdir, spawn_env.items)
             else
                 FailureAction.continue_;
             if (action == .retry and attempt == 0) {
