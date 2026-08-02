@@ -272,7 +272,7 @@ const NixSetupMatch = struct { short_name: []const u8, package: []const u8 };
 fn nixSetupMatch(uses_ref: []const u8) ?NixSetupMatch {
     const at = std.mem.indexOfScalar(u8, uses_ref, '@') orelse uses_ref.len;
     const path = uses_ref[0..at];
-    if (std.mem.eql(u8, path, "actions/setup-node")) return .{ .short_name = "setup-node", .package = "nodejs_20" };
+    if (std.mem.eql(u8, path, "actions/setup-node")) return .{ .short_name = "setup-node", .package = "nodejs_22" };
     if (std.mem.eql(u8, path, "actions/setup-python")) return .{ .short_name = "setup-python", .package = "python3" };
     if (std.mem.eql(u8, path, "actions/setup-go")) return .{ .short_name = "setup-go", .package = "go" };
     return null;
@@ -930,9 +930,9 @@ test "setup-node is intercepted on the nix backend without needing nix installed
     const out = try runUses(a, step, &.{}, &.{}, b, &h, &env, Capture.log, false, &em);
     try std.testing.expectEqual(@as(i32, 0), out.exit_code);
     try std.testing.expect(Capture.msg != null);
-    try std.testing.expectEqualStrings("setup-node: added nix package 'nodejs_20' for subsequent steps", Capture.msg.?);
+    try std.testing.expectEqualStrings("setup-node: added nix package 'nodejs_22' for subsequent steps", Capture.msg.?);
     try std.testing.expectEqual(@as(usize, 1), h.nix_packages.len);
-    try std.testing.expectEqualStrings("nodejs_20", h.nix_packages[0]);
+    try std.testing.expectEqualStrings("nodejs_22", h.nix_packages[0]);
 }
 
 test "setup-python on nix actually appends to handle.nix_packages, no duplicate on repeat" {

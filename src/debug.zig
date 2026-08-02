@@ -11,6 +11,23 @@ pub const Breakpoint = struct {
     step: []const u8,
 };
 
+pub const PromptKind = enum { breakpoint, failure };
+
+/// Snapshot supplied to injected/UI prompts. Slices remain valid for the
+/// duration of the callback; values in `effective_env` are already masked.
+pub const PromptState = struct {
+    kind: PromptKind,
+    job_index: usize,
+    job_id: []const u8,
+    job_name: []const u8,
+    step_id: []const u8,
+    step_name: []const u8,
+    step_index: usize,
+    workspace: []const u8,
+    workdir: ?[]const u8,
+    effective_env: []const ir.EnvPair,
+};
+
 pub fn matches(bp: Breakpoint, job_id: []const u8, step_id: []const u8, index: usize) bool {
     if (!std.mem.eql(u8, bp.job_id, job_id)) return false;
     if (std.mem.eql(u8, bp.step, step_id)) return true;
@@ -45,11 +62,11 @@ pub fn isTty() bool {
     return std.fs.File.stdin().isTty();
 }
 
-pub const PromptFn = *const fn (ctx: ?*anyopaque) PromptCmd;
+pub const PromptFn = *const fn (ctx: ?*anyopaque, state: PromptState) PromptCmd;
 
 /// Read one command from stdin. EOF/read errors are treated as continue so a
 /// disappearing terminal cannot wedge an otherwise non-interactive run.
-pub fn promptOnce(_: ?*anyopaque) PromptCmd {
+pub fn promptOnce(_: ?*anyopaque, _: PromptState) PromptCmd {
     var buf: [256]u8 = undefined;
     const line = std.fs.File.stdin().deprecatedReader().readUntilDelimiterOrEof(&buf, '\n') catch return .continue_;
     return parseCmd(line orelse return .continue_);

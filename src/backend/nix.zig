@@ -8,10 +8,10 @@ const config = @import("../config.zig");
 const backend_iface = @import("../backend.zig");
 
 /// Packages used when `Config.nix_packages` is empty. `bash` + `coreutils`
-/// cover the shell/script step this backend runs; `nodejs_20` mirrors the
+/// cover the shell/script step this backend runs; `nodejs_22` mirrors the
 /// docker backend's default image so `uses:` actions relying on Node work
 /// out of the box.
-pub const default_packages = [_][]const u8{ "bash", "coreutils", "nodejs_20" };
+pub const default_packages = [_][]const u8{ "bash", "coreutils", "nodejs_22" };
 
 /// Spawns `nix --version`; exit 0 means nix is on PATH and usable. Any spawn
 /// error (nix missing, PATH issue, etc.) is treated as unavailable. Callers
@@ -285,11 +285,11 @@ test "buildArgv: explicit packages produce exact argv" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const argv = try buildArgv(a, &.{ "nodejs_20", "git" }, &.{ "echo", "hi" });
+    const argv = try buildArgv(a, &.{ "nodejs_22", "git" }, &.{ "echo", "hi" });
     try std.testing.expectEqual(@as(usize, 7), argv.len);
     try std.testing.expectEqualStrings("nix", argv[0]);
     try std.testing.expectEqualStrings("shell", argv[1]);
-    try std.testing.expectEqualStrings("nixpkgs#nodejs_20", argv[2]);
+    try std.testing.expectEqualStrings("nixpkgs#nodejs_22", argv[2]);
     try std.testing.expectEqualStrings("nixpkgs#git", argv[3]);
     try std.testing.expectEqualStrings("--command", argv[4]);
     try std.testing.expectEqualStrings("echo", argv[5]);
@@ -304,7 +304,7 @@ test "buildArgv: empty packages fall back to default_packages" {
     try std.testing.expectEqual(@as(usize, 2 + default_packages.len + 1 + 3), argv.len);
     try std.testing.expectEqualStrings("nixpkgs#bash", argv[2]);
     try std.testing.expectEqualStrings("nixpkgs#coreutils", argv[3]);
-    try std.testing.expectEqualStrings("nixpkgs#nodejs_20", argv[4]);
+    try std.testing.expectEqualStrings("nixpkgs#nodejs_22", argv[4]);
     try std.testing.expectEqualStrings("--command", argv[5]);
 }
 

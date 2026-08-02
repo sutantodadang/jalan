@@ -12,6 +12,7 @@ const nix_backend = @import("backend/nix.zig");
 const client = @import("docker/client.zig");
 const runrecord = @import("snap/runrecord.zig");
 const debug_mod = @import("debug.zig");
+const tui = @import("tui.zig");
 
 pub const Provider = enum { gha, unknown };
 
@@ -136,6 +137,7 @@ pub const RunArgs = struct {
     on_failure: []const u8 = "continue",
     resume_run: ?[]const u8 = null,
     resume_at: ?[]const u8 = null,
+    tui: bool = false,
 };
 
 test "parse run args" {
@@ -596,6 +598,18 @@ pub fn main(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
         };
         return runMain(alloc, ra);
     }
+    if (std.mem.eql(u8, cmd, "debug")) {
+        if (!tui.isInteractive()) {
+            _ = try print("error: 'jalan debug' requires an interactive stdin and stdout; use 'jalan run' or 'jalan runs' instead\n");
+            return 2;
+        }
+        var ra = parseRunArgs(alloc, args[1..]) catch {
+            _ = try print("error: bad arguments (see 'jalan help')\n");
+            return 2;
+        };
+        ra.tui = true;
+        return runMain(alloc, ra);
+    }
     _ = try print("error: unknown command\n");
     return 2;
 }
@@ -628,6 +642,7 @@ fn help() !u8 {
         \\            [--snapshot|--no-snapshot] [--cache|--no-cache]
         \\            [--break <job/step>]... [--on-failure shell|stop|continue]
         \\            [--resume <run-id> --at <job/step>]
+        \\  jalan debug [file] [same options as jalan run]
         \\  jalan runs [--json]
         \\  jalan version
         \\  jalan help
@@ -697,6 +712,8 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         },
         error.OutOfMemory => return error.OutOfMemory,
     };
+    var tui_session = tui.Session.init(alloc, pipeline);
+    defer tui_session.deinit();
     {
         var out: std.ArrayList(u8) = .empty;
         try printDiags(alloc, path, &diags, &out);
@@ -761,9 +778,11 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         .cache = cache_enabled,
         .workspace_abs = workspace_abs,
         .breakpoints = breakpoints.items,
+        .debug_all_steps = ra.tui,
         .on_failure = onFailureMode(ra.on_failure),
         .resume_from = resume_point,
-        .prompt_fn = if (debug_mod.isTty()) debug_mod.promptOnce else null,
+        .prompt_fn = if (ra.tui) tui.Session.prompt else if (debug_mod.isTty()) debug_mod.promptOnce else null,
+        .prompt_ctx = if (ra.tui) &tui_session else null,
     }) catch |e| switch (e) {
         error.ResumeInvalid => {
             if (ra.resume_run) |run_id| try printResumeInvalid(alloc, run_id) else _ = try print("error: invalid resume target\n");
@@ -796,6 +815,8 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
             return 2;
         }
     }
+
+    if (ra.tui) return tui_session.finish(report);
 
     const use_color = colorsEnabled(alloc, ra);
     var out: std.ArrayList(u8) = .empty;
