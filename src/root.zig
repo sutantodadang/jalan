@@ -3,6 +3,7 @@ pub const yaml = @import("yaml.zig");
 pub const ir = @import("ir.zig");
 pub const expr = @import("expr.zig");
 pub const gha = @import("frontend/gha.zig");
+pub const gitlab = @import("frontend/gitlab.zig");
 pub const native = @import("backend/native.zig");
 pub const backend = @import("backend.zig");
 pub const engine = @import("engine.zig");
@@ -29,6 +30,7 @@ test {
     _ = ir;
     _ = expr;
     _ = gha;
+    _ = gitlab;
     _ = native;
     _ = backend;
     _ = engine;

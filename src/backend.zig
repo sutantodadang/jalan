@@ -20,6 +20,7 @@ pub const JobHandle = struct {
     /// Immutable execution identity prepared by backends whose runtime is
     /// resolved during setup (for example Docker image IDs).
     cache_identity: []const u8 = "",
+    provider: ir.Provider = .github_actions,
     /// Extra nix packages this job needs on top of `NixBackend.cfg`'s own
     /// (`Config.nix_packages`/`default_packages`) — populated by `runUses`'s
     /// `setup-node`/`setup-python`/`setup-go` interception on the nix
@@ -129,11 +130,11 @@ pub fn native() Backend {
     return .{ .ctx = @ptrCast(&native_ctx), .vtable = &native_vtable, .kind = .native };
 }
 
-fn nativeSetup(_: *anyopaque, _: std.mem.Allocator, _: ir.Job, workspace_abs: []const u8, _: ?LogFn) anyerror!JobHandle {
-    return .{ .workspace = workspace_abs };
+fn nativeSetup(_: *anyopaque, _: std.mem.Allocator, job: ir.Job, workspace_abs: []const u8, _: ?LogFn) anyerror!JobHandle {
+    return .{ .workspace = workspace_abs, .provider = job.provider };
 }
-fn nativeRun(_: *anyopaque, alloc: std.mem.Allocator, _: *JobHandle, step: ir.Step, env: []const ir.EnvPair, workdir: ?[]const u8, err_msg: *?[]const u8) anyerror!StepOutcome {
-    return native_impl.runStep(alloc, step, env, workdir, err_msg);
+fn nativeRun(_: *anyopaque, alloc: std.mem.Allocator, handle: *JobHandle, step: ir.Step, env: []const ir.EnvPair, workdir: ?[]const u8, err_msg: *?[]const u8) anyerror!StepOutcome {
+    return native_impl.runStepForProvider(alloc, handle.provider, step, env, workdir, err_msg);
 }
 fn nativeTeardown(_: *anyopaque, _: std.mem.Allocator, _: *JobHandle) void {}
 fn nativeOpenShell(_: *anyopaque, alloc: std.mem.Allocator, _: *JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) anyerror!void {

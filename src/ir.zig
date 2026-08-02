@@ -34,6 +34,8 @@ pub const Service = struct {
     env: []EnvPair = &.{},
 };
 
+pub const Provider = enum { github_actions, gitlab };
+
 pub const Job = struct {
     id: []const u8,
     display_name: []const u8,
@@ -45,6 +47,7 @@ pub const Job = struct {
     src_line: u32 = 0,
     container_image: []const u8 = "",
     services: []Service = &.{},
+    provider: Provider = .github_actions,
 };
 
 pub const Pipeline = struct {
