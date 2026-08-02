@@ -94,6 +94,17 @@ pub fn runStep(
     workdir: ?[]const u8,
     err_msg: *?[]const u8,
 ) RunError!StepOutcome {
+    return runStepForProvider(alloc, .github_actions, step, env, workdir, err_msg);
+}
+
+pub fn runStepForProvider(
+    alloc: std.mem.Allocator,
+    provider: ir.Provider,
+    step: ir.Step,
+    env: []const ir.EnvPair,
+    workdir: ?[]const u8,
+    err_msg: *?[]const u8,
+) RunError!StepOutcome {
     const shell = if (step.shell) |name|
         shellTable(name) orelse {
             err_msg.* = std.fmt.allocPrint(alloc, "unknown shell '{s}'", .{name}) catch null;
@@ -122,7 +133,10 @@ pub fn runStep(
     var env_map = std.process.getEnvMap(alloc) catch return error.OutOfMemory;
     for (env) |p| env_map.put(p.name, p.value) catch return error.OutOfMemory;
     env_map.put("CI", "true") catch return error.OutOfMemory;
-    env_map.put("GITHUB_ACTIONS", "true") catch return error.OutOfMemory;
+    if (provider == .github_actions)
+        env_map.put("GITHUB_ACTIONS", "true") catch return error.OutOfMemory
+    else
+        _ = env_map.remove("GITHUB_ACTIONS");
     env_map.put("JALAN", "true") catch return error.OutOfMemory;
     const abs_output = std.fs.cwd().realpathAlloc(alloc, output_path) catch |e| {
         err_msg.* = std.fmt.allocPrint(
@@ -239,6 +253,32 @@ test "step outputs parsed from GITHUB_OUTPUT" {
     const out = try runStep(a, step, &.{}, null, &err_msg);
     try std.testing.expectEqualStrings("ver", out.outputs[0].name);
     try std.testing.expectEqualStrings("1.2", std.mem.trim(u8, out.outputs[0].value, " "));
+}
+
+test "GitLab steps do not receive the GitHub Actions marker" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script = if (builtin.os.tag == .windows)
+        "if defined GITHUB_ACTIONS exit /b 5\nif not \"%GITLAB_CI%\"==\"true\" exit /b 6"
+    else
+        "test \"$GITLAB_CI\" = true && test -z \"$GITHUB_ACTIONS\"";
+    const shell: ?[]const u8 = if (builtin.os.tag == .windows) "cmd" else null;
+    const step = ir.Step{ .id = "s", .name = "s", .kind = .run, .script = script, .shell = shell };
+    var err_msg: ?[]const u8 = null;
+    const out = try runStepForProvider(a, .gitlab, step, &.{
+        .{ .name = "GITLAB_CI", .value = "true" },
+        .{ .name = "GITHUB_ACTIONS", .value = "true" },
+    }, null, &err_msg);
+    try std.testing.expectEqual(@as(i32, 0), out.exit_code);
+
+    const gha_script = if (builtin.os.tag == .windows)
+        "if not defined GITHUB_ACTIONS exit /b 5"
+    else
+        "test \"$GITHUB_ACTIONS\" = true";
+    const gha_step = ir.Step{ .id = "s", .name = "s", .kind = .run, .script = gha_script, .shell = shell };
+    const gha_out = try runStep(a, gha_step, &.{.{ .name = "GITLAB_CI", .value = "true" }}, null, &err_msg);
+    try std.testing.expectEqual(@as(i32, 0), gha_out.exit_code);
 }
 
 test "step with workdir set resolves script and output paths correctly" {

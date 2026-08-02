@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const yaml = @import("yaml.zig");
 const ir = @import("ir.zig");
 const gha = @import("frontend/gha.zig");
+const gitlab = @import("frontend/gitlab.zig");
 const engine = @import("engine.zig");
 const config = @import("config.zig");
 const backend = @import("backend.zig");
@@ -14,9 +15,16 @@ const runrecord = @import("snap/runrecord.zig");
 const debug_mod = @import("debug.zig");
 const tui = @import("tui.zig");
 
-pub const Provider = enum { gha, unknown };
+pub const Provider = enum { gha, gitlab, unknown };
+
+fn pathBasename(path: []const u8) []const u8 {
+    const start = if (std.mem.lastIndexOfAny(u8, path, "/\\")) |i| i + 1 else 0;
+    return path[start..];
+}
 
 pub fn detectProvider(path: []const u8, source: []const u8) Provider {
+    const basename = pathBasename(path);
+    if (std.mem.eql(u8, basename, ".gitlab-ci.yml") or std.mem.eql(u8, basename, ".gitlab-ci.yaml")) return .gitlab;
     if (std.mem.indexOf(u8, path, ".github/workflows") != null or
         std.mem.indexOf(u8, path, ".github\\workflows") != null) return .gha;
     if (std.mem.indexOf(u8, source, "jobs:") != null and
@@ -25,23 +33,43 @@ pub fn detectProvider(path: []const u8, source: []const u8) Provider {
     return .unknown;
 }
 
+fn parseProvider(
+    alloc: std.mem.Allocator,
+    provider: Provider,
+    path: []const u8,
+    source: []const u8,
+    diags: *yaml.Diags,
+) !ir.Pipeline {
+    return switch (provider) {
+        .gha => gha.parseWorkflow(alloc, path, source, diags),
+        .gitlab => gitlab.parsePipeline(alloc, path, source, diags),
+        .unknown => unreachable,
+    };
+}
+
 pub fn findDefaultWorkflow(alloc: std.mem.Allocator) !?[]const u8 {
-    var dir = std.fs.cwd().openDir(".github/workflows", .{ .iterate = true }) catch return null;
-    defer dir.close();
-    var names: std.ArrayList([]const u8) = .empty;
-    var it = dir.iterate();
-    while (try it.next()) |e| {
-        if (e.kind != .file) continue;
-        if (std.mem.endsWith(u8, e.name, ".yml") or std.mem.endsWith(u8, e.name, ".yaml"))
-            try names.append(alloc, try std.fmt.allocPrint(alloc, ".github/workflows/{s}", .{e.name}));
-    }
-    if (names.items.len == 0) return null;
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.lessThan(u8, a, b);
+    if (std.fs.cwd().openDir(".github/workflows", .{ .iterate = true })) |dir_value| {
+        var dir = dir_value;
+        defer dir.close();
+        var names: std.ArrayList([]const u8) = .empty;
+        var it = dir.iterate();
+        while (try it.next()) |e| {
+            if (e.kind != .file) continue;
+            if (std.mem.endsWith(u8, e.name, ".yml") or std.mem.endsWith(u8, e.name, ".yaml"))
+                try names.append(alloc, try std.fmt.allocPrint(alloc, ".github/workflows/{s}", .{e.name}));
         }
-    }.lt);
-    return names.items[0];
+        if (names.items.len > 0) {
+            std.mem.sort([]const u8, names.items, {}, struct {
+                fn lt(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lt);
+            return names.items[0];
+        }
+    } else |_| {}
+    if (std.fs.cwd().access(".gitlab-ci.yml", .{})) |_| return ".gitlab-ci.yml" else |_| {}
+    if (std.fs.cwd().access(".gitlab-ci.yaml", .{})) |_| return ".gitlab-ci.yaml" else |_| {}
+    return null;
 }
 
 pub fn lintMain(alloc: std.mem.Allocator, path: []const u8, json: bool, strict: bool, out: *std.ArrayList(u8)) !u8 {
@@ -49,12 +77,13 @@ pub fn lintMain(alloc: std.mem.Allocator, path: []const u8, json: bool, strict: 
         try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "error: cannot read '{s}'\n", .{path}));
         return 3;
     };
-    if (detectProvider(path, source) == .unknown) {
-        try out.appendSlice(alloc, "error: could not detect CI provider (phase 1 supports GitHub Actions only)\n");
+    const provider = detectProvider(path, source);
+    if (provider == .unknown) {
+        try out.appendSlice(alloc, "error: could not detect CI provider (supported providers: GitHub Actions and GitLab CI)\n");
         return 2;
     }
     var diags = yaml.Diags.init(alloc);
-    const pipeline = gha.parseWorkflow(alloc, path, source, &diags) catch |e| switch (e) {
+    const pipeline = parseProvider(alloc, provider, path, source, &diags) catch |e| switch (e) {
         error.ParseFailed => {
             try printDiags(alloc, path, &diags, out);
             return 2;
@@ -583,7 +612,7 @@ pub fn main(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
             return 2;
         };
         const path = la.file orelse (try findDefaultWorkflow(alloc)) orelse {
-            _ = try print("error: no workflow found in .github/workflows\n");
+            _ = try print("error: no workflow found in .github/workflows or .gitlab-ci.yml/.gitlab-ci.yaml\n");
             return 2;
         };
         var out: std.ArrayList(u8) = .empty;
@@ -691,19 +720,20 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         }
     }
     const path = ra.file orelse recorded_workflow orelse (try findDefaultWorkflow(alloc)) orelse {
-        _ = try print("error: no workflow found in .github/workflows\n");
+        _ = try print("error: no workflow found in .github/workflows or .gitlab-ci.yml/.gitlab-ci.yaml\n");
         return 2;
     };
     const source = std.fs.cwd().readFileAlloc(alloc, path, 4 * 1024 * 1024) catch {
         _ = try print(try std.fmt.allocPrint(alloc, "error: cannot read '{s}'\n", .{path}));
         return 3;
     };
-    if (detectProvider(path, source) == .unknown) {
-        _ = try print("error: could not detect CI provider (phase 1 supports GitHub Actions only)\n");
+    const provider = detectProvider(path, source);
+    if (provider == .unknown) {
+        _ = try print("error: could not detect CI provider (supported providers: GitHub Actions and GitLab CI)\n");
         return 2;
     }
     var diags = yaml.Diags.init(alloc);
-    const pipeline = gha.parseWorkflow(alloc, path, source, &diags) catch |e| switch (e) {
+    const pipeline = parseProvider(alloc, provider, path, source, &diags) catch |e| switch (e) {
         error.ParseFailed => {
             var out: std.ArrayList(u8) = .empty;
             try printDiags(alloc, path, &diags, &out);
@@ -965,6 +995,8 @@ test "parseRunsArgs accepts only one optional --json" {
 
 test "detect provider by path and content" {
     try std.testing.expectEqual(Provider.gha, detectProvider(".github/workflows/ci.yml", ""));
+    try std.testing.expectEqual(Provider.gitlab, detectProvider(".gitlab-ci.yml", "stages:\n  - build"));
+    try std.testing.expectEqual(Provider.gitlab, detectProvider("dir\\.gitlab-ci.yaml", "stages:\n  - build"));
     try std.testing.expectEqual(Provider.gha, detectProvider("any.yml", "jobs:\n  a:\n    steps:\n      - run: x"));
     try std.testing.expectEqual(Provider.unknown, detectProvider("pipeline.yml", "stages:\n  - build"));
 }
