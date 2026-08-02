@@ -40,7 +40,11 @@ pub fn request(alloc: std.mem.Allocator, c: Client, req: http.Request) !http.Res
 
 pub fn ping(alloc: std.mem.Allocator, c: Client) bool {
     const resp = request(alloc, c, .{ .method = "GET", .path = "/_ping" }) catch return false;
-    return resp.status == 200;
+    if (resp.status != 200) return false;
+    const info = request(alloc, c, .{ .method = "GET", .path = api_prefix ++ "/info" }) catch return false;
+    if (info.status != 200) return false;
+    const parsed = std.json.parseFromSliceLeaky(struct { OSType: []const u8 }, alloc, info.body, .{ .ignore_unknown_fields = true }) catch return false;
+    return std.mem.eql(u8, parsed.OSType, "linux");
 }
 
 /// Parses a `DOCKER_HOST`-style value into a local socket/pipe path.
