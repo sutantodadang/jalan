@@ -1,0 +1,53 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: test
+        run: zig build test
+
+      - name: cross-compile all targets
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          targets="x86_64-linux-musl aarch64-linux-musl x86_64-macos aarch64-macos x86_64-windows aarch64-windows"
+          mkdir -p dist
+          for t in $targets; do
+            zig build -Dtarget="$t" -Doptimize=ReleaseSafe
+            name="jalan-${version}-${t}"
+            mkdir -p "dist/$name"
+            if [[ "$t" == *windows* ]]; then
+              cp zig-out/bin/jalan.exe "dist/$name/"
+            else
+              cp zig-out/bin/jalan "dist/$name/"
+            fi
+            cp LICENSE README.md "dist/$name/"
+            if [[ "$t" == *windows* ]]; then
+              (cd dist && zip -qr "$name.zip" "$name")
+            else
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+            fi
+            rm -rf "dist/$name"
+          done
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          mv dist/SHA256SUMS dist/jalan-${version}-SHA256SUMS.txt
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "jalan $GITHUB_REF_NAME" \
+            --generate-notes
