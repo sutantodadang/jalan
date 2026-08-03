@@ -5,6 +5,7 @@ const yaml = @import("yaml.zig");
 const ir = @import("ir.zig");
 const gha = @import("frontend/gha.zig");
 const gitlab = @import("frontend/gitlab.zig");
+const jenkins = @import("frontend/jenkins.zig");
 const engine = @import("engine.zig");
 const config = @import("config.zig");
 const backend = @import("backend.zig");
@@ -15,7 +16,7 @@ const runrecord = @import("snap/runrecord.zig");
 const debug_mod = @import("debug.zig");
 const tui = @import("tui.zig");
 
-pub const Provider = enum { gha, gitlab, unknown };
+pub const Provider = enum { gha, gitlab, jenkins, unknown };
 
 fn pathBasename(path: []const u8) []const u8 {
     const start = if (std.mem.lastIndexOfAny(u8, path, "/\\")) |i| i + 1 else 0;
@@ -25,11 +26,13 @@ fn pathBasename(path: []const u8) []const u8 {
 pub fn detectProvider(path: []const u8, source: []const u8) Provider {
     const basename = pathBasename(path);
     if (std.mem.eql(u8, basename, ".gitlab-ci.yml") or std.mem.eql(u8, basename, ".gitlab-ci.yaml")) return .gitlab;
+    if (std.mem.endsWith(u8, basename, ".jenkinsfile") or std.mem.startsWith(u8, basename, "Jenkinsfile")) return .jenkins;
     if (std.mem.indexOf(u8, path, ".github/workflows") != null or
         std.mem.indexOf(u8, path, ".github\\workflows") != null) return .gha;
     if (std.mem.indexOf(u8, source, "jobs:") != null and
         (std.mem.indexOf(u8, source, "runs-on") != null or
             std.mem.indexOf(u8, source, "steps:") != null)) return .gha;
+    if (std.mem.indexOf(u8, source, "pipeline {") != null or std.mem.indexOf(u8, source, "pipeline{") != null) return .jenkins;
     return .unknown;
 }
 
@@ -43,6 +46,7 @@ fn parseProvider(
     return switch (provider) {
         .gha => gha.parseWorkflow(alloc, path, source, diags),
         .gitlab => gitlab.parsePipeline(alloc, path, source, diags),
+        .jenkins => jenkins.parsePipeline(alloc, path, source, diags),
         .unknown => unreachable,
     };
 }
@@ -69,6 +73,7 @@ pub fn findDefaultWorkflow(alloc: std.mem.Allocator) !?[]const u8 {
     } else |_| {}
     if (std.fs.cwd().access(".gitlab-ci.yml", .{})) |_| return ".gitlab-ci.yml" else |_| {}
     if (std.fs.cwd().access(".gitlab-ci.yaml", .{})) |_| return ".gitlab-ci.yaml" else |_| {}
+    if (std.fs.cwd().access("Jenkinsfile", .{})) |_| return "Jenkinsfile" else |_| {}
     return null;
 }
 
@@ -79,7 +84,7 @@ pub fn lintMain(alloc: std.mem.Allocator, path: []const u8, json: bool, strict: 
     };
     const provider = detectProvider(path, source);
     if (provider == .unknown) {
-        try out.appendSlice(alloc, "error: could not detect CI provider (supported providers: GitHub Actions and GitLab CI)\n");
+        try out.appendSlice(alloc, "error: could not detect CI provider (supported providers: GitHub Actions, GitLab CI, and Jenkins)\n");
         return 2;
     }
     var diags = yaml.Diags.init(alloc);
@@ -612,7 +617,7 @@ pub fn main(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
             return 2;
         };
         const path = la.file orelse (try findDefaultWorkflow(alloc)) orelse {
-            _ = try print("error: no workflow found in .github/workflows or .gitlab-ci.yml/.gitlab-ci.yaml\n");
+            _ = try print("error: no workflow found in .github/workflows, .gitlab-ci.yml/.gitlab-ci.yaml, or Jenkinsfile\n");
             return 2;
         };
         var out: std.ArrayList(u8) = .empty;
@@ -720,7 +725,7 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         }
     }
     const path = ra.file orelse recorded_workflow orelse (try findDefaultWorkflow(alloc)) orelse {
-        _ = try print("error: no workflow found in .github/workflows or .gitlab-ci.yml/.gitlab-ci.yaml\n");
+        _ = try print("error: no workflow found in .github/workflows, .gitlab-ci.yml/.gitlab-ci.yaml, or Jenkinsfile\n");
         return 2;
     };
     const source = std.fs.cwd().readFileAlloc(alloc, path, 4 * 1024 * 1024) catch {
@@ -729,7 +734,7 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
     };
     const provider = detectProvider(path, source);
     if (provider == .unknown) {
-        _ = try print("error: could not detect CI provider (supported providers: GitHub Actions and GitLab CI)\n");
+        _ = try print("error: could not detect CI provider (supported providers: GitHub Actions, GitLab CI, and Jenkins)\n");
         return 2;
     }
     var diags = yaml.Diags.init(alloc);
