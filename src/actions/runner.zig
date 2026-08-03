@@ -50,7 +50,7 @@ pub const ActionKind = enum {
 pub fn classify(meta_using: []const u8, ref: resolve.Ref) ActionKind {
     if (ref == .docker_image) return .docker_image;
     if (std.mem.eql(u8, meta_using, "composite")) return .composite;
-    if (std.mem.eql(u8, meta_using, "node20") or std.mem.eql(u8, meta_using, "node16")) return .node;
+    if (std.mem.eql(u8, meta_using, "node24") or std.mem.eql(u8, meta_using, "node20") or std.mem.eql(u8, meta_using, "node16")) return .node;
     if (std.mem.eql(u8, meta_using, "docker")) return .docker_image;
     return .unsupported;
 }
@@ -324,7 +324,7 @@ fn buildInputEnv(alloc: std.mem.Allocator, with: []const ir.EnvPair, defaults: [
     return out.toOwnedSlice(alloc);
 }
 
-/// `node20`/`node16` action: runs `node "<abs main path>"` through the
+/// `node24`/`node20`/`node16` action: runs `node "<abs main path>"` through the
 /// backend's own `runStep` as a synthetic `.run` step (env = `INPUT_*` from
 /// `with`/defaults; `GITHUB_OUTPUT` is added by the backend's `runStep`
 /// itself, same as any other step).
@@ -749,6 +749,7 @@ test "classify: docker:// ref wins regardless of using" {
 test "classify: using maps to a kind for non-docker refs" {
     const local_ref = resolve.Ref{ .local = "./x" };
     try std.testing.expectEqual(ActionKind.composite, classify("composite", local_ref));
+    try std.testing.expectEqual(ActionKind.node, classify("node24", local_ref));
     try std.testing.expectEqual(ActionKind.node, classify("node20", local_ref));
     try std.testing.expectEqual(ActionKind.node, classify("node16", local_ref));
     try std.testing.expectEqual(ActionKind.docker_image, classify("docker", local_ref));

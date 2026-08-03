@@ -2758,8 +2758,12 @@ fn runJob(
     defer b.teardownJob(alloc, &handle);
 
     var job_status: JobStatus = .success;
+    var halted = false;
     step_loop: for (job.steps, 0..) |step, si| {
-        if (shared.halt.load(.acquire)) break;
+        if (shared.halt.load(.acquire)) {
+            halted = true;
+            break;
+        }
         if (opts.step_filter) |f| if (!std.mem.eql(u8, f, step.id)) continue;
         if (si < resume_start) continue; // resume: steps before the target stay skipped
         if (job_status == .failed) {
@@ -2790,6 +2794,13 @@ fn runJob(
         const lock_workspace = opts.snapshot or opts.cache;
         if (lock_workspace) shared.workspace_mutex.lock();
         defer if (lock_workspace) shared.workspace_mutex.unlock();
+
+        // A step can sit blocked on the shared-workspace mutex while another
+        // job's prompt aborts the run; re-check before doing any work.
+        if (shared.halt.load(.acquire)) {
+            halted = true;
+            break;
+        }
 
         if (opts.debug_all_steps or hasBreakpoint(opts, job, step, si)) switch (handleBreakpoint(alloc, opts, shared, index, job, step, si, &env, b, &handle, merged_env.items, p, results, done)) {
             .continue_ => {},
@@ -2999,6 +3010,10 @@ fn runJob(
             break :run_attempt;
         }
     }
+    // An abort mid-run cut this job short: reporting it as "success" with
+    // most steps skipped misleads; only jobs that finished (or failed) before
+    // the halt keep their real status.
+    if (halted and job_status == .success) job_status = .skipped;
     return .{ .job_index = index, .display_name = job.display_name, .status = job_status, .steps = steps };
 }
 
