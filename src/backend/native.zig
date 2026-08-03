@@ -87,6 +87,16 @@ fn defaultShell(alloc: std.mem.Allocator) Shell {
     return shellTable("sh").?;
 }
 
+fn defaultShellForProvider(alloc: std.mem.Allocator, provider: ir.Provider) Shell {
+    // GitLab scripts are written for a POSIX shell; on Windows prefer
+    // bash (incl. Git Bash) over pwsh, where `$VAR` is not the env var.
+    if (provider == .gitlab and builtin.os.tag == .windows) {
+        if (onPath(alloc, "bash") or gitBashExe(alloc, "bash") != null) return shellTable("bash").?;
+        if (onPath(alloc, "sh") or gitBashExe(alloc, "sh") != null) return shellTable("sh").?;
+    }
+    return defaultShell(alloc);
+}
+
 pub fn runStep(
     alloc: std.mem.Allocator,
     step: ir.Step,
@@ -111,7 +121,7 @@ pub fn runStepForProvider(
             return error.SpawnFailed;
         }
     else
-        defaultShell(alloc);
+        defaultShellForProvider(alloc, provider);
 
     std.fs.cwd().makePath(".jalan/tmp") catch {
         err_msg.* = "cannot create .jalan/tmp";

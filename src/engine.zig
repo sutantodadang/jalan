@@ -105,6 +105,31 @@ test "failed job skips dependents, continue-on-error does not fail job" {
     try std.testing.expectEqual(StepStatus.failed, report.jobs[0].steps[0].status);
 }
 
+test "manual job is skipped without --job (dependent still runs); --job runs it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var man_steps = [_]ir.Step{.{ .id = "s", .name = "s", .kind = .run, .script = "echo hi" }};
+    var dep_steps = [_]ir.Step{.{ .id = "s2", .name = "s2", .kind = .run, .script = "echo dep" }};
+    var needs = [_][]const u8{"man"};
+    var jobs = [_]ir.Job{
+        .{ .id = "man", .display_name = "man", .steps = &man_steps, .manual = true },
+        .{ .id = "dep", .display_name = "dep", .needs = &needs, .steps = &dep_steps },
+    };
+    const p = ir.Pipeline{ .name = "p", .source_path = "x.yml", .jobs = &jobs };
+
+    const report = try run(a, p, .{});
+    try std.testing.expectEqual(JobStatus.skipped, report.jobs[0].status);
+    try std.testing.expectEqual(JobStatus.success, report.jobs[1].status);
+
+    const report2 = try run(a, p, .{ .job_filter = "man" });
+    try std.testing.expectEqual(JobStatus.success, report2.jobs[0].status);
+
+    const report3 = try run(a, p, .{ .job_filter = "dep" });
+    try std.testing.expectEqual(JobStatus.skipped, report3.jobs[0].status);
+    try std.testing.expectEqual(JobStatus.success, report3.jobs[1].status);
+}
+
 test "if condition false skips step; dry run executes nothing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -124,6 +149,35 @@ test "if condition false skips step; dry run executes nothing" {
     const dry = try run(a, p, .{ .dry_run = true });
     try std.testing.expect(dry.ok());
     try std.testing.expectEqual(@as(usize, 0), dry.jobs[0].steps[1].stdout.len);
+}
+
+test "always() step runs after a prior step fails; without it stays skipped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - run: exit 1
+        \\      - run: echo cleanup
+        \\        if: always()
+    );
+    const report = try run(a, p, .{});
+    try std.testing.expectEqual(JobStatus.failed, report.jobs[0].status);
+    try std.testing.expectEqual(StepStatus.failed, report.jobs[0].steps[0].status);
+    try std.testing.expectEqual(StepStatus.success, report.jobs[0].steps[1].status);
+
+    const p2 = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - run: exit 1
+        \\      - run: echo cleanup
+    );
+    const report2 = try run(a, p2, .{});
+    try std.testing.expectEqual(JobStatus.failed, report2.jobs[0].status);
+    try std.testing.expectEqual(StepStatus.skipped, report2.jobs[0].steps[1].status);
 }
 
 test "spawn failure (unknown shell) respects continue-on-error" {
@@ -1914,8 +1968,12 @@ fn needsSatisfied(p: ir.Pipeline, done: []bool, job: ir.Job) bool {
 fn needsFailed(p: ir.Pipeline, results: []JobResult, done: []bool, job: ir.Job) bool {
     for (job.needs) |n| {
         for (p.jobs, 0..) |other, oi| {
-            if (std.mem.eql(u8, other.id, n) and done[oi] and results[oi].status != .success)
+            if (std.mem.eql(u8, other.id, n) and done[oi] and results[oi].status != .success) {
+                // A manual job left unselected skips without blocking its
+                // dependents (GitLab treats manual jobs as allow_failure).
+                if (other.manual and results[oi].status == .skipped) continue;
                 return true;
+            }
         }
     }
     return false;
@@ -2138,9 +2196,15 @@ fn runJob(
     if (shared.halt.load(.acquire)) return skipped;
 
     if (opts.job_filter) |f| if (!std.mem.eql(u8, f, job.id)) return skipped;
+    if (job.manual and opts.job_filter == null) {
+        logJob(opts, alloc, job, "manual job skipped (run with --job)");
+        return skipped;
+    }
     if (!gha.matrixMatches(job, opts.matrix_filter)) return skipped;
     if (opts.resume_from == null) {
-        if (needsFailed(p, results, done, job)) return skipped;
+        // -j selects one job: its upstreams were intentionally not run, so
+        // their filter-skips must not gate the selected job.
+        if (opts.job_filter == null and needsFailed(p, results, done, job)) return skipped;
     } else {
         // Resume: skipped upstreams are expected (their outputs were seeded
         // from the record); only an explicit failure THIS run blocks a job.
@@ -2234,7 +2298,10 @@ fn runJob(
         if (shared.halt.load(.acquire)) break;
         if (opts.step_filter) |f| if (!std.mem.eql(u8, f, step.id)) continue;
         if (si < resume_start) continue; // resume: steps before the target stay skipped
-        if (job_status == .failed) break;
+        if (job_status == .failed) {
+            const cond = step.cond orelse continue;
+            if (std.mem.indexOf(u8, cond, "always()") == null) continue; // stays .skipped
+        }
         const t0 = std.time.milliTimestamp();
 
         if (step.cond) |cond| {

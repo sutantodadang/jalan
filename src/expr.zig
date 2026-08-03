@@ -60,6 +60,15 @@ test "functions contains and format" {
     try std.testing.expectEqualStrings("os=ubuntu-latest", f.string);
 }
 
+test "always() evals truthy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env = Env{};
+    const v = try eval(a, try parseExpr(a, "always()"), &env);
+    try std.testing.expect(v.boolean);
+}
+
 test "Env remove deletes a key so lookup falls back to unset" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -359,6 +368,10 @@ fn callFn(alloc: std.mem.Allocator, name: []const u8, args: []Ast, env: *const E
             }
         }
         return .{ .string = try out.toOwnedSlice(alloc) };
+    }
+    if (std.mem.eql(u8, name, "always")) {
+        if (args.len != 0) return error.EvalFailed;
+        return .{ .boolean = true };
     }
     if (args.len != 2) return error.EvalFailed;
     const a0 = try (try eval(alloc, args[0], env)).toString(alloc);

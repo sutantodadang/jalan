@@ -48,6 +48,7 @@ pub const Job = struct {
     container_image: []const u8 = "",
     services: []Service = &.{},
     provider: Provider = .github_actions,
+    manual: bool = false,
 };
 
 pub const Pipeline = struct {
