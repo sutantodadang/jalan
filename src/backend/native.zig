@@ -90,7 +90,7 @@ fn defaultShell(alloc: std.mem.Allocator) Shell {
 fn defaultShellForProvider(alloc: std.mem.Allocator, provider: ir.Provider) Shell {
     // GitLab scripts are written for a POSIX shell; on Windows prefer
     // bash (incl. Git Bash) over pwsh, where `$VAR` is not the env var.
-    if (provider == .gitlab and builtin.os.tag == .windows) {
+    if ((provider == .gitlab or provider == .jenkins) and builtin.os.tag == .windows) {
         if (onPath(alloc, "bash") or gitBashExe(alloc, "bash") != null) return shellTable("bash").?;
         if (onPath(alloc, "sh") or gitBashExe(alloc, "sh") != null) return shellTable("sh").?;
     }

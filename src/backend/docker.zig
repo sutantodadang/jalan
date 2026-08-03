@@ -358,7 +358,7 @@ fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: 
         }
     }
 
-    const container_env = if (job.provider == .gitlab)
+    const container_env = if (job.provider == .gitlab or job.provider == .jenkins)
         try formatEnvPairs(alloc, job.env, &.{ "CI=true", "JALAN=true" })
     else
         try formatEnvPairs(alloc, job.env, &.{ "CI=true", "GITHUB_ACTIONS=true", "JALAN=true" });
