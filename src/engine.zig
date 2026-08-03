@@ -105,7 +105,7 @@ test "failed job skips dependents, continue-on-error does not fail job" {
     try std.testing.expectEqual(StepStatus.failed, report.jobs[0].steps[0].status);
 }
 
-test "manual job is skipped without --job (dependent skipped, not failed); --job runs it" {
+test "manual job is skipped without --job (dependent still runs); --job runs it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -120,10 +120,14 @@ test "manual job is skipped without --job (dependent skipped, not failed); --job
 
     const report = try run(a, p, .{});
     try std.testing.expectEqual(JobStatus.skipped, report.jobs[0].status);
-    try std.testing.expectEqual(JobStatus.skipped, report.jobs[1].status);
+    try std.testing.expectEqual(JobStatus.success, report.jobs[1].status);
 
     const report2 = try run(a, p, .{ .job_filter = "man" });
     try std.testing.expectEqual(JobStatus.success, report2.jobs[0].status);
+
+    const report3 = try run(a, p, .{ .job_filter = "dep" });
+    try std.testing.expectEqual(JobStatus.skipped, report3.jobs[0].status);
+    try std.testing.expectEqual(JobStatus.success, report3.jobs[1].status);
 }
 
 test "if condition false skips step; dry run executes nothing" {
@@ -1964,8 +1968,12 @@ fn needsSatisfied(p: ir.Pipeline, done: []bool, job: ir.Job) bool {
 fn needsFailed(p: ir.Pipeline, results: []JobResult, done: []bool, job: ir.Job) bool {
     for (job.needs) |n| {
         for (p.jobs, 0..) |other, oi| {
-            if (std.mem.eql(u8, other.id, n) and done[oi] and results[oi].status != .success)
+            if (std.mem.eql(u8, other.id, n) and done[oi] and results[oi].status != .success) {
+                // A manual job left unselected skips without blocking its
+                // dependents (GitLab treats manual jobs as allow_failure).
+                if (other.manual and results[oi].status == .skipped) continue;
                 return true;
+            }
         }
     }
     return false;
@@ -2194,7 +2202,9 @@ fn runJob(
     }
     if (!gha.matrixMatches(job, opts.matrix_filter)) return skipped;
     if (opts.resume_from == null) {
-        if (needsFailed(p, results, done, job)) return skipped;
+        // -j selects one job: its upstreams were intentionally not run, so
+        // their filter-skips must not gate the selected job.
+        if (opts.job_filter == null and needsFailed(p, results, done, job)) return skipped;
     } else {
         // Resume: skipped upstreams are expected (their outputs were seeded
         // from the record); only an explicit failure THIS run blocks a job.
