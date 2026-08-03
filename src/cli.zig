@@ -33,6 +33,7 @@ pub fn detectProvider(path: []const u8, source: []const u8) Provider {
         (std.mem.indexOf(u8, source, "runs-on") != null or
             std.mem.indexOf(u8, source, "steps:") != null)) return .gha;
     if (std.mem.indexOf(u8, source, "pipeline {") != null or std.mem.indexOf(u8, source, "pipeline{") != null) return .jenkins;
+    if (std.mem.indexOf(u8, source, "node {") != null or std.mem.indexOf(u8, source, "node{") != null) return .jenkins;
     return .unknown;
 }
 
@@ -1004,6 +1005,7 @@ test "detect provider by path and content" {
     try std.testing.expectEqual(Provider.gitlab, detectProvider("dir\\.gitlab-ci.yaml", "stages:\n  - build"));
     try std.testing.expectEqual(Provider.gha, detectProvider("any.yml", "jobs:\n  a:\n    steps:\n      - run: x"));
     try std.testing.expectEqual(Provider.unknown, detectProvider("pipeline.yml", "stages:\n  - build"));
+    try std.testing.expectEqual(Provider.jenkins, detectProvider("Jenkinsfile", "node {\n    sh 'echo hi'\n}"));
 }
 
 test "lint reports diagnostics with exit 2 and job graph on success" {

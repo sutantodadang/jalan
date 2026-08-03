@@ -4,6 +4,8 @@
 const std = @import("std");
 const yaml = @import("../yaml.zig");
 const ir = @import("../ir.zig");
+const groovy_ast = @import("../groovy/ast.zig");
+const groovy_interp = @import("../groovy/interp.zig");
 
 pub const ParseError = error{ ParseFailed, OutOfMemory };
 
@@ -48,6 +50,15 @@ const Tokenizer = struct {
     col: u32 = 1,
     alloc: std.mem.Allocator,
     diags: *yaml.Diags,
+    // Set right after tokenizing an ident "script" that is immediately
+    // followed (modulo whitespace/comments) by '{': tells the NEXT call to
+    // nextToken() (which will produce that '{' symbol) to also raw-skip the
+    // block's entire interior at the byte level rather than tokenizing it.
+    // `script { ... }` bodies are arbitrary Groovy, which this declarative
+    // tokenizer's limited character set (see `symbol_chars`) cannot lex --
+    // they're re-parsed by the Groovy front end at lowering time instead,
+    // using the byte range this produces (see Stmt.block_start/block_end).
+    pending_script_open: bool = false,
 
     fn advance(self: *Tokenizer) u8 {
         const c = self.src[self.pos];
@@ -163,16 +174,126 @@ const Tokenizer = struct {
         return buf.toOwnedSlice(self.alloc);
     }
 
+    /// Non-consuming lookahead: does the next significant (non-ws,
+    /// non-comment) character start with '{'? Used to detect `script {`.
+    fn peekIsOpenBrace(self: *Tokenizer) bool {
+        var i = self.pos;
+        while (i < self.src.len) {
+            const c = self.src[i];
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+                i += 1;
+                continue;
+            }
+            if (c == '/' and i + 1 < self.src.len and self.src[i + 1] == '/') {
+                while (i < self.src.len and self.src[i] != '\n') i += 1;
+                continue;
+            }
+            if (c == '/' and i + 1 < self.src.len and self.src[i + 1] == '*') {
+                i += 2;
+                while (i + 1 < self.src.len and !(self.src[i] == '*' and self.src[i + 1] == '/')) i += 1;
+                i = @min(i + 2, self.src.len);
+                continue;
+            }
+            break;
+        }
+        return i < self.src.len and self.src[i] == '{';
+    }
+
+    /// Raw byte-level skip of a `script { ... }` body: advances `self.pos`
+    /// from just after the opening '{' (already consumed by the caller) to
+    /// exactly the matching '}' (left unconsumed, so the caller's normal
+    /// symbol tokenizing produces it). Tracks brace depth while skipping over
+    /// comments and string literals so braces inside them don't miscount.
+    /// Never fails on characters this tokenizer wouldn't otherwise accept --
+    /// that's the point: the interior is arbitrary Groovy, re-parsed later by
+    /// the Groovy front end from the recorded byte range.
+    fn skipScriptBody(self: *Tokenizer) ParseError!void {
+        var depth: usize = 1;
+        while (true) {
+            if (self.pos >= self.src.len) {
+                try self.diags.add(self.line, self.col, "unterminated 'script' block", .{});
+                return error.ParseFailed;
+            }
+            const c = self.src[self.pos];
+            if (c == '/' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '/') {
+                while (self.pos < self.src.len and self.src[self.pos] != '\n') _ = self.advance();
+                continue;
+            }
+            if (c == '/' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '*') {
+                self.advance2();
+                while (self.pos < self.src.len and !(self.src[self.pos] == '*' and self.pos + 1 < self.src.len and self.src[self.pos + 1] == '/')) _ = self.advance();
+                if (self.pos < self.src.len) self.advance2();
+                continue;
+            }
+            if (c == '\'' or c == '"') {
+                const quote = c;
+                _ = self.advance();
+                var triple = false;
+                if (self.pos + 1 < self.src.len and self.src[self.pos] == quote and self.src[self.pos + 1] == quote) {
+                    triple = true;
+                    self.advance2();
+                }
+                while (self.pos < self.src.len) {
+                    const sc = self.src[self.pos];
+                    if (sc == '\\' and self.pos + 1 < self.src.len) {
+                        self.advance2();
+                        continue;
+                    }
+                    if (triple) {
+                        if (sc == quote and self.pos + 2 < self.src.len and self.src[self.pos + 1] == quote and self.src[self.pos + 2] == quote) {
+                            self.advance2();
+                            _ = self.advance();
+                            break;
+                        }
+                        _ = self.advance();
+                        continue;
+                    }
+                    if (sc == quote) {
+                        _ = self.advance();
+                        break;
+                    }
+                    if (sc == '\n') break;
+                    _ = self.advance();
+                }
+                continue;
+            }
+            if (c == '{') {
+                depth += 1;
+                _ = self.advance();
+                continue;
+            }
+            if (c == '}') {
+                depth -= 1;
+                if (depth == 0) return;
+                _ = self.advance();
+                continue;
+            }
+            _ = self.advance();
+        }
+    }
+
     fn nextToken(self: *Tokenizer) ParseError!Token {
         try self.skipWsAndComments();
         const line = self.line;
         const col = self.col;
         if (self.pos >= self.src.len) return .{ .kind = .eof, .text = "", .line = line, .col = col };
         const c = self.src[self.pos];
+        if (self.pending_script_open and c == '{') {
+            self.pending_script_open = false;
+            const brace_pos = self.pos;
+            _ = self.advance();
+            const brace_text = self.src[brace_pos .. brace_pos + 1];
+            try self.skipScriptBody();
+            return .{ .kind = .symbol, .text = brace_text, .line = line, .col = col };
+        }
         if (isIdentStart(c)) {
             const start = self.pos;
             while (self.pos < self.src.len and isIdentChar(self.src[self.pos])) _ = self.advance();
-            return .{ .kind = .ident, .text = self.src[start..self.pos], .line = line, .col = col };
+            const text = self.src[start..self.pos];
+            if (std.mem.eql(u8, text, "script") and self.peekIsOpenBrace()) {
+                self.pending_script_open = true;
+            }
+            return .{ .kind = .ident, .text = text, .line = line, .col = col };
         }
         if (std.ascii.isDigit(c)) {
             const start = self.pos;
@@ -232,6 +353,12 @@ const Stmt = struct {
     args: []Arg = &.{},
     named: []Named = &.{},
     block: ?[]Stmt = null,
+    // Byte offsets into the original source, just inside the block's braces
+    // (i.e. `source[block_start..block_end]` is the raw text between `{` and
+    // `}`, exclusive of both). Only meaningful when `block != null`. Used to
+    // re-parse `script { ... }` bodies as Groovy at lowering time.
+    block_start: usize = 0,
+    block_end: usize = 0,
     assign: ?[]const u8 = null,
     rhs_call: ?[]const u8 = null,
     line: u32,
@@ -257,6 +384,15 @@ const Parser = struct {
     pos: usize = 0,
     alloc: std.mem.Allocator,
     diags: *yaml.Diags,
+    source: []const u8 = &.{},
+
+    /// Byte offset of a symbol token within `source`. Only valid for symbol
+    /// tokens: their `.text` is always a 1-byte slice of `source` itself
+    /// (unlike string tokens, which are copied into freshly allocated
+    /// buffers), so pointer subtraction recovers the offset.
+    fn byteOffset(self: *Parser, tok: Token) usize {
+        return @intFromPtr(tok.text.ptr) - @intFromPtr(self.source.ptr);
+    }
 
     fn peek(self: *Parser) Token {
         return self.toks[self.pos];
@@ -403,9 +539,13 @@ const Parser = struct {
             }
         }
         var block: ?[]Stmt = null;
+        var block_start: usize = 0;
+        var block_end: usize = 0;
         if (self.checkSymbol('{')) {
-            _ = self.advance();
+            const open_tok = self.advance();
+            block_start = self.byteOffset(open_tok) + 1;
             block = try self.parseStmtList('}');
+            block_end = self.byteOffset(self.peek());
             try self.expectSymbol('}');
         }
         return .{
@@ -413,6 +553,8 @@ const Parser = struct {
             .args = try args.toOwnedSlice(self.alloc),
             .named = try named.toOwnedSlice(self.alloc),
             .block = block,
+            .block_start = block_start,
+            .block_end = block_end,
             .line = head.line,
             .col = head.col,
         };
@@ -442,8 +584,40 @@ const Parser = struct {
 
 fn parseTop(alloc: std.mem.Allocator, source: []const u8, diags: *yaml.Diags) ParseError![]Stmt {
     const toks = try tokenize(alloc, source, diags);
-    var p = Parser{ .toks = toks, .alloc = alloc, .diags = diags };
+    var p = Parser{ .toks = toks, .alloc = alloc, .diags = diags, .source = source };
     return p.parseRoot();
+}
+
+/// Cheap pre-check to route a Jenkinsfile to the declarative or scripted
+/// lowering path without running the (possibly failing) declarative parser
+/// on genuinely scripted sources. Manually skims whitespace/comments and
+/// looks at the very first identifier token: declarative Jenkinsfiles always
+/// open with `pipeline { ... }`; anything else (`node { ... }`, bare
+/// statements, etc.) is scripted Groovy.
+fn firstTopLevelIdentIsPipeline(source: []const u8) bool {
+    var i: usize = 0;
+    while (i < source.len) {
+        const c = source[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < source.len and source[i + 1] == '/') {
+            while (i < source.len and source[i] != '\n') i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < source.len and source[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < source.len and !(source[i] == '*' and source[i + 1] == '/')) i += 1;
+            i = @min(i + 2, source.len);
+            continue;
+        }
+        break;
+    }
+    if (i >= source.len or !isIdentStart(source[i])) return false;
+    const start = i;
+    while (i < source.len and isIdentChar(source[i])) i += 1;
+    return std.mem.eql(u8, source[start..i], "pipeline");
 }
 
 // ---------------------------------------------------------------------------
@@ -571,9 +745,11 @@ fn lowerSteps(
     env: []const ir.EnvPair,
     counts: *std.StringArrayHashMapUnmanaged(u32),
     diags: *yaml.Diags,
+    source: []const u8,
+    declarative_env: []const ir.EnvPair,
 ) ParseError![]ir.Step {
     var out: std.ArrayList(ir.Step) = .empty;
-    for (block) |s| try lowerOneStep(alloc, s, workdir, env, counts, &out, diags);
+    for (block) |s| try lowerOneStep(alloc, s, workdir, env, counts, &out, diags, source, declarative_env);
     return out.toOwnedSlice(alloc);
 }
 
@@ -585,6 +761,8 @@ fn lowerOneStep(
     counts: *std.StringArrayHashMapUnmanaged(u32),
     out: *std.ArrayList(ir.Step),
     diags: *yaml.Diags,
+    source: []const u8,
+    declarative_env: []const ir.EnvPair,
 ) ParseError!void {
     if (std.mem.eql(u8, s.name, "sh") or std.mem.eql(u8, s.name, "bat") or
         std.mem.eql(u8, s.name, "powershell") or std.mem.eql(u8, s.name, "pwsh"))
@@ -663,7 +841,7 @@ fn lowerOneStep(
             }
         }
         if (s.block) |children| {
-            const inner = try lowerSteps(alloc, children, inner_workdir, env, counts, diags);
+            const inner = try lowerSteps(alloc, children, inner_workdir, env, counts, diags, source, declarative_env);
             try out.appendSlice(alloc, inner);
         }
         return;
@@ -685,13 +863,13 @@ fn lowerOneStep(
         }
         const merged = try mergeEnv(alloc, env, pairs.items);
         if (s.block) |children| {
-            const inner = try lowerSteps(alloc, children, workdir, merged, counts, diags);
+            const inner = try lowerSteps(alloc, children, workdir, merged, counts, diags, source, declarative_env);
             try out.appendSlice(alloc, inner);
         }
         return;
     }
     if (std.mem.eql(u8, s.name, "script")) {
-        try warn(diags, s.line, s.col, "scripted 'script' blocks are not supported (skipped)", .{});
+        try lowerScriptBlock(alloc, s, workdir, env, counts, out, diags, source, declarative_env);
         return;
     }
     if (std.mem.eql(u8, s.name, "checkout")) {
@@ -701,7 +879,7 @@ fn lowerOneStep(
     if (std.mem.eql(u8, s.name, "timeout") or std.mem.eql(u8, s.name, "retry")) {
         try warn(diags, s.line, s.col, "'{s}' is not simulated (inner steps run)", .{s.name});
         if (s.block) |children| {
-            const inner = try lowerSteps(alloc, children, workdir, env, counts, diags);
+            const inner = try lowerSteps(alloc, children, workdir, env, counts, diags, source, declarative_env);
             try out.appendSlice(alloc, inner);
         }
         return;
@@ -709,14 +887,85 @@ fn lowerOneStep(
     try warn(diags, s.line, s.col, "step '{s}' is not supported (skipped)", .{s.name});
 }
 
+/// Executes a declarative `script { ... }` step block as real Groovy: the raw
+/// source between the braces is re-parsed and run through the same Lowering
+/// host used for scripted pipelines (mode = .script_block), so `sh`/`echo`/etc
+/// calls append steps directly into the enclosing job's step list `out`.
+/// `stage`/`node`/`parallel` are disallowed inside a script block (declarative
+/// stage structure is already fixed by the surrounding DSL).
+fn lowerScriptBlock(
+    alloc: std.mem.Allocator,
+    s: Stmt,
+    workdir: ?[]const u8,
+    env: []const ir.EnvPair,
+    counts: *std.StringArrayHashMapUnmanaged(u32),
+    out: *std.ArrayList(ir.Step),
+    diags: *yaml.Diags,
+    source: []const u8,
+    declarative_env: []const ir.EnvPair,
+) ParseError!void {
+    const raw = source[s.block_start..s.block_end];
+    const stmts = try groovy_ast.parse(alloc, raw, diags);
+
+    const lowering = try alloc.create(Lowering);
+    lowering.* = .{
+        .alloc = alloc,
+        .diags = diags,
+        .mode = .script_block,
+        .out_steps = out,
+        .step_counts = counts,
+    };
+    if (workdir) |wd| try lowering.workdir_stack.append(alloc, wd);
+
+    const host = groovy_interp.Host{ .ctx = @ptrCast(lowering), .call = hostCall };
+    const interp = try groovy_interp.Interp.init(alloc, diags, host);
+    try seedGlobals(alloc, interp, env, declarative_env);
+
+    _ = interp.run(stmts) catch |e| switch (e) {
+        error.EvalFailed => return error.ParseFailed,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// Seeds the Groovy globals (`env`, `params`, `currentBuild`) available to
+/// scripted/`script{}` bodies. `env` is pre-populated with BUILD_NUMBER/
+/// JOB_NAME plus any declarative pipeline/stage `environment{}` pairs and
+/// step-local (withEnv) pairs, so `env.FOO` reads inside Groovy see the same
+/// values the declarative side already computed. `env` wins over
+/// `declarative_env` on key collision (mirrors the engine's "step env wins"
+/// precedence).
+fn seedGlobals(alloc: std.mem.Allocator, interp: *groovy_interp.Interp, env: []const ir.EnvPair, declarative_env: []const ir.EnvPair) !void {
+    const env_map = try alloc.create(groovy_interp.ValueMap);
+    env_map.* = .{};
+    try env_map.put(alloc, "BUILD_NUMBER", .{ .string = "1" });
+    try env_map.put(alloc, "JOB_NAME", .{ .string = "pipeline" });
+    for (declarative_env) |p| try env_map.put(alloc, p.name, .{ .string = p.value });
+    for (env) |p| try env_map.put(alloc, p.name, .{ .string = p.value });
+    try interp.setGlobal("env", .{ .map = env_map });
+
+    const params_map = try alloc.create(groovy_interp.ValueMap);
+    params_map.* = .{};
+    try interp.setGlobal("params", .{ .map = params_map });
+
+    const cb_map = try alloc.create(groovy_interp.ValueMap);
+    cb_map.* = .{};
+    try cb_map.put(alloc, "result", .{ .string = "SUCCESS" });
+    try interp.setGlobal("currentBuild", .{ .map = cb_map });
+
+    // `checkout scm` is idiomatic Jenkins syntax referencing the implicit
+    // per-job SCM config global; its value is never inspected (checkout is
+    // always warned-and-skipped), so any placeholder works.
+    try interp.setGlobal("scm", .{ .nul = {} });
+}
+
 const StageCtx = struct {
     env: []const ir.EnvPair,
     agent: AgentResult,
 };
 
-fn lowerPostBucket(alloc: std.mem.Allocator, existing: []ir.Step, body: []const Stmt, diags: *yaml.Diags) ![]ir.Step {
+fn lowerPostBucket(alloc: std.mem.Allocator, existing: []ir.Step, body: []const Stmt, diags: *yaml.Diags, source: []const u8) ![]ir.Step {
     var counts: std.StringArrayHashMapUnmanaged(u32) = .empty;
-    const s = try lowerSteps(alloc, body, null, &.{}, &counts, diags);
+    const s = try lowerSteps(alloc, body, null, &.{}, &counts, diags, source, &.{});
     var tmp: std.ArrayList(ir.Step) = .empty;
     try tmp.appendSlice(alloc, existing);
     try tmp.appendSlice(alloc, s);
@@ -733,6 +982,7 @@ fn lowerStage(
     jobs: *std.ArrayList(ir.Job),
     seen_names: *std.StringArrayHashMapUnmanaged(void),
     diags: *yaml.Diags,
+    source: []const u8,
 ) ParseError![][]const u8 {
     if (stmt.args.len == 0) {
         try diags.add(stmt.line, stmt.col, "stage requires a name", .{});
@@ -792,7 +1042,7 @@ fn lowerStage(
                 try warn(diags, child.line, child.col, "'{s}' is not simulated (ignored)", .{child.name});
                 continue;
             }
-            const child_ids = try lowerStage(alloc, child, needs, .{ .env = local_env.items, .agent = local_agent }, pipeline_name, false, jobs, seen_names, diags);
+            const child_ids = try lowerStage(alloc, child, needs, .{ .env = local_env.items, .agent = local_agent }, pipeline_name, false, jobs, seen_names, diags, source);
             try ids.appendSlice(alloc, child_ids);
         }
         return ids.toOwnedSlice(alloc);
@@ -809,9 +1059,9 @@ fn lowerStage(
         if (ps.block) |post_children| {
             for (post_children) |pc| {
                 if (std.mem.eql(u8, pc.name, "always") or std.mem.eql(u8, pc.name, "cleanup")) {
-                    post_always = try lowerPostBucket(alloc, post_always, pc.block orelse &.{}, diags);
+                    post_always = try lowerPostBucket(alloc, post_always, pc.block orelse &.{}, diags, source);
                 } else if (std.mem.eql(u8, pc.name, "success")) {
-                    post_success = try lowerPostBucket(alloc, post_success, pc.block orelse &.{}, diags);
+                    post_success = try lowerPostBucket(alloc, post_success, pc.block orelse &.{}, diags, source);
                 } else {
                     try warn(diags, pc.line, pc.col, "post '{s}' is not simulated (ignored)", .{pc.name});
                 }
@@ -824,7 +1074,7 @@ fn lowerStage(
     }
 
     var counts: std.StringArrayHashMapUnmanaged(u32) = .empty;
-    const steps = try lowerSteps(alloc, steps_stmt.?.block orelse &.{}, null, &.{}, &counts, diags);
+    const steps = try lowerSteps(alloc, steps_stmt.?.block orelse &.{}, null, &.{}, &counts, diags, source, local_env.items);
 
     var all_steps: std.ArrayList(ir.Step) = .empty;
     try all_steps.appendSlice(alloc, steps);
@@ -860,6 +1110,7 @@ fn lowerStages(
     pipeline_agent: AgentResult,
     pipeline_name: []const u8,
     diags: *yaml.Diags,
+    source: []const u8,
 ) ParseError![]ir.Job {
     var jobs: std.ArrayList(ir.Job) = .empty;
     var seen_names: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -874,27 +1125,28 @@ fn lowerStages(
             try warn(diags, c.line, c.col, "'{s}' is not simulated (ignored)", .{c.name});
             continue;
         }
-        const ids = try lowerStage(alloc, c, prev_needs, .{ .env = pipeline_env, .agent = pipeline_agent }, pipeline_name, true, &jobs, &seen_names, diags);
+        const ids = try lowerStage(alloc, c, prev_needs, .{ .env = pipeline_env, .agent = pipeline_agent }, pipeline_name, true, &jobs, &seen_names, diags, source);
         if (ids.len > 0) prev_needs = ids;
     }
     return jobs.toOwnedSlice(alloc);
 }
 
+/// Entry point: routes to the declarative or scripted lowering path based on
+/// the source's first top-level identifier (see `firstTopLevelIdentIsPipeline`).
 pub fn parsePipeline(alloc: std.mem.Allocator, source_path: []const u8, source: []const u8, diags: *yaml.Diags) ParseError!ir.Pipeline {
+    if (firstTopLevelIdentIsPipeline(source)) {
+        return parseDeclarative(alloc, source_path, source, diags);
+    }
+    return parseScripted(alloc, source_path, source, diags);
+}
+
+fn parseDeclarative(alloc: std.mem.Allocator, source_path: []const u8, source: []const u8, diags: *yaml.Diags) ParseError!ir.Pipeline {
     const top = try parseTop(alloc, source, diags);
     const is_pipeline = top.len == 1 and std.mem.eql(u8, top[0].name, "pipeline") and top[0].block != null;
     if (!is_pipeline) {
-        var hint = false;
-        for (top) |s| if (std.mem.eql(u8, s.name, "node")) {
-            hint = true;
-        };
         const line: u32 = if (top.len > 0) top[0].line else 1;
         const col: u32 = if (top.len > 0) top[0].col else 1;
-        if (hint) {
-            try diags.add(line, col, "Jenkinsfile must contain a single declarative 'pipeline' block (scripted pipelines are not supported)", .{});
-        } else {
-            try diags.add(line, col, "Jenkinsfile must contain a single declarative 'pipeline' block", .{});
-        }
+        try diags.add(line, col, "Jenkinsfile must contain a single declarative 'pipeline' block", .{});
         return error.ParseFailed;
     }
 
@@ -926,7 +1178,7 @@ pub fn parsePipeline(alloc: std.mem.Allocator, source_path: []const u8, source: 
     const pipeline_name = "pipeline";
     var jobs: []ir.Job = &.{};
     if (stages_stmt) |ss| {
-        jobs = try lowerStages(alloc, ss, pipeline_env.items, pipeline_agent, pipeline_name, diags);
+        jobs = try lowerStages(alloc, ss, pipeline_env.items, pipeline_agent, pipeline_name, diags, source);
     } else {
         try diags.add(pipeline_stmt.line, pipeline_stmt.col, "pipeline has no stages", .{});
     }
@@ -934,6 +1186,413 @@ pub fn parsePipeline(alloc: std.mem.Allocator, source_path: []const u8, source: 
     if (hasHardError(diags)) return error.ParseFailed;
 
     return .{ .name = pipeline_name, .source_path = source_path, .jobs = jobs };
+}
+
+// ---------------------------------------------------------------------------
+// Scripted pipeline lowering: `node { stage('X') { sh '...' } ... }` runs
+// through the Groovy interpreter (src/groovy/interp.zig) with a Host that
+// lowers each recognized DSL call directly to IR. Also backs declarative
+// `script { ... }` step blocks (see `lowerScriptBlock` above), which share
+// the same Host/dispatch but append into an existing job's step list instead
+// of building jobs of their own.
+// ---------------------------------------------------------------------------
+
+const LowerMode = enum { scripted, script_block };
+
+const Lowering = struct {
+    alloc: std.mem.Allocator,
+    diags: *yaml.Diags,
+    mode: LowerMode,
+
+    // .scripted: jobs are built up here as `stage`/implicit-`main` blocks close.
+    jobs: std.ArrayList(ir.Job) = .empty,
+    prev_needs: [][]const u8 = &.{},
+    cur_stage_id: ?[]const u8 = null,
+    cur_steps: std.ArrayList(ir.Step) = .empty,
+    cur_runs_on: []const u8 = "",
+    node_depth: u32 = 0,
+    in_parallel_branch: bool = false,
+    stage_name_counts: std.StringArrayHashMapUnmanaged(u32) = .empty,
+
+    // .script_block: steps append directly into the enclosing declarative job.
+    out_steps: ?*std.ArrayList(ir.Step) = null,
+
+    // Shared context stacks (both modes).
+    workdir_stack: std.ArrayList([]const u8) = .empty,
+    with_env_stack: std.ArrayList([]const ir.EnvPair) = .empty,
+    // Pointer so declarative `script{}` blocks share the enclosing job's
+    // counter — step ids must stay unique across both lowering paths.
+    step_counts: *std.StringArrayHashMapUnmanaged(u32),
+
+    fn currentWorkdir(self: *Lowering) ?[]const u8 {
+        if (self.workdir_stack.items.len == 0) return null;
+        return self.workdir_stack.items[self.workdir_stack.items.len - 1];
+    }
+
+    fn snapshotEnv(self: *Lowering, interp: *groovy_interp.Interp) ![]ir.EnvPair {
+        var out: std.ArrayList(ir.EnvPair) = .empty;
+        if (interp.getGlobal("env")) |v| {
+            if (v == .map) {
+                var it = v.map.iterator();
+                while (it.next()) |entry| {
+                    const val_str = try interp.toStr(entry.value_ptr.*);
+                    try out.append(self.alloc, .{ .name = entry.key_ptr.*, .value = val_str });
+                }
+            }
+        }
+        for (self.with_env_stack.items) |frame| try out.appendSlice(self.alloc, frame);
+        return out.toOwnedSlice(self.alloc);
+    }
+
+    fn appendStep(self: *Lowering, step: ir.Step) !void {
+        switch (self.mode) {
+            .scripted => {
+                if (self.cur_stage_id == null) {
+                    self.cur_stage_id = try self.uniqueStageName("main", step.src_line, 1);
+                    self.cur_steps = .empty;
+                }
+                try self.cur_steps.append(self.alloc, step);
+            },
+            .script_block => try self.out_steps.?.append(self.alloc, step),
+        }
+    }
+
+    fn predefinedEnv(self: *Lowering) ![]ir.EnvPair {
+        var out: std.ArrayList(ir.EnvPair) = .empty;
+        try out.append(self.alloc, .{ .name = "BUILD_NUMBER", .value = "1" });
+        try out.append(self.alloc, .{ .name = "JOB_NAME", .value = "pipeline" });
+        return out.toOwnedSlice(self.alloc);
+    }
+
+    /// Deduplicates stage/branch job ids: first use of a name passes through
+    /// unchanged; repeats are suffixed "-2", "-3", ... with a warning.
+    fn uniqueStageName(self: *Lowering, name: []const u8, line: u32, col: u32) ![]const u8 {
+        const gop = try self.stage_name_counts.getOrPut(self.alloc, name);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = 1;
+            return name;
+        }
+        gop.value_ptr.* += 1;
+        const n = gop.value_ptr.*;
+        const suffixed = try std.fmt.allocPrint(self.alloc, "{s}-{d}", .{ name, n });
+        try warn(self.diags, line, col, "duplicate stage name '{s}' (renamed to '{s}')", .{ name, suffixed });
+        return suffixed;
+    }
+
+    /// Finalizes whatever stage is currently open (explicit or the lazily
+    /// created implicit "main") into a Job, chains `prev_needs` onto it, and
+    /// clears the current-stage state.
+    fn commitCurrentStage(self: *Lowering) !void {
+        const id = self.cur_stage_id orelse return;
+        try self.jobs.append(self.alloc, .{
+            .id = id,
+            .display_name = id,
+            .runs_on = self.cur_runs_on,
+            .needs = self.prev_needs,
+            .env = try self.predefinedEnv(),
+            .steps = try self.cur_steps.toOwnedSlice(self.alloc),
+            .provider = .jenkins,
+        });
+        const needs = try self.alloc.alloc([]const u8, 1);
+        needs[0] = id;
+        self.prev_needs = needs;
+        self.cur_stage_id = null;
+        self.cur_steps = .empty;
+    }
+};
+
+fn trailingClosure(args: []groovy_interp.Value) ?groovy_interp.ClosureVal {
+    if (args.len == 0) return null;
+    return switch (args[args.len - 1]) {
+        .closure => |c| c,
+        else => null,
+    };
+}
+
+fn hostCall(ctx: *anyopaque, interp: *groovy_interp.Interp, name: []const u8, args: []groovy_interp.Value, named: []const groovy_interp.NamedArg, line: u32, col: u32) groovy_interp.InterpError!groovy_interp.Value {
+    const self: *Lowering = @ptrCast(@alignCast(ctx));
+    const diags = self.diags;
+    const nul = groovy_interp.Value{ .nul = {} };
+
+    if (self.mode == .script_block and (std.mem.eql(u8, name, "stage") or std.mem.eql(u8, name, "node") or std.mem.eql(u8, name, "parallel"))) {
+        try diags.add(line, col, "groovy: '{s}' is not allowed inside script blocks", .{name});
+        return error.EvalFailed;
+    }
+
+    if (std.mem.eql(u8, name, "node")) {
+        const closure = trailingClosure(args);
+        const label_count: usize = if (closure != null) args.len - 1 else args.len;
+        var label: []const u8 = "";
+        if (label_count >= 1 and args[0] == .string) label = args[0].string;
+        if (self.node_depth > 0) {
+            try warn(diags, line, col, "nested node blocks are not supported (inner runs in same context)", .{});
+        }
+        self.node_depth += 1;
+        const prev_runs_on = self.cur_runs_on;
+        if (label.len > 0) self.cur_runs_on = label;
+        defer {
+            self.node_depth -= 1;
+            self.cur_runs_on = prev_runs_on;
+        }
+        if (closure) |c| _ = try interp.callClosure(c, &.{});
+        return nul;
+    }
+
+    if (std.mem.eql(u8, name, "stage")) {
+        const closure = trailingClosure(args);
+        const name_count: usize = if (closure != null) args.len - 1 else args.len;
+        if (name_count == 0) {
+            try diags.add(line, col, "stage requires a name", .{});
+            return error.EvalFailed;
+        }
+        const stage_name = try interp.toStr(args[0]);
+        if (self.in_parallel_branch) {
+            try warn(diags, line, col, "nested stage inside parallel branch is flattened", .{});
+            if (closure) |c| _ = try interp.callClosure(c, &.{});
+            return nul;
+        }
+        if (self.cur_stage_id != null) try self.commitCurrentStage();
+        self.cur_stage_id = try self.uniqueStageName(stage_name, line, col);
+        self.cur_steps = .empty;
+        if (closure) |c| _ = try interp.callClosure(c, &.{});
+        try self.commitCurrentStage();
+        return nul;
+    }
+
+    if (std.mem.eql(u8, name, "parallel")) {
+        if (self.cur_stage_id != null) try self.commitCurrentStage();
+        const base_needs = self.prev_needs;
+        const Branch = struct { name: []const u8, closure: groovy_interp.ClosureVal };
+        var branches: std.ArrayList(Branch) = .empty;
+        for (named) |n| {
+            if (std.mem.eql(u8, n.name, "failFast")) {
+                try warn(diags, line, col, "parallel(failFast:) is not simulated (ignored)", .{});
+                continue;
+            }
+            if (n.value != .closure) {
+                try warn(diags, line, col, "parallel branch '{s}' is not a closure (ignored)", .{n.name});
+                continue;
+            }
+            try branches.append(self.alloc, .{ .name = n.name, .closure = n.value.closure });
+        }
+        for (args) |a| {
+            if (a == .map) {
+                var it = a.map.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.* != .closure) continue;
+                    try branches.append(self.alloc, .{ .name = entry.key_ptr.*, .closure = entry.value_ptr.*.closure });
+                }
+            }
+        }
+        var branch_ids: std.ArrayList([]const u8) = .empty;
+        for (branches.items) |b| {
+            const id = try self.uniqueStageName(b.name, line, col);
+            self.cur_stage_id = id;
+            self.cur_steps = .empty;
+            const prev_in_parallel = self.in_parallel_branch;
+            self.in_parallel_branch = true;
+            _ = try interp.callClosure(b.closure, &.{});
+            self.in_parallel_branch = prev_in_parallel;
+            try self.jobs.append(self.alloc, .{
+                .id = id,
+                .display_name = id,
+                .runs_on = self.cur_runs_on,
+                .needs = base_needs,
+                .env = try self.predefinedEnv(),
+                .steps = try self.cur_steps.toOwnedSlice(self.alloc),
+                .provider = .jenkins,
+            });
+            try branch_ids.append(self.alloc, id);
+            self.cur_stage_id = null;
+            self.cur_steps = .empty;
+        }
+        self.prev_needs = try branch_ids.toOwnedSlice(self.alloc);
+        return nul;
+    }
+
+    if (std.mem.eql(u8, name, "sh") or std.mem.eql(u8, name, "bat") or
+        std.mem.eql(u8, name, "powershell") or std.mem.eql(u8, name, "pwsh"))
+    {
+        var script: ?[]const u8 = null;
+        for (args) |a| if (a == .string) {
+            script = a.string;
+        };
+        var return_stdout = false;
+        var return_status = false;
+        for (named) |n| {
+            if (std.mem.eql(u8, n.name, "script")) {
+                script = try interp.toStr(n.value);
+            } else if (std.mem.eql(u8, n.name, "returnStdout")) {
+                return_stdout = groovy_interp.truthy(n.value);
+            } else if (std.mem.eql(u8, n.name, "returnStatus")) {
+                return_status = groovy_interp.truthy(n.value);
+            } else {
+                try warn(diags, line, col, "{s} argument '{s}' is ignored", .{ name, n.name });
+            }
+        }
+        if (script == null) {
+            try diags.add(line, col, "'{s}' requires a script argument", .{name});
+            return error.EvalFailed;
+        }
+        const shell: ?[]const u8 = if (std.mem.eql(u8, name, "bat"))
+            "cmd"
+        else if (std.mem.eql(u8, name, "powershell") or std.mem.eql(u8, name, "pwsh"))
+            "pwsh"
+        else
+            null;
+        const id = try nextStepId(self.alloc, self.step_counts, name);
+        try self.appendStep(.{
+            .id = id,
+            .name = id,
+            .kind = .run,
+            .script = script.?,
+            .shell = shell,
+            .env = try self.snapshotEnv(interp),
+            .workdir = self.currentWorkdir(),
+            .src_line = line,
+        });
+        if (return_stdout or return_status) {
+            try warn(diags, line, col, "{s} with returnStdout/returnStatus is not available at lowering time (empty result)", .{name});
+        }
+        if (return_stdout) return .{ .string = "" };
+        if (return_status) return .{ .int = 0 };
+        return nul;
+    }
+
+    if (std.mem.eql(u8, name, "echo") or std.mem.eql(u8, name, "println")) {
+        const text = if (args.len > 0) try interp.toStr(args[0]) else "";
+        const id = try nextStepId(self.alloc, self.step_counts, "echo");
+        try self.appendStep(.{
+            .id = id,
+            .name = id,
+            .kind = .run,
+            .script = try std.fmt.allocPrint(self.alloc, "echo {s}", .{text}),
+            .env = try self.snapshotEnv(interp),
+            .workdir = self.currentWorkdir(),
+            .src_line = line,
+        });
+        return nul;
+    }
+
+    if (std.mem.eql(u8, name, "sleep")) {
+        var time_val: []const u8 = "0";
+        if (args.len > 0) time_val = try interp.toStr(args[0]);
+        for (named) |n| if (std.mem.eql(u8, n.name, "time")) {
+            time_val = try interp.toStr(n.value);
+        };
+        const id = try nextStepId(self.alloc, self.step_counts, "sleep");
+        try self.appendStep(.{
+            .id = id,
+            .name = id,
+            .kind = .run,
+            .script = try std.fmt.allocPrint(self.alloc, "sleep {s}", .{time_val}),
+            .env = try self.snapshotEnv(interp),
+            .workdir = self.currentWorkdir(),
+            .src_line = line,
+        });
+        return nul;
+    }
+
+    if (std.mem.eql(u8, name, "error")) {
+        const msg = if (args.len > 0) try interp.toStr(args[0]) else "";
+        const id = try nextStepId(self.alloc, self.step_counts, "error");
+        try self.appendStep(.{
+            .id = id,
+            .name = id,
+            .kind = .run,
+            .script = try std.fmt.allocPrint(self.alloc, "echo {s}; exit 1", .{msg}),
+            .env = try self.snapshotEnv(interp),
+            .workdir = self.currentWorkdir(),
+            .src_line = line,
+        });
+        return nul;
+    }
+
+    if (std.mem.eql(u8, name, "dir")) {
+        const closure = trailingClosure(args);
+        var path: []const u8 = "";
+        if (args.len >= 1 and args[0] == .string) path = args[0].string;
+        const parent = self.currentWorkdir();
+        const joined = if (parent) |p| (if (path.len > 0) try std.fs.path.join(self.alloc, &.{ p, path }) else p) else path;
+        try self.workdir_stack.append(self.alloc, joined);
+        if (closure) |c| _ = try interp.callClosure(c, &.{});
+        _ = self.workdir_stack.pop();
+        return nul;
+    }
+
+    if (std.mem.eql(u8, name, "withEnv")) {
+        const closure = trailingClosure(args);
+        var pairs: std.ArrayList(ir.EnvPair) = .empty;
+        if (args.len >= 1 and args[0] == .list) {
+            for (args[0].list.items) |it| {
+                const raw = try interp.toStr(it);
+                if (std.mem.indexOfScalar(u8, raw, '=')) |eq| {
+                    try pairs.append(self.alloc, .{ .name = raw[0..eq], .value = raw[eq + 1 ..] });
+                } else {
+                    try warn(diags, line, col, "withEnv entry '{s}' is malformed (ignored)", .{raw});
+                }
+            }
+        }
+        try self.with_env_stack.append(self.alloc, try pairs.toOwnedSlice(self.alloc));
+        if (closure) |c| _ = try interp.callClosure(c, &.{});
+        _ = self.with_env_stack.pop();
+        return nul;
+    }
+
+    const skip_names = [_][]const u8{ "input", "checkout", "properties", "archiveArtifacts", "junit", "stash", "unstash", "build", "emailext" };
+    for (skip_names) |kw| if (std.mem.eql(u8, name, kw)) {
+        try warn(diags, line, col, "'{s}' is not supported (skipped)", .{name});
+        return nul;
+    };
+
+    const sim_names = [_][]const u8{ "timeout", "retry", "catchError", "ansiColor", "withCredentials" };
+    for (sim_names) |kw| if (std.mem.eql(u8, name, kw)) {
+        const closure = trailingClosure(args);
+        if (closure) |c| {
+            try warn(diags, line, col, "'{s}' is not simulated (inner steps run)", .{name});
+            if (std.mem.eql(u8, name, "withCredentials")) {
+                try warn(diags, line, col, "credentials are unavailable in withCredentials (skipped)", .{});
+            }
+            _ = try interp.callClosure(c, &.{});
+        } else {
+            try warn(diags, line, col, "'{s}' is not supported (skipped)", .{name});
+        }
+        return nul;
+    };
+
+    try warn(diags, line, col, "step '{s}' is not supported (skipped)", .{name});
+    return nul;
+}
+
+fn parseScripted(alloc: std.mem.Allocator, source_path: []const u8, source: []const u8, diags: *yaml.Diags) ParseError!ir.Pipeline {
+    const stmts = try groovy_ast.parse(alloc, source, diags);
+
+    const scripted_counts = try alloc.create(std.StringArrayHashMapUnmanaged(u32));
+    scripted_counts.* = .empty;
+    const lowering = try alloc.create(Lowering);
+    lowering.* = .{ .alloc = alloc, .diags = diags, .mode = .scripted, .step_counts = scripted_counts };
+
+    const host = groovy_interp.Host{ .ctx = @ptrCast(lowering), .call = hostCall };
+    const interp = try groovy_interp.Interp.init(alloc, diags, host);
+    try seedGlobals(alloc, interp, &.{}, &.{});
+
+    _ = interp.run(stmts) catch |e| switch (e) {
+        error.EvalFailed => return error.ParseFailed,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    if (lowering.cur_stage_id != null) try lowering.commitCurrentStage();
+
+    if (hasHardError(diags)) return error.ParseFailed;
+
+    var total_steps: usize = 0;
+    for (lowering.jobs.items) |j| total_steps += j.steps.len;
+    if (total_steps == 0) {
+        try diags.add(1, 1, "scripted pipeline produced no steps", .{});
+        return error.ParseFailed;
+    }
+
+    return .{ .name = "pipeline", .source_path = source_path, .jobs = try lowering.jobs.toOwnedSlice(alloc) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,7 +1932,7 @@ test "${env.X} and ${params.Y} rewrite to ${X} and ${Y} in sh scripts" {
     try std.testing.expectEqualStrings("echo ${FOO} ${BAR} ${OTHER}", pipeline.jobs[0].steps[0].script);
 }
 
-test "scripted 'script' block warns and is skipped; checkout warns and is skipped" {
+test "checkout warns and is skipped; declarative script { } step runs for real" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1285,7 +1944,7 @@ test "scripted 'script' block warns and is skipped; checkout warns and is skippe
         \\        stage('Build') {
         \\            steps {
         \\                checkout scm
-        \\                script { x = 1 }
+        \\                script { sh 'from-script' }
         \\                sh 'echo after'
         \\            }
         \\        }
@@ -1293,18 +1952,79 @@ test "scripted 'script' block warns and is skipped; checkout warns and is skippe
         \\}
     ;
     const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs[0].steps.len);
-    try std.testing.expectEqualStrings("echo after", pipeline.jobs[0].steps[0].script);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.jobs[0].steps.len);
+    try std.testing.expectEqualStrings("from-script", pipeline.jobs[0].steps[0].script);
+    try std.testing.expectEqualStrings("echo after", pipeline.jobs[0].steps[1].script);
     var checkout_warn = false;
-    var script_warn = false;
-    for (diags.list.items) |d| {
-        if (std.mem.indexOf(u8, d.msg, "checkout") != null) checkout_warn = true;
-        if (std.mem.indexOf(u8, d.msg, "scripted 'script'") != null) script_warn = true;
-    }
-    try std.testing.expect(checkout_warn and script_warn);
+    for (diags.list.items) |d| if (std.mem.indexOf(u8, d.msg, "checkout") != null) {
+        checkout_warn = true;
+    };
+    try std.testing.expect(checkout_warn);
 }
 
-test "top-level 'node' block is rejected with a scripted-pipeline hint" {
+test "declarative script { } supports a for-loop; nested stage() inside script is rejected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\pipeline {
+        \\    agent any
+        \\    stages {
+        \\        stage('Build') {
+        \\            steps {
+        \\                script { for (i in 1..2) { sh "s${i}" } }
+        \\            }
+        \\        }
+        \\    }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.jobs[0].steps.len);
+    try std.testing.expectEqualStrings("s1", pipeline.jobs[0].steps[0].script);
+    try std.testing.expectEqualStrings("s2", pipeline.jobs[0].steps[1].script);
+
+    var diags2 = yaml.Diags.init(a);
+    const bad_source =
+        \\pipeline {
+        \\    agent any
+        \\    stages {
+        \\        stage('Build') {
+        \\            steps { script { stage('x') {} } }
+        \\        }
+        \\    }
+        \\}
+    ;
+    try std.testing.expectError(error.ParseFailed, parsePipeline(a, "Jenkinsfile", bad_source, &diags2));
+    var found = false;
+    for (diags2.list.items) |d| if (std.mem.indexOf(u8, d.msg, "not allowed inside script blocks") != null) {
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "scripted: node + two stages + sh lower to two jobs with sequential needs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\node {
+        \\    stage('Build') { sh 'echo build' }
+        \\    stage('Test') { sh 'echo test' }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.jobs.len);
+    try std.testing.expectEqualStrings("Build", pipeline.jobs[0].id);
+    try std.testing.expectEqualStrings("Test", pipeline.jobs[1].id);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs[1].needs.len);
+    try std.testing.expectEqualStrings("Build", pipeline.jobs[1].needs[0]);
+    try std.testing.expectEqual(ir.Provider.jenkins, pipeline.jobs[0].provider);
+    try std.testing.expectEqualStrings("1", findEnv(pipeline.jobs[0].env, "BUILD_NUMBER").?);
+}
+
+test "scripted: steps before any stage() open an implicit 'main' job" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1314,9 +2034,186 @@ test "top-level 'node' block is rejected with a scripted-pipeline hint" {
         \\    sh 'echo hi'
         \\}
     ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expectEqualStrings("main", pipeline.jobs[0].id);
+    try std.testing.expectEqualStrings("echo hi", pipeline.jobs[0].steps[0].script);
+}
+
+test "scripted: for-in loop over a range renders interpolated scripts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\node {
+        \\    stage('Build') {
+        \\        for (i in 1..3) { sh "echo ${i}" }
+        \\    }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    try std.testing.expectEqual(@as(usize, 3), pipeline.jobs[0].steps.len);
+    try std.testing.expectEqualStrings("echo 1", pipeline.jobs[0].steps[0].script);
+    try std.testing.expectEqualStrings("echo 2", pipeline.jobs[0].steps[1].script);
+    try std.testing.expectEqualStrings("echo 3", pipeline.jobs[0].steps[2].script);
+}
+
+test "scripted: a def closure invoked inside a stage lands its step in that stage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\def deploy = { sh 'd' }
+        \\node {
+        \\    stage('D') { deploy() }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    const d = findJob(pipeline, "D").?;
+    try std.testing.expectEqual(@as(usize, 1), d.steps.len);
+    try std.testing.expectEqualStrings("d", d.steps[0].script);
+}
+
+test "scripted: env.FOO assignment between steps only affects later steps" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\node {
+        \\    stage('Build') {
+        \\        sh 'echo first'
+        \\        env.FOO = 'x'
+        \\        sh 'echo second'
+        \\    }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    const job = pipeline.jobs[0];
+    try std.testing.expect(findEnv(job.steps[0].env, "FOO") == null);
+    try std.testing.expectEqualStrings("x", findEnv(job.steps[1].env, "FOO").?);
+}
+
+test "scripted: dir() sets workdir, withEnv() sets step env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\node {
+        \\    stage('Build') {
+        \\        dir('sub') { sh 'a' }
+        \\        withEnv(['A=1']) { sh 'b' }
+        \\    }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    const job = pipeline.jobs[0];
+    try std.testing.expectEqualStrings("sub", job.steps[0].workdir.?);
+    try std.testing.expectEqualStrings("1", findEnv(job.steps[1].env, "A").?);
+}
+
+test "scripted: parallel() between stages fans out and fans back in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\node {
+        \\    stage('A') { sh 'echo a' }
+        \\    parallel(b1: { sh 'echo b1' }, b2: { sh 'echo b2' })
+        \\    stage('C') { sh 'echo c' }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    const b1 = findJob(pipeline, "b1").?;
+    const b2 = findJob(pipeline, "b2").?;
+    const c = findJob(pipeline, "C").?;
+    try std.testing.expectEqualStrings("A", b1.needs[0]);
+    try std.testing.expectEqualStrings("A", b2.needs[0]);
+    try std.testing.expectEqual(@as(usize, 2), c.needs.len);
+    try std.testing.expectEqualStrings("b1", c.needs[0]);
+    try std.testing.expectEqualStrings("b2", c.needs[1]);
+}
+
+test "scripted: sh(script:, returnStdout: true) warns but still creates the step" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\node {
+        \\    stage('Build') {
+        \\        def out = sh(script: 'x', returnStdout: true)
+        \\        echo "got:${out}"
+        \\    }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    const job = pipeline.jobs[0];
+    try std.testing.expectEqual(@as(usize, 2), job.steps.len);
+    try std.testing.expectEqualStrings("x", job.steps[0].script);
+    try std.testing.expectEqualStrings("echo got:", job.steps[1].script);
+    var found_warn = false;
+    for (diags.list.items) |d| if (std.mem.indexOf(u8, d.msg, "returnStdout") != null) {
+        found_warn = true;
+    };
+    try std.testing.expect(found_warn);
+}
+
+test "scripted: error('msg') lowers to a step whose script contains exit 1" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\node {
+        \\    stage('Build') { error('boom') }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    try std.testing.expect(std.mem.indexOf(u8, pipeline.jobs[0].steps[0].script, "exit 1") != null);
+}
+
+test "scripted: checkout warns skipped; timeout() runs its inner steps" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\node {
+        \\    stage('Build') {
+        \\        checkout scm
+        \\        timeout(10) { sh 'x' }
+        \\    }
+        \\}
+    ;
+    const pipeline = try parsePipeline(a, "Jenkinsfile", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs[0].steps.len);
+    try std.testing.expectEqualStrings("x", pipeline.jobs[0].steps[0].script);
+    var checkout_warn = false;
+    for (diags.list.items) |d| if (std.mem.indexOf(u8, d.msg, "checkout") != null) {
+        checkout_warn = true;
+    };
+    try std.testing.expect(checkout_warn);
+}
+
+test "scripted: a Groovy syntax error surfaces as ParseFailed with a 'groovy: ' diag" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\node {
+        \\    sh 'echo hi'
+        \\    if (
+        \\}
+    ;
     try std.testing.expectError(error.ParseFailed, parsePipeline(a, "Jenkinsfile", source, &diags));
     var found = false;
-    for (diags.list.items) |d| if (std.mem.indexOf(u8, d.msg, "scripted pipelines are not supported") != null) {
+    for (diags.list.items) |d| if (std.mem.startsWith(u8, d.msg, "groovy: ")) {
         found = true;
     };
     try std.testing.expect(found);
