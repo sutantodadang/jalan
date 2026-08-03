@@ -13,6 +13,24 @@ pub const Breakpoint = struct {
 
 pub const PromptKind = enum { breakpoint, failure };
 
+/// Per-job status for the TUI's DAG panel, kept separate from
+/// `engine.JobStatus` (which only exists once a job finishes): `pending`
+/// covers a job that hasn't started or hasn't finished (this codebase
+/// doesn't track an in-between "started" flag per job), `running` marks the
+/// job that owns the currently-open prompt. ASCII-only glyphs — safe even if
+/// a terminal is left at a non-UTF-8 codepage.
+pub const JobDagStatus = enum { pending, running, success, failed, skipped };
+
+pub fn dagGlyph(status: JobDagStatus) u8 {
+    return switch (status) {
+        .pending => '.',
+        .running => '>',
+        .success => 'v',
+        .failed => 'x',
+        .skipped => '-',
+    };
+}
+
 /// Snapshot supplied to injected/UI prompts. Slices remain valid for the
 /// duration of the callback; values in `effective_env` are already masked.
 pub const PromptState = struct {
@@ -26,6 +44,9 @@ pub const PromptState = struct {
     workspace: []const u8,
     workdir: ?[]const u8,
     effective_env: []const ir.EnvPair,
+    // Parallel to the pipeline's job list; empty when the caller hasn't
+    // threaded job state in (e.g. direct unit tests of makePromptState).
+    job_statuses: []const JobDagStatus = &.{},
 };
 
 pub fn matches(bp: Breakpoint, job_id: []const u8, step_id: []const u8, index: usize) bool {
@@ -99,6 +120,14 @@ test "parseCmd accepts breakpoint commands and rejects unknown input" {
         .{ .text = "wat", .want = .invalid },
     };
     for (cases) |case| try std.testing.expectEqual(case.want, parseCmd(case.text));
+}
+
+test "dagGlyph: one ASCII glyph per DAG status" {
+    try std.testing.expectEqual(@as(u8, '.'), dagGlyph(.pending));
+    try std.testing.expectEqual(@as(u8, '>'), dagGlyph(.running));
+    try std.testing.expectEqual(@as(u8, 'v'), dagGlyph(.success));
+    try std.testing.expectEqual(@as(u8, 'x'), dagGlyph(.failed));
+    try std.testing.expectEqual(@as(u8, '-'), dagGlyph(.skipped));
 }
 
 test "matches accepts step id or index in the selected job" {

@@ -18,9 +18,106 @@ pub const Conn = struct {
     }
 };
 
+// Total time budget (wall clock) to keep retrying a busy Windows named pipe
+// before giving up and surfacing the original error.
+const windows_pipe_retry_budget_ms: i64 = 30_000;
+// Per-wait timeout passed to WaitNamedPipeW: how long it blocks for a pipe
+// instance to free up before we loop around and try opening again.
+const windows_pipe_wait_timeout_ms: u32 = 2000;
+// Fallback pause when WaitNamedPipeW itself can't be used (path conversion
+// failed) or reports no luck, so the retry loop doesn't spin hot.
+const windows_pipe_sleep_ns: u64 = 50 * std.time.ns_per_ms;
+
+// std.os.windows.kernel32 doesn't bind this — declare it locally, mirroring
+// the SetConsoleOutputCP/SetConsoleCP externs in main.zig (same calling
+// convention style).
+extern "kernel32" fn WaitNamedPipeW(lpNamedPipeName: [*:0]const u16, nTimeOut: u32) callconv(.winapi) c_int;
+
+/// Which `connect()` failures are worth retrying rather than surfacing
+/// immediately. Under parallel job setup (several worker threads dialing the
+/// daemon at once — e.g. one job's HTTP calls racing another job's slow
+/// `docker pull`), a Windows named pipe reports busy/unavailable, which Zig
+/// surfaces as `error.NoDevice` or `error.PipeBusy` depending on the exact
+/// Win32 code path (see std/os/windows.zig: NO_MEDIA_IN_DEVICE and
+/// PIPE_NOT_AVAILABLE both map to NoDevice; PIPE_BUSY maps to PipeBusy).
+/// Deliberately does NOT include AccessDenied: unlike the other two, Windows
+/// doesn't document that as a *transient* busy-pipe signal, so treating it
+/// as retryable risked masking a real permissions failure.
+fn isRetryablePipeError(err: anyerror) bool {
+    return switch (err) {
+        error.NoDevice, error.PipeBusy => true,
+        else => false,
+    };
+}
+
+/// Generic busy-resource retry driver: calls `attempt`, and while it fails
+/// with a retryable error (per `isRetryablePipeError`) and the elapsed time
+/// (per `nowMs`) is still under `budget_ms`, calls `waitFn` and tries again.
+/// `Ctx`/`T` are generic and `nowMs`/`waitFn` are injected so this is
+/// unit-testable without a real named pipe: a fake `attempt` can fail N times
+/// then succeed, a fake clock can fast-forward past the budget, etc. (see
+/// tests below). The real Windows path instantiates this with `T = std.fs.File`.
+fn retryBusyResource(
+    comptime Ctx: type,
+    comptime T: type,
+    ctx: Ctx,
+    attempt: *const fn (Ctx) anyerror!T,
+    nowMs: *const fn () i64,
+    waitFn: *const fn (Ctx) void,
+    budget_ms: i64,
+) !T {
+    const start = nowMs();
+    while (true) {
+        return attempt(ctx) catch |err| {
+            if (!isRetryablePipeError(err)) return err;
+            if (nowMs() - start >= budget_ms) return err;
+            waitFn(ctx);
+            continue;
+        };
+    }
+}
+
+const WindowsPipeCtx = struct { socket_path: []const u8 };
+
+fn windowsPipeAttempt(ctx: WindowsPipeCtx) anyerror!std.fs.File {
+    return std.fs.openFileAbsolute(ctx.socket_path, .{ .mode = .read_write });
+}
+
+fn windowsPipeWait(ctx: WindowsPipeCtx) void {
+    // Pipe paths (`\\.\pipe\...`) are short; a fixed stack buffer avoids
+    // needing an allocator here (`connect` doesn't take one). On conversion
+    // failure, just fall back to a short sleep-retry rather than failing the
+    // whole connect attempt over a path-encoding edge case.
+    var wbuf: [260]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(wbuf[0 .. wbuf.len - 1], ctx.socket_path) catch {
+        std.Thread.sleep(windows_pipe_sleep_ns);
+        return;
+    };
+    wbuf[wlen] = 0;
+    const wpath: [:0]const u16 = wbuf[0..wlen :0];
+    if (WaitNamedPipeW(wpath.ptr, windows_pipe_wait_timeout_ms) == 0) {
+        // WaitNamedPipeW itself errored/timed out (returns 0 = FALSE) — its
+        // return doesn't guarantee a slot is actually free anyway, so either
+        // way just fall back to a short sleep before the next open attempt.
+        std.Thread.sleep(windows_pipe_sleep_ns);
+    }
+}
+
+fn connectWindows(socket_path: []const u8) !std.fs.File {
+    return retryBusyResource(
+        WindowsPipeCtx,
+        std.fs.File,
+        .{ .socket_path = socket_path },
+        &windowsPipeAttempt,
+        &std.time.milliTimestamp,
+        &windowsPipeWait,
+        windows_pipe_retry_budget_ms,
+    );
+}
+
 pub fn connect(c: Client) !Conn {
     if (builtin.os.tag == .windows) {
-        const f = try std.fs.openFileAbsolute(c.socket_path, .{ .mode = .read_write });
+        const f = try connectWindows(c.socket_path);
         return .{ .file = f };
     } else {
         const stream = try std.net.connectUnixSocket(c.socket_path);
@@ -697,6 +794,71 @@ test "socketFromEnvValue parses DOCKER_HOST schemes" {
     try std.testing.expectEqualStrings("/x/y.sock", socketFromEnvValue(a, "unix:///x/y.sock").?);
     try std.testing.expectEqualStrings("\\\\.\\pipe\\p", socketFromEnvValue(a, "npipe:////./pipe/p").?);
     try std.testing.expect(socketFromEnvValue(a, "tcp://127.0.0.1:2375") == null);
+}
+
+test "isRetryablePipeError: classifies busy-pipe errors, not others" {
+    try std.testing.expect(isRetryablePipeError(error.NoDevice));
+    try std.testing.expect(isRetryablePipeError(error.PipeBusy));
+    try std.testing.expect(!isRetryablePipeError(error.AccessDenied));
+    try std.testing.expect(!isRetryablePipeError(error.FileNotFound));
+}
+
+// Test seam for `retryBusyResource`: no real named pipes, just fake
+// attempt/clock/wait functions driven by module-level counters (function
+// pointers can't close over local state in Zig).
+const RetryTestCtx = struct {};
+var retry_test_attempts: usize = 0;
+var retry_test_fail_count: usize = 0;
+var retry_test_wait_calls: usize = 0;
+var retry_test_clock_ms: i64 = 0;
+
+fn retryTestAttempt(_: RetryTestCtx) anyerror!i32 {
+    retry_test_attempts += 1;
+    if (retry_test_attempts <= retry_test_fail_count) return error.PipeBusy;
+    return 42;
+}
+
+fn retryTestNowMs() i64 {
+    return retry_test_clock_ms;
+}
+
+fn retryTestWait(_: RetryTestCtx) void {
+    retry_test_wait_calls += 1;
+    retry_test_clock_ms += 100; // simulate elapsed time without a real sleep
+}
+
+test "retryBusyResource: retries a retryable error until it succeeds" {
+    retry_test_attempts = 0;
+    retry_test_fail_count = 3;
+    retry_test_wait_calls = 0;
+    retry_test_clock_ms = 0;
+
+    const result = try retryBusyResource(RetryTestCtx, i32, .{}, &retryTestAttempt, &retryTestNowMs, &retryTestWait, 10_000);
+    try std.testing.expectEqual(@as(i32, 42), result);
+    try std.testing.expectEqual(@as(usize, 4), retry_test_attempts);
+    try std.testing.expectEqual(@as(usize, 3), retry_test_wait_calls);
+}
+
+test "retryBusyResource: gives up once the time budget is exhausted, returns original error" {
+    retry_test_attempts = 0;
+    retry_test_fail_count = std.math.maxInt(usize); // never succeeds
+    retry_test_wait_calls = 0;
+    retry_test_clock_ms = 0;
+
+    try std.testing.expectError(error.PipeBusy, retryBusyResource(RetryTestCtx, i32, .{}, &retryTestAttempt, &retryTestNowMs, &retryTestWait, 250));
+    try std.testing.expect(retry_test_wait_calls >= 2);
+}
+
+test "retryBusyResource: non-retryable error returns immediately without waiting" {
+    retry_test_wait_calls = 0;
+
+    const AlwaysFail = struct {
+        fn attempt(_: RetryTestCtx) anyerror!i32 {
+            return error.AccessDenied;
+        }
+    };
+    try std.testing.expectError(error.AccessDenied, retryBusyResource(RetryTestCtx, i32, .{}, &AlwaysFail.attempt, &retryTestNowMs, &retryTestWait, 10_000));
+    try std.testing.expectEqual(@as(usize, 0), retry_test_wait_calls);
 }
 
 test "tarSingleFile produces valid ustar header" {
