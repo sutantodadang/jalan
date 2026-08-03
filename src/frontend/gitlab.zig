@@ -13,7 +13,8 @@ const job_keys = [_][]const u8{
 };
 const job_supported = [_][]const u8{ "script", "stage", "needs", "variables", "before_script", "image", "services", "parallel", "allow_failure", "extends", "after_script", "rules", "when" };
 const unsafe_job_keys = [_][]const u8{};
-const unsafe_root_keys = [_][]const u8{"include"};
+const unsafe_root_keys = [_][]const u8{};
+const include_unsupported_types = [_][]const u8{ "file", "project", "remote", "template", "component" };
 const rule_keys = [_][]const u8{ "if", "when", "variables", "allow_failure", "changes", "exists" };
 
 fn contains(list: []const []const u8, value: []const u8) bool {
@@ -770,11 +771,123 @@ fn appendExpanded(alloc: std.mem.Allocator, jobs: *std.ArrayList(ir.Job), base: 
     }
 }
 
+fn stripKey(alloc: std.mem.Allocator, node: yaml.Node, key: []const u8) !yaml.Node {
+    const m = switch (node.data) {
+        .map => |value| value,
+        else => return node,
+    };
+    var out: yaml.Map = .empty;
+    var it = m.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, key)) continue;
+        try out.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    return .{ .line = node.line, .col = node.col, .data = .{ .map = out } };
+}
+
+fn resolveIncludePath(entry: yaml.Node, diags: *yaml.Diags) !?[]const u8 {
+    switch (entry.data) {
+        .scalar => |s| return s,
+        .map => |m| {
+            var it = m.iterator();
+            while (it.next()) |kv| {
+                if (contains(&include_unsupported_types, kv.key_ptr.*)) {
+                    try warn(diags, entry, "include type '{s}' is not supported locally (ignored)", .{kv.key_ptr.*});
+                    return null;
+                }
+            }
+            const local_node = m.get("local") orelse {
+                try diags.add(entry.line, entry.col, "'include' must be a path, mapping, or list", .{});
+                return null;
+            };
+            var it2 = m.iterator();
+            while (it2.next()) |kv| {
+                if (!std.mem.eql(u8, kv.key_ptr.*, "local"))
+                    try warn(diags, kv.value_ptr.*, "include key '{s}' is not simulated (ignored)", .{kv.key_ptr.*});
+            }
+            return local_node.scalarOr("");
+        },
+        .seq => {
+            try diags.add(entry.line, entry.col, "'include' must be a path, mapping, or list", .{});
+            return null;
+        },
+    }
+}
+
+fn expandIncludes(
+    alloc: std.mem.Allocator,
+    source_path: []const u8,
+    root: yaml.Node,
+    visited: *std.StringArrayHashMapUnmanaged(void),
+    depth: u32,
+    diags: *yaml.Diags,
+) ParseError!yaml.Node {
+    const root_map = switch (root.data) {
+        .map => |m| m,
+        else => return root,
+    };
+    const include_node = root_map.get("include") orelse return root;
+    if (depth >= 32) {
+        try diags.add(include_node.line, include_node.col, "include nesting too deep", .{});
+        return root;
+    }
+    const dir = std.fs.path.dirname(source_path) orelse ".";
+    var entries: std.ArrayList(yaml.Node) = .empty;
+    switch (include_node.data) {
+        .scalar, .map => try entries.append(alloc, include_node),
+        .seq => |items| try entries.appendSlice(alloc, items),
+    }
+    var merged: ?yaml.Node = null;
+    for (entries.items) |entry| {
+        const rel_path = try resolveIncludePath(entry, diags) orelse continue;
+        if (std.mem.indexOfScalar(u8, rel_path, '*') != null) {
+            try warn(diags, entry, "wildcard includes are not supported (ignored)", .{});
+            continue;
+        }
+        const stripped_path = if (rel_path.len > 0 and rel_path[0] == '/') rel_path[1..] else rel_path;
+        const full_path = try std.fs.path.join(alloc, &.{ dir, stripped_path });
+        const canonical = std.fs.path.resolve(alloc, &.{full_path}) catch full_path;
+        if (visited.contains(canonical)) {
+            try warn(diags, entry, "include '{s}' already processed (skipped)", .{rel_path});
+            continue;
+        }
+        try visited.put(alloc, canonical, {});
+        const text = std.fs.cwd().readFileAlloc(alloc, full_path, 4 * 1024 * 1024) catch {
+            try diags.add(entry.line, entry.col, "cannot read include '{s}'", .{rel_path});
+            continue;
+        };
+        var sub_diags = yaml.Diags.init(alloc);
+        const sub_root = yaml.parse(alloc, text, &sub_diags) catch |err| {
+            for (sub_diags.list.items) |d| try diags.add(d.line, d.col, "{s}: {s}", .{ rel_path, d.msg });
+            return switch (err) {
+                error.ParseFailed => error.ParseFailed,
+                error.OutOfMemory => error.OutOfMemory,
+            };
+        };
+        for (sub_diags.list.items) |d| try diags.add(d.line, d.col, "{s}: {s}", .{ rel_path, d.msg });
+        const expanded_sub = try expandIncludes(alloc, full_path, sub_root, visited, depth + 1, diags);
+        merged = if (merged) |m| try mergeNodes(alloc, m, expanded_sub) else expanded_sub;
+    }
+    const stripped_root = try stripKey(alloc, root, "include");
+    return if (merged) |m| try mergeNodes(alloc, m, stripped_root) else stripped_root;
+}
+
 pub fn parsePipeline(alloc: std.mem.Allocator, source_path: []const u8, source: []const u8, diags: *yaml.Diags) ParseError!ir.Pipeline {
-    const root = yaml.parse(alloc, source, diags) catch |err| return switch (err) {
+    const parsed_root = yaml.parse(alloc, source, diags) catch |err| return switch (err) {
         error.ParseFailed => error.ParseFailed,
         error.OutOfMemory => error.OutOfMemory,
     };
+    switch (parsed_root.data) {
+        .map => {},
+        else => {
+            try diags.add(parsed_root.line, parsed_root.col, "GitLab pipeline must be a mapping", .{});
+            return error.ParseFailed;
+        },
+    }
+    var visited_includes: std.StringArrayHashMapUnmanaged(void) = .empty;
+    const main_canonical = std.fs.path.resolve(alloc, &.{source_path}) catch source_path;
+    try visited_includes.put(alloc, main_canonical, {});
+    const root = try expandIncludes(alloc, source_path, parsed_root, &visited_includes, 0, diags);
     const root_map = switch (root.data) {
         .map => |value| value,
         else => {
@@ -1490,4 +1603,170 @@ test "only and except are recognized but not simulated; job stays" {
     try std.testing.expect(anyDiagContains(&diags, "'only' is recognized but not simulated"));
     try std.testing.expect(anyDiagContains(&diags, "'except' is recognized but not simulated"));
     for (diags.list.items) |diag| try std.testing.expect(std.mem.startsWith(u8, diag.msg, "warning: "));
+}
+
+test "include: scalar shorthand loads jobs from a local file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "other.yml", .data = "a:\n  script: echo a\n" });
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    const main_path = try std.fs.path.join(a, &.{ dir_path, "main.yml" });
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\include: other.yml
+        \\b:
+        \\  script: echo b
+    ;
+    const pipeline = try parsePipeline(a, main_path, source, &diags);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.jobs.len);
+    var found_a = false;
+    var found_b = false;
+    for (pipeline.jobs) |job| {
+        if (std.mem.eql(u8, job.id, "a")) found_a = true;
+        if (std.mem.eql(u8, job.id, "b")) found_b = true;
+    }
+    try std.testing.expect(found_a and found_b);
+}
+
+test "include: {local:} map form works; unsupported type map warns and is ignored" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "other.yml", .data = "a:\n  script: echo a\n" });
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    const main_path = try std.fs.path.join(a, &.{ dir_path, "main.yml" });
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\include:
+        \\  - local: other.yml
+        \\  - template: Some/Template.yml
+        \\b:
+        \\  script: echo b
+    ;
+    const pipeline = try parsePipeline(a, main_path, source, &diags);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.jobs.len);
+    try std.testing.expect(anyDiagContains(&diags, "include type 'template' is not supported locally"));
+}
+
+test "include: main job wins on collision; include-only keys survive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "other.yml", .data =
+        \\x:
+        \\  stage: build
+        \\  variables:
+        \\    A: "1"
+        \\  script: echo included
+    });
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    const main_path = try std.fs.path.join(a, &.{ dir_path, "main.yml" });
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\stages: [build, test]
+        \\include: other.yml
+        \\x:
+        \\  stage: test
+        \\  script: echo main
+    ;
+    const pipeline = try parsePipeline(a, main_path, source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expectEqualStrings("test", findEnv(pipeline.jobs[0].env, "CI_JOB_STAGE").?);
+    try std.testing.expectEqualStrings("echo main", pipeline.jobs[0].steps[0].script);
+    try std.testing.expectEqualStrings("1", findEnv(pipeline.jobs[0].env, "A").?);
+}
+
+test "include: nested includes are expanded depth-first" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "c.yml", .data = "c_job:\n  script: echo c\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.yml", .data = "include: c.yml\nb_job:\n  script: echo b\n" });
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    const main_path = try std.fs.path.join(a, &.{ dir_path, "main.yml" });
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\include: b.yml
+        \\a_job:
+        \\  script: echo a
+    ;
+    const pipeline = try parsePipeline(a, main_path, source, &diags);
+    try std.testing.expectEqual(@as(usize, 3), pipeline.jobs.len);
+    var found_c = false;
+    for (pipeline.jobs) |job| if (std.mem.eql(u8, job.id, "c_job")) {
+        found_c = true;
+    };
+    try std.testing.expect(found_c);
+}
+
+test "include: cycle between two files is deduped without hanging" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.yml", .data = "include: b.yml\na_job:\n  script: echo a\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.yml", .data = "include: a.yml\nb_job:\n  script: echo b\n" });
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    const main_path = try std.fs.path.join(a, &.{ dir_path, "a.yml" });
+    const source = try tmp.dir.readFileAlloc(a, "a.yml", 4096);
+    var diags = yaml.Diags.init(a);
+    const pipeline = try parsePipeline(a, main_path, source, &diags);
+    try std.testing.expect(anyDiagContains(&diags, "already processed"));
+    var count_a: usize = 0;
+    var count_b: usize = 0;
+    for (pipeline.jobs) |job| {
+        if (std.mem.eql(u8, job.id, "a_job")) count_a += 1;
+        if (std.mem.eql(u8, job.id, "b_job")) count_b += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count_a);
+    try std.testing.expectEqual(@as(usize, 1), count_b);
+}
+
+test "include: missing file is a hard diagnostic; rest of pipeline still evaluated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    const main_path = try std.fs.path.join(a, &.{ dir_path, "main.yml" });
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\include: missing.yml
+        \\b:
+        \\  script: echo b
+    ;
+    try std.testing.expectError(error.ParseFailed, parsePipeline(a, main_path, source, &diags));
+    try std.testing.expect(anyDiagContains(&diags, "cannot read include"));
+}
+
+test "include: template defined in included file is usable via extends in main" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "templates.yml", .data = ".t:\n  image: node:18\n" });
+    const dir_path = try tmp.dir.realpathAlloc(a, ".");
+    const main_path = try std.fs.path.join(a, &.{ dir_path, "main.yml" });
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\include: templates.yml
+        \\job:
+        \\  extends: .t
+        \\  script: echo hi
+    ;
+    const pipeline = try parsePipeline(a, main_path, source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expectEqualStrings("node:18", pipeline.jobs[0].container_image);
 }
