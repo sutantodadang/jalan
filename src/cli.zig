@@ -9,6 +9,7 @@ const jenkins = @import("frontend/jenkins.zig");
 const circleci = @import("frontend/circleci.zig");
 const azure = @import("frontend/azure.zig");
 const bitbucket = @import("frontend/bitbucket.zig");
+const translate_mod = @import("translate.zig");
 const engine = @import("engine.zig");
 const config = @import("config.zig");
 const backend = @import("backend.zig");
@@ -108,6 +109,64 @@ pub fn findDefaultWorkflow(alloc: std.mem.Allocator) !?[]const u8 {
     if (std.fs.cwd().access("azure-pipelines.yml", .{})) |_| return "azure-pipelines.yml" else |_| {}
     if (std.fs.cwd().access("bitbucket-pipelines.yml", .{})) |_| return "bitbucket-pipelines.yml" else |_| {}
     return null;
+}
+
+const TranslateArgs = struct { file: ?[]const u8 = null, to: ?[]const u8 = null, out_path: ?[]const u8 = null };
+
+fn parseTranslateArgs(args: []const []const u8) !TranslateArgs {
+    var t = TranslateArgs{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--to")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            t.to = args[i];
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) return error.BadArgs;
+            t.out_path = args[i];
+        } else if (std.mem.startsWith(u8, arg, "-") and arg.len > 1) {
+            return error.BadArgs;
+        } else {
+            if (t.file != null) return error.BadArgs;
+            t.file = arg;
+        }
+    }
+    if (t.to == null) return error.BadArgs;
+    return t;
+}
+
+pub fn translateMain(alloc: std.mem.Allocator, path: []const u8, target: translate_mod.Target, out_path: ?[]const u8, out: *std.ArrayList(u8)) !u8 {
+    const source = std.fs.cwd().readFileAlloc(alloc, path, 4 * 1024 * 1024) catch {
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "error: cannot read '{s}'\n", .{path}));
+        return 3;
+    };
+    const provider = detectProvider(path, source);
+    if (provider == .unknown) {
+        try out.appendSlice(alloc, "error: could not detect CI provider (supported providers: GitHub Actions, GitLab CI, Jenkins, CircleCI, Azure Pipelines, and Bitbucket Pipelines)\n");
+        return 2;
+    }
+    var diags = yaml.Diags.init(alloc);
+    const pipeline = parseProvider(alloc, provider, path, source, &diags) catch |e| switch (e) {
+        error.ParseFailed => {
+            try printDiags(alloc, path, &diags, out);
+            return 2;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    try printDiags(alloc, path, &diags, out);
+    const text = try translate_mod.emit(alloc, pipeline, target);
+    if (out_path) |op| {
+        std.fs.cwd().writeFile(.{ .sub_path = op, .data = text }) catch {
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "error: cannot write '{s}'\n", .{op}));
+            return 3;
+        };
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "wrote {s}\n", .{op}));
+    } else {
+        try out.appendSlice(alloc, text);
+    }
+    return 0;
 }
 
 pub fn lintMain(alloc: std.mem.Allocator, path: []const u8, json: bool, strict: bool, out: *std.ArrayList(u8)) !u8 {
@@ -644,6 +703,24 @@ pub fn main(alloc: std.mem.Allocator, args: []const []const u8) !u8 {
         };
         return runsMain(alloc, runs_args);
     }
+    if (std.mem.eql(u8, cmd, "translate")) {
+        const ta = parseTranslateArgs(args[1..]) catch {
+            _ = try print("error: bad arguments (see 'jalan help')\n");
+            return 2;
+        };
+        const target = translate_mod.Target.fromName(ta.to.?) orelse {
+            _ = try print("error: unknown target provider (use gha, gitlab, jenkins, circleci, azure, or bitbucket)\n");
+            return 2;
+        };
+        const path = ta.file orelse (try findDefaultWorkflow(alloc)) orelse {
+            _ = try print("error: no workflow found (.github/workflows, .gitlab-ci.yml, Jenkinsfile, .circleci/config.yml, azure-pipelines.yml, bitbucket-pipelines.yml)\n");
+            return 2;
+        };
+        var out: std.ArrayList(u8) = .empty;
+        const code = try translateMain(alloc, path, target, ta.out_path, &out);
+        _ = try print(out.items);
+        return code;
+    }
     if (std.mem.eql(u8, cmd, "lint")) {
         const la = parseLintArgs(args[1..]) catch {
             _ = try print("error: bad arguments (see 'jalan help')\n");
@@ -710,6 +787,8 @@ fn help() !u8 {
         \\            [--break <job/step>]... [--on-failure shell|stop|continue]
         \\            [--resume <run-id> --at <job/step>]
         \\  jalan debug [file] [same options as jalan run]
+        \\  jalan translate [file] --to <provider> [-o <path>]
+        \\            (providers: gha, gitlab, jenkins, circleci, azure, bitbucket)
         \\  jalan runs [--json]
         \\  jalan version
         \\  jalan help

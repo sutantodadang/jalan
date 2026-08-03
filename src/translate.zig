@@ -175,17 +175,67 @@ fn writeBlockScalar(w: *Writer, key: []const u8, text: []const u8) !void {
     while (it.next()) |ln| try w.line("{s}", .{ln});
 }
 
-fn writeNeedsList(w: *Writer, needs: []const []const u8, id_map: *const std.StringArrayHashMapUnmanaged([]const u8)) !void {
+/// Writes a `needs: [...]` line from an already-resolved list of emitted
+/// job ids (see `expandNeeds` — callers must expand *before* calling this).
+fn writeNeedsList(w: *Writer, expanded_ids: []const []const u8) !void {
     const alloc = w.alloc;
     var parts: std.ArrayList(u8) = .empty;
     try parts.append(alloc, '[');
-    for (needs, 0..) |n, i| {
+    for (expanded_ids, 0..) |eid, i| {
         if (i > 0) try parts.appendSlice(alloc, ", ");
-        const mapped = id_map.get(n) orelse n;
-        try parts.appendSlice(alloc, try quoteScalar(alloc, mapped));
+        try parts.appendSlice(alloc, try quoteScalar(alloc, eid));
     }
     try parts.append(alloc, ']');
     try w.line("needs: {s}", .{try parts.toOwnedSlice(alloc)});
+}
+
+/// A `needs`/`requires`/`dependsOn` entry names a *source* job id (as it
+/// appeared pre-translation). For a matrix-expanded job that source id is
+/// shared by every matrix sibling (they only differ in `display_name` and
+/// `matrix`), so one source id can resolve to several emitted jobs. Expands
+/// each entry in `needs` to the emitted id of every job sharing that source
+/// id, in pipeline job order, using the per-job-index `emitted_ids` table
+/// built by each target's own id builder.
+fn expandNeeds(alloc: std.mem.Allocator, needs: []const []const u8, jobs: []const ir.Job, emitted_ids: []const []const u8) ![][]const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (needs) |n| {
+        for (jobs, 0..) |job, i| {
+            if (std.mem.eql(u8, job.id, n)) try out.append(alloc, emitted_ids[i]);
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Collapses runs of `-` into a single `-` and trims leading/trailing `-`.
+/// Used after character-sanitizing a display name like "unit (linux)" (which
+/// turns the space and parens into dashes) so the emitted id reads as
+/// `unit-linux` instead of `unit--linux-`.
+fn collapseDashes(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var prev_dash = false;
+    for (s) |c| {
+        if (c == '-') {
+            if (!prev_dash) try out.append(alloc, c);
+            prev_dash = true;
+        } else {
+            try out.append(alloc, c);
+            prev_dash = false;
+        }
+    }
+    var result: []const u8 = try out.toOwnedSlice(alloc);
+    var start: usize = 0;
+    var end: usize = result.len;
+    while (start < end and result[start] == '-') start += 1;
+    while (end > start and result[end - 1] == '-') end -= 1;
+    return result[start..end];
+}
+
+/// The base name an emitted job id is derived from: for a matrix-expanded
+/// job (siblings sharing one source `id`), `display_name` is what tells them
+/// apart (e.g. "unit (linux)" / "unit (mac)"); a non-matrix job just uses its
+/// own `id`.
+fn emittedIdBase(job: ir.Job) []const u8 {
+    return if (job.matrix.len > 0) job.display_name else job.id;
 }
 
 /// Names injected by the *source* frontend (GitLab/Jenkins/CircleCI/Azure/
@@ -200,15 +250,15 @@ fn isPredefinedEnvName(name: []const u8) bool {
     return false;
 }
 
-/// Job env minus predefined-provider names and minus pairs that just
-/// duplicate a matrix combo pair (name AND value match).
+/// Job env minus predefined-provider names. Matrix combo pairs are kept —
+/// for a matrix-expanded job (several `ir.Job`s sharing one source `id`,
+/// distinguished by `display_name` and their own `matrix` pairs) the matrix
+/// pair is the *only* thing telling the emitted jobs apart, so dropping it
+/// would make every sibling identical.
 fn filteredEnv(alloc: std.mem.Allocator, job: ir.Job) ![]ir.EnvPair {
     var out: std.ArrayList(ir.EnvPair) = .empty;
-    outer: for (job.env) |e| {
+    for (job.env) |e| {
         if (isPredefinedEnvName(e.name)) continue;
-        for (job.matrix) |m| {
-            if (std.mem.eql(u8, m.name, e.name) and std.mem.eql(u8, m.value, e.value)) continue :outer;
-        }
         try out.append(alloc, e);
     }
     return out.toOwnedSlice(alloc);
@@ -221,16 +271,23 @@ fn sanitizeGhaId(alloc: std.mem.Allocator, id: []const u8) ![]const u8 {
         try out.append(alloc, if (ok) c else '-');
     }
     var result: []const u8 = try out.toOwnedSlice(alloc);
+    result = try collapseDashes(alloc, result);
     if (result.len == 0) result = "job";
     if (!(std.ascii.isAlphabetic(result[0]) or result[0] == '_'))
         result = try std.fmt.allocPrint(alloc, "job-{s}", .{result});
     return result;
 }
 
-fn buildGhaIdMap(alloc: std.mem.Allocator, jobs: []const ir.Job) !std.StringArrayHashMapUnmanaged([]const u8) {
-    var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
-    for (jobs) |job| try map.put(alloc, job.id, try sanitizeGhaId(alloc, job.id));
-    return map;
+/// Emitted job id per pipeline-job-index (not per source id — matrix
+/// siblings share a source `job.id` but must land on distinct emitted keys).
+fn buildGhaEmittedIds(alloc: std.mem.Allocator, jobs: []const ir.Job) ![][]const u8 {
+    var seen: std.StringArrayHashMapUnmanaged(u32) = .empty;
+    var out: [][]const u8 = try alloc.alloc([]const u8, jobs.len);
+    for (jobs, 0..) |job, i| {
+        const sanitized = try sanitizeGhaId(alloc, emittedIdBase(job));
+        out[i] = try uniqueName(alloc, &seen, sanitized);
+    }
+    return out;
 }
 
 const gitlab_reserved_keys = [_][]const u8{
@@ -239,17 +296,33 @@ const gitlab_reserved_keys = [_][]const u8{
     "after_script",
 };
 
+/// GitLab job keys are otherwise unrestricted, but a matrix-expanded job's
+/// base is a display name like "unit (linux)" — parens/spaces make an ugly
+/// (if technically legal) YAML key, so they get the same char-sanitize +
+/// dash-collapse treatment as GHA before the reserved-key suffix check.
 fn sanitizeGitlabId(alloc: std.mem.Allocator, id: []const u8) ![]const u8 {
-    for (gitlab_reserved_keys) |r| {
-        if (std.mem.eql(u8, r, id)) return std.fmt.allocPrint(alloc, "{s}-job", .{id});
+    var out: std.ArrayList(u8) = .empty;
+    for (id) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+        try out.append(alloc, if (ok) c else '-');
     }
-    return id;
+    var result: []const u8 = try out.toOwnedSlice(alloc);
+    result = try collapseDashes(alloc, result);
+    if (result.len == 0) result = "job";
+    for (gitlab_reserved_keys) |r| {
+        if (std.mem.eql(u8, r, result)) return std.fmt.allocPrint(alloc, "{s}-job", .{result});
+    }
+    return result;
 }
 
-fn buildGitlabIdMap(alloc: std.mem.Allocator, jobs: []const ir.Job) !std.StringArrayHashMapUnmanaged([]const u8) {
-    var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
-    for (jobs) |job| try map.put(alloc, job.id, try sanitizeGitlabId(alloc, job.id));
-    return map;
+fn buildGitlabEmittedIds(alloc: std.mem.Allocator, jobs: []const ir.Job) ![][]const u8 {
+    var seen: std.StringArrayHashMapUnmanaged(u32) = .empty;
+    var out: [][]const u8 = try alloc.alloc([]const u8, jobs.len);
+    for (jobs, 0..) |job, i| {
+        const sanitized = try sanitizeGitlabId(alloc, emittedIdBase(job));
+        out[i] = try uniqueName(alloc, &seen, sanitized);
+    }
+    return out;
 }
 
 /// Escapes a value for a Groovy single-quoted (non-triple) string literal.
@@ -293,10 +366,10 @@ fn emitGha(w: *Writer, p: ir.Pipeline) !void {
     try w.raw("jobs:");
     w.indentIn();
 
-    var id_map = try buildGhaIdMap(alloc, p.jobs);
+    const emitted_ids = try buildGhaEmittedIds(alloc, p.jobs);
 
-    for (p.jobs) |job| {
-        const sid = id_map.get(job.id).?;
+    for (p.jobs, 0..) |job, ji| {
+        const sid = emitted_ids[ji];
         try w.line("{s}:", .{sid});
         w.indentIn();
         if (!std.mem.eql(u8, job.display_name, job.id))
@@ -322,7 +395,10 @@ fn emitGha(w: *Writer, p: ir.Pipeline) !void {
             }
             w.indentOut();
         }
-        if (job.needs.len > 0) try writeNeedsList(w, job.needs, &id_map);
+        if (job.needs.len > 0) {
+            const expanded = try expandNeeds(alloc, job.needs, p.jobs, emitted_ids);
+            if (expanded.len > 0) try writeNeedsList(w, expanded);
+        }
         const fenv = try filteredEnv(alloc, job);
         if (fenv.len > 0) {
             try w.raw("env:");
@@ -396,14 +472,17 @@ fn emitGitlab(w: *Writer, p: ir.Pipeline) !void {
     w.indentOut();
     try w.blank();
 
-    var id_map = try buildGitlabIdMap(alloc, p.jobs);
+    const emitted_ids = try buildGitlabEmittedIds(alloc, p.jobs);
 
     for (p.jobs, 0..) |job, ji| {
-        const sid = id_map.get(job.id).?;
+        const sid = emitted_ids[ji];
         try w.line("{s}:", .{sid});
         w.indentIn();
         try w.line("stage: s{d}", .{level_of_job[ji] + 1});
-        if (job.needs.len > 0) try writeNeedsList(w, job.needs, &id_map);
+        if (job.needs.len > 0) {
+            const expanded = try expandNeeds(alloc, job.needs, p.jobs, emitted_ids);
+            if (expanded.len > 0) try writeNeedsList(w, expanded);
+        }
         if (job.container_image.len > 0)
             try w.line("image: {s}", .{try quoteScalar(alloc, job.container_image)});
 
@@ -650,15 +729,14 @@ fn sanitizeCircleciId(alloc: std.mem.Allocator, id: []const u8) ![]const u8 {
     return result;
 }
 
-fn buildCircleciIdMap(alloc: std.mem.Allocator, jobs: []const ir.Job) !std.StringArrayHashMapUnmanaged([]const u8) {
+fn buildCircleciEmittedIds(alloc: std.mem.Allocator, jobs: []const ir.Job) ![][]const u8 {
     var seen: std.StringArrayHashMapUnmanaged(u32) = .empty;
-    var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
-    for (jobs) |job| {
-        const sanitized = try sanitizeCircleciId(alloc, job.id);
-        const uniq = try uniqueName(alloc, &seen, sanitized);
-        try map.put(alloc, job.id, uniq);
+    var out: [][]const u8 = try alloc.alloc([]const u8, jobs.len);
+    for (jobs, 0..) |job, i| {
+        const sanitized = try sanitizeCircleciId(alloc, emittedIdBase(job));
+        out[i] = try uniqueName(alloc, &seen, sanitized);
     }
-    return map;
+    return out;
 }
 
 fn emitCircleci(w: *Writer, p: ir.Pipeline) !void {
@@ -669,10 +747,10 @@ fn emitCircleci(w: *Writer, p: ir.Pipeline) !void {
     try w.raw("jobs:");
     w.indentIn();
 
-    var id_map = try buildCircleciIdMap(alloc, p.jobs);
+    const emitted_ids = try buildCircleciEmittedIds(alloc, p.jobs);
 
-    for (p.jobs) |job| {
-        const sid = id_map.get(job.id).?;
+    for (p.jobs, 0..) |job, ji| {
+        const sid = emitted_ids[ji];
         try w.line("{s}:", .{sid});
         w.indentIn();
 
@@ -717,9 +795,10 @@ fn emitCircleci(w: *Writer, p: ir.Pipeline) !void {
     w.indentIn();
     try w.raw("jobs:");
     w.indentIn();
-    for (p.jobs) |job| {
-        const sid = id_map.get(job.id).?;
-        if (job.needs.len > 0) {
+    for (p.jobs, 0..) |job, ji| {
+        const sid = emitted_ids[ji];
+        const expanded = if (job.needs.len > 0) try expandNeeds(alloc, job.needs, p.jobs, emitted_ids) else &[_][]const u8{};
+        if (expanded.len > 0) {
             try w.line("- {s}:", .{sid});
             // A bare `- key:` list item (no inline value) nests its child map
             // two indent levels deeper than the item itself: one level just
@@ -729,10 +808,9 @@ fn emitCircleci(w: *Writer, p: ir.Pipeline) !void {
             w.indentIn();
             var parts: std.ArrayList(u8) = .empty;
             try parts.append(alloc, '[');
-            for (job.needs, 0..) |n, i| {
+            for (expanded, 0..) |eid, i| {
                 if (i > 0) try parts.appendSlice(alloc, ", ");
-                const mapped = id_map.get(n) orelse n;
-                try parts.appendSlice(alloc, try quoteScalar(alloc, mapped));
+                try parts.appendSlice(alloc, try quoteScalar(alloc, eid));
             }
             try parts.append(alloc, ']');
             try w.line("requires: {s}", .{try parts.toOwnedSlice(alloc)});
@@ -830,25 +908,25 @@ fn uniqueUnderscoreName(alloc: std.mem.Allocator, seen: *std.StringArrayHashMapU
     return std.fmt.allocPrint(alloc, "{s}_{d}", .{ name, gop.value_ptr.* });
 }
 
-fn buildAzureIdMap(alloc: std.mem.Allocator, jobs: []const ir.Job) !std.StringArrayHashMapUnmanaged([]const u8) {
+fn buildAzureEmittedIds(alloc: std.mem.Allocator, jobs: []const ir.Job) ![][]const u8 {
     var seen: std.StringArrayHashMapUnmanaged(u32) = .empty;
-    var map: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
-    for (jobs) |job| {
-        const sanitized = try sanitizeAzureId(alloc, job.id);
-        const uniq = try uniqueUnderscoreName(alloc, &seen, sanitized);
-        try map.put(alloc, job.id, uniq);
+    var out: [][]const u8 = try alloc.alloc([]const u8, jobs.len);
+    for (jobs, 0..) |job, i| {
+        const sanitized = try sanitizeAzureId(alloc, emittedIdBase(job));
+        out[i] = try uniqueUnderscoreName(alloc, &seen, sanitized);
     }
-    return map;
+    return out;
 }
 
-fn writeDependsOnList(w: *Writer, needs: []const []const u8, id_map: *const std.StringArrayHashMapUnmanaged([]const u8)) !void {
+/// Writes a `dependsOn: [...]` line from an already-resolved list of
+/// emitted job ids (see `expandNeeds`).
+fn writeDependsOnList(w: *Writer, expanded_ids: []const []const u8) !void {
     const alloc = w.alloc;
     var parts: std.ArrayList(u8) = .empty;
     try parts.append(alloc, '[');
-    for (needs, 0..) |n, i| {
+    for (expanded_ids, 0..) |eid, i| {
         if (i > 0) try parts.appendSlice(alloc, ", ");
-        const mapped = id_map.get(n) orelse n;
-        try parts.appendSlice(alloc, try quoteScalar(alloc, mapped));
+        try parts.appendSlice(alloc, try quoteScalar(alloc, eid));
     }
     try parts.append(alloc, ']');
     try w.line("dependsOn: {s}", .{try parts.toOwnedSlice(alloc)});
@@ -862,15 +940,18 @@ fn emitAzure(w: *Writer, p: ir.Pipeline) !void {
     try w.raw("jobs:");
     w.indentIn();
 
-    var id_map = try buildAzureIdMap(alloc, p.jobs);
+    const emitted_ids = try buildAzureEmittedIds(alloc, p.jobs);
 
-    for (p.jobs) |job| {
-        const sid = id_map.get(job.id).?;
+    for (p.jobs, 0..) |job, ji| {
+        const sid = emitted_ids[ji];
         try w.line("- job: {s}", .{sid});
         w.indentIn();
         if (!std.mem.eql(u8, job.display_name, job.id))
             try w.line("displayName: {s}", .{try quoteScalar(alloc, job.display_name)});
-        if (job.needs.len > 0) try writeDependsOnList(w, job.needs, &id_map);
+        if (job.needs.len > 0) {
+            const expanded = try expandNeeds(alloc, job.needs, p.jobs, emitted_ids);
+            if (expanded.len > 0) try writeDependsOnList(w, expanded);
+        }
 
         const fenv = try filteredEnv(alloc, job);
         if (fenv.len > 0) {
@@ -1295,6 +1376,146 @@ test "env filtering: predefined names dropped, user vars kept" {
     const out = try filteredEnv(a, job);
     try testing.expectEqual(@as(usize, 1), out.len);
     try testing.expectEqualStrings("USER_VAR", out[0].name);
+}
+
+test "env filtering: matrix combo pairs are kept, not stripped" {
+    var arena = arenaAlloc();
+    defer arena.deinit();
+    const a = arena.allocator();
+    var env = [_]ir.EnvPair{.{ .name = "OS", .value = "linux" }};
+    var matrix = [_]ir.EnvPair{.{ .name = "OS", .value = "linux" }};
+    var steps = [_]ir.Step{.{ .id = "s", .name = "s", .kind = .run, .script = "echo hi" }};
+    const job = ir.Job{ .id = "unit", .display_name = "unit (linux)", .env = &env, .matrix = &matrix, .steps = &steps };
+    const out = try filteredEnv(a, job);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqualStrings("OS", out[0].name);
+    try testing.expectEqualStrings("linux", out[0].value);
+}
+
+fn buildMatrixFanoutPipeline(alloc: std.mem.Allocator) !ir.Pipeline {
+    // Every slice a Job holds must be arena-owned, not a pointer into this
+    // function's stack frame — the frame is gone by the time callers read
+    // the returned pipeline (this bit us once already: a segfault in
+    // quoteScalar reading a dangling step.name).
+    const build_steps = try alloc.dupe(ir.Step, &[_]ir.Step{.{ .id = "s", .name = "s", .kind = .run, .script = "echo build" }});
+    const linux_env = try alloc.dupe(ir.EnvPair, &[_]ir.EnvPair{.{ .name = "OS", .value = "linux" }});
+    const mac_env = try alloc.dupe(ir.EnvPair, &[_]ir.EnvPair{.{ .name = "OS", .value = "mac" }});
+    const linux_steps = try alloc.dupe(ir.Step, &[_]ir.Step{.{ .id = "s", .name = "s", .kind = .run, .script = "echo unit" }});
+    const mac_steps = try alloc.dupe(ir.Step, &[_]ir.Step{.{ .id = "s", .name = "s", .kind = .run, .script = "echo unit" }});
+    const deploy_steps = try alloc.dupe(ir.Step, &[_]ir.Step{.{ .id = "s", .name = "s", .kind = .run, .script = "echo deploy" }});
+    const needs_unit = try alloc.dupe([]const u8, &[_][]const u8{"build"});
+    const needs_deploy = try alloc.dupe([]const u8, &[_][]const u8{"unit"});
+    const jobs = try alloc.dupe(ir.Job, &[_]ir.Job{
+        .{ .id = "build", .display_name = "build", .steps = build_steps },
+        .{ .id = "unit", .display_name = "unit (linux)", .needs = needs_unit, .env = linux_env, .matrix = linux_env, .steps = linux_steps },
+        .{ .id = "unit", .display_name = "unit (mac)", .needs = needs_unit, .env = mac_env, .matrix = mac_env, .steps = mac_steps },
+        .{ .id = "deploy", .display_name = "deploy", .needs = needs_deploy, .steps = deploy_steps },
+    });
+    return .{ .name = "CI", .source_path = "x", .jobs = jobs };
+}
+
+test "gha: matrix siblings get distinct ids, dependent fans out to both" {
+    var arena = arenaAlloc();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try buildMatrixFanoutPipeline(a);
+    const ids = try buildGhaEmittedIds(a, p.jobs);
+    try testing.expect(!std.mem.eql(u8, ids[1], ids[2]));
+
+    const out = try emit(a, p, .gha);
+    try testing.expect(std.mem.indexOf(u8, out, "OS: linux") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "OS: mac") != null);
+
+    var diags = yaml.Diags.init(a);
+    const p2 = try gha_frontend.parseWorkflow(a, "out.yml", out, &diags);
+    for (diags.list.items) |d| try testing.expect(std.mem.startsWith(u8, d.msg, "warning: "));
+    try testing.expectEqual(@as(usize, 4), p2.jobs.len);
+
+    var deploy: ?ir.Job = null;
+    for (p2.jobs) |j| if (std.mem.eql(u8, j.id, ids[3])) {
+        deploy = j;
+    };
+    try testing.expectEqual(@as(usize, 2), deploy.?.needs.len);
+    try testing.expect(std.mem.eql(u8, deploy.?.needs[0], ids[1]) or std.mem.eql(u8, deploy.?.needs[0], ids[2]));
+    try testing.expect(std.mem.eql(u8, deploy.?.needs[1], ids[1]) or std.mem.eql(u8, deploy.?.needs[1], ids[2]));
+}
+
+test "gitlab: matrix siblings get distinct ids, dependent fans out to both" {
+    var arena = arenaAlloc();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try buildMatrixFanoutPipeline(a);
+    const ids = try buildGitlabEmittedIds(a, p.jobs);
+    try testing.expect(!std.mem.eql(u8, ids[1], ids[2]));
+
+    const out = try emit(a, p, .gitlab);
+    try testing.expect(std.mem.indexOf(u8, out, "OS: linux") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "OS: mac") != null);
+
+    var diags = yaml.Diags.init(a);
+    const p2 = try gitlab_frontend.parsePipeline(a, "out.yml", out, &diags);
+    for (diags.list.items) |d| try testing.expect(std.mem.startsWith(u8, d.msg, "warning: "));
+    try testing.expectEqual(@as(usize, 4), p2.jobs.len);
+
+    var deploy: ?ir.Job = null;
+    for (p2.jobs) |j| if (std.mem.eql(u8, j.id, ids[3])) {
+        deploy = j;
+    };
+    try testing.expectEqual(@as(usize, 2), deploy.?.needs.len);
+    try testing.expect(std.mem.eql(u8, deploy.?.needs[0], ids[1]) or std.mem.eql(u8, deploy.?.needs[0], ids[2]));
+    try testing.expect(std.mem.eql(u8, deploy.?.needs[1], ids[1]) or std.mem.eql(u8, deploy.?.needs[1], ids[2]));
+}
+
+test "circleci: matrix siblings get distinct ids, dependent fans out to both" {
+    var arena = arenaAlloc();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try buildMatrixFanoutPipeline(a);
+    const ids = try buildCircleciEmittedIds(a, p.jobs);
+    try testing.expect(!std.mem.eql(u8, ids[1], ids[2]));
+
+    const out = try emit(a, p, .circleci);
+    try testing.expect(std.mem.indexOf(u8, out, "OS: linux") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "OS: mac") != null);
+
+    var diags = yaml.Diags.init(a);
+    const p2 = try circleci_frontend.parsePipeline(a, "out.yml", out, &diags);
+    for (diags.list.items) |d| try testing.expect(std.mem.startsWith(u8, d.msg, "warning: "));
+    try testing.expectEqual(@as(usize, 4), p2.jobs.len);
+
+    var deploy: ?ir.Job = null;
+    for (p2.jobs) |j| if (std.mem.eql(u8, j.id, ids[3])) {
+        deploy = j;
+    };
+    try testing.expectEqual(@as(usize, 2), deploy.?.needs.len);
+    try testing.expect(std.mem.eql(u8, deploy.?.needs[0], ids[1]) or std.mem.eql(u8, deploy.?.needs[0], ids[2]));
+    try testing.expect(std.mem.eql(u8, deploy.?.needs[1], ids[1]) or std.mem.eql(u8, deploy.?.needs[1], ids[2]));
+}
+
+test "azure: matrix siblings get distinct ids, dependent fans out to both" {
+    var arena = arenaAlloc();
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try buildMatrixFanoutPipeline(a);
+    const ids = try buildAzureEmittedIds(a, p.jobs);
+    try testing.expect(!std.mem.eql(u8, ids[1], ids[2]));
+
+    const out = try emit(a, p, .azure);
+    try testing.expect(std.mem.indexOf(u8, out, "OS: linux") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "OS: mac") != null);
+
+    var diags = yaml.Diags.init(a);
+    const p2 = try azure_frontend.parsePipeline(a, "out.yml", out, &diags);
+    for (diags.list.items) |d| try testing.expect(std.mem.startsWith(u8, d.msg, "warning: "));
+    try testing.expectEqual(@as(usize, 4), p2.jobs.len);
+
+    var deploy: ?ir.Job = null;
+    for (p2.jobs) |j| if (std.mem.eql(u8, j.id, ids[3])) {
+        deploy = j;
+    };
+    try testing.expectEqual(@as(usize, 2), deploy.?.needs.len);
+    try testing.expect(std.mem.eql(u8, deploy.?.needs[0], ids[1]) or std.mem.eql(u8, deploy.?.needs[0], ids[2]));
+    try testing.expect(std.mem.eql(u8, deploy.?.needs[1], ids[1]) or std.mem.eql(u8, deploy.?.needs[1], ids[2]));
 }
 
 test "gitlab: round-trip preserves job count, needs, after_script, manual, allow_failure" {
