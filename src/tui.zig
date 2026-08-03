@@ -175,12 +175,21 @@ pub fn renderPrompt(
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     const w = out.writer(alloc);
-    try w.print("\n[{s}] {s}/{s} step {d}: {s}\n", .{ @tagName(state.kind), state.job_name, state.job_id, state.step_index + 1, state.step_name });
+    // `state.job_name` is already the job's display_name (e.g. "test (rest)"
+    // for a matrix job) — earlier this line also appended `state.job_id`
+    // (the bare "test"), producing a mixed "test (rest)/test step 1: ..."
+    // header. Use display_name consistently: "test (rest) step 1: ...".
+    try w.print("\n[{s}] {s} step {d}: {s}\n", .{ @tagName(state.kind), state.job_name, state.step_index + 1, state.step_name });
     try w.print("workspace: {s}\n", .{state.workspace});
     if (view.show_workdir) try w.print("workdir: {s}\n", .{state.workdir orelse state.workspace});
     try w.writeAll("DAG:\n");
     for (pipeline.jobs, 0..) |job, i| {
-        try w.print("{s} {s}", .{ if (i == view.selected_job) ">" else " ", job.id });
+        // Second glyph is the job's run status (pending/running/success/
+        // failed/skipped), kept separate from the leading selector char so
+        // "which row is highlighted" and "which job is done/running" never
+        // collide in the same column.
+        const status: debug.JobDagStatus = if (i < state.job_statuses.len) state.job_statuses[i] else .pending;
+        try w.print("{s} {c} {s}", .{ if (i == view.selected_job) ">" else " ", debug.dagGlyph(status), job.display_name });
         if (job.needs.len > 0) {
             try w.writeAll(" <- ");
             for (job.needs, 0..) |need, ni| {
@@ -320,6 +329,7 @@ test "renderers show DAG, masked watch, and selected logs" {
     };
     const pipeline = ir.Pipeline{ .name = "CI", .source_path = "ci.yml", .jobs = &jobs };
     const env = [_]ir.EnvPair{.{ .name = "env.token", .value = "***" }};
+    const statuses = [_]debug.JobDagStatus{ .running, .pending };
     const state = debug.PromptState{
         .kind = .breakpoint,
         .job_index = 0,
@@ -331,10 +341,22 @@ test "renderers show DAG, masked watch, and selected logs" {
         .workspace = "work",
         .workdir = "work/sub",
         .effective_env = &env,
+        .job_statuses = &statuses,
     };
     const prompt = try renderPrompt(std.testing.allocator, pipeline, state, .{ .show_workdir = true }, &.{"env.TOKEN"});
     defer std.testing.allocator.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "test <- build") != null);
+    // DAG rows use display_name ("Test"/"Build"), not the bare job id
+    // ("test"/"build") — two matrix jobs sharing an id prefix would
+    // otherwise render as indistinguishable rows.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Test <- build") != null);
+    // Status glyphs: the running job's row carries '>' separate from the
+    // selector column ("> > Build" = selected-row '>' then running-status
+    // '>'), the not-yet-done job's row carries the pending '.'.
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "> > Build") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, ". Test <- build") != null);
+    // Header uses display_name consistently (no mixed "Build/build").
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Build step 1: compile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Build/build") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "watch env.TOKEN=***") != null);
 
     var failure_state = state;

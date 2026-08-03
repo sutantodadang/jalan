@@ -1017,7 +1017,7 @@ test "prompt state masks a secret-derived workdir" {
     const secrets = [_]ir.EnvPair{.{ .name = "TOKEN", .value = "hidden" }};
     const job = ir.Job{ .id = "j", .display_name = "job", .steps = &.{} };
     const step = ir.Step{ .id = "s", .name = "step", .kind = .run, .script = "true" };
-    const state = try makePromptState(arena.allocator(), .{ .secrets = &secrets }, .breakpoint, "workspace", 0, job, step, 0, &.{}, "workspace/hidden");
+    const state = try makePromptState(arena.allocator(), .{ .secrets = &secrets }, .breakpoint, "workspace", 0, job, step, 0, &.{}, "workspace/hidden", &.{});
     try std.testing.expectEqualStrings("***", state.workdir.?);
 }
 
@@ -1220,6 +1220,66 @@ test "prompt-safe logging: lines buffer while a prompt is open, then flush in FI
     try std.testing.expectEqual(@as(usize, 2), test_log_lines.items.len);
     try std.testing.expectEqualStrings("line-1", test_log_lines.items[0]);
     try std.testing.expectEqualStrings("line-2", test_log_lines.items[1]);
+}
+
+test "prompt-safe logging: the prompt-owning thread's own lines print directly, not buffered" {
+    // Regression test for the self-buffering deadlock: `handleBreakpoint`/
+    // `handleStepFailure` set `prompt_active` and then log their own prompt
+    // text through `logLine` -> `emitLog`. Before `prompt_owner` existed,
+    // that self-emitted line buffered behind the very prompt it announces,
+    // so the user saw nothing and the process hung waiting on stdin.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    testLogReset(a);
+
+    var shared = Shared{ .alloc = a };
+    const opts = RunOptions{ .log = &testLogCapture };
+
+    shared.prompt_owner.store(currentThreadId64(), .release);
+    shared.prompt_active.store(true, .release);
+    defer {
+        shared.prompt_active.store(false, .release);
+        shared.prompt_owner.store(no_prompt_owner, .release);
+    }
+
+    emitLog(opts, &shared, "breakpoint — (c)ontinue (s)kip (e)nv (w)orkdir (sh)ell (a)bort");
+    try std.testing.expectEqual(@as(usize, 0), shared.log_buffered.items.len);
+    try std.testing.expect(testLogContains("breakpoint —"));
+}
+
+test "prompt-safe logging: other threads still buffer while a prompt is open" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    testLogReset(a);
+
+    var shared = Shared{ .alloc = a };
+    const opts = RunOptions{ .log = &testLogCapture };
+
+    // Main thread owns the prompt; a spawned thread represents another
+    // worker whose docker-pull-progress-style log line must not garble the
+    // open prompt, so it should buffer instead of printing directly.
+    shared.prompt_owner.store(currentThreadId64(), .release);
+    shared.prompt_active.store(true, .release);
+    defer {
+        shared.prompt_active.store(false, .release);
+        shared.prompt_owner.store(no_prompt_owner, .release);
+    }
+
+    const Ctx = struct {
+        fn run(opts_: RunOptions, shared_: *Shared) void {
+            emitLog(opts_, shared_, "other-worker-line");
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Ctx.run, .{ opts, &shared });
+    t.join();
+
+    try std.testing.expect(!testLogContains("other-worker-line"));
+    try std.testing.expectEqual(@as(usize, 1), shared.log_buffered.items.len);
+
+    flushLogBuffer(opts, &shared);
+    try std.testing.expect(testLogContains("other-worker-line"));
 }
 
 test "debug defaults (step_all off, on_failure shell): only the failing step prompts" {
@@ -1509,6 +1569,15 @@ test "resume rejects a run recorded by another backend" {
     }));
 }
 
+// Sentinel for `Shared.prompt_owner` meaning "no thread currently owns the
+// prompt". Thread ids are process-unique but not guaranteed non-zero on
+// every target, so use maxInt rather than 0 as the "unset" marker.
+const no_prompt_owner: u64 = std.math.maxInt(u64);
+
+fn currentThreadId64() u64 {
+    return @intCast(std.Thread.getCurrentId());
+}
+
 const Shared = struct {
     alloc: std.mem.Allocator,
     // "jobid.outputs.key" -> value, merged across matrix copies (last writer wins).
@@ -1539,6 +1608,12 @@ const Shared = struct {
     // `log_buffer_mutex` separately guards `log_buffered` since appends can
     // race with the flush that happens when the prompt closes.
     prompt_active: std.atomic.Value(bool) = .init(false),
+    // Thread id of the worker currently holding the prompt (valid only while
+    // `prompt_active` is true). Lets that thread's own prompt-text lines
+    // (e.g. "breakpoint — ...") print directly through `emitLog` instead of
+    // being buffered behind its own prompt — only OTHER threads' lines still
+    // buffer. See `emitLog`.
+    prompt_owner: std.atomic.Value(u64) = .init(no_prompt_owner),
     log_buffer_mutex: std.Thread.Mutex = .{},
     log_buffered: std.ArrayList([]const u8) = .empty,
 };
@@ -2193,6 +2268,7 @@ fn makePromptState(
     step_index: usize,
     env: []const ir.EnvPair,
     workdir: ?[]const u8,
+    job_statuses: []const debug_mod.JobDagStatus,
 ) !debug_mod.PromptState {
     var effective: std.ArrayList(ir.EnvPair) = .empty;
     for (env) |pair| {
@@ -2210,7 +2286,32 @@ fn makePromptState(
         .workspace = workspace,
         .workdir = if (workdir) |value| if (isSecretValue(opts, value)) "***" else value else null,
         .effective_env = effective.items,
+        .job_statuses = job_statuses,
     };
+}
+
+/// Per-job status glyphs for the TUI's DAG panel: `results`/`done` are the
+/// same run() arrays the final Report turns into JobResult.status, snapshotted
+/// at prompt time. The job at `running_index` (the one that owns this prompt)
+/// shows as actively running even though it hasn't finished yet; every other
+/// not-yet-`done` job shows pending — this engine doesn't track a separate
+/// "started" flag per job, only finished-or-not.
+fn buildJobDagStatuses(alloc: std.mem.Allocator, p: ir.Pipeline, results: []const JobResult, done: []const bool, running_index: usize) ![]const debug_mod.JobDagStatus {
+    const out = try alloc.alloc(debug_mod.JobDagStatus, p.jobs.len);
+    for (out, 0..) |*s, i| {
+        if (i == running_index) {
+            s.* = .running;
+        } else if (i < done.len and done[i]) {
+            s.* = switch (results[i].status) {
+                .success => .success,
+                .failed => .failed,
+                .skipped => .skipped,
+            };
+        } else {
+            s.* = .pending;
+        }
+    }
+    return out;
 }
 
 fn putPromptEnv(alloc: std.mem.Allocator, pairs: *std.ArrayList(ir.EnvPair), pair: ir.EnvPair) !void {
@@ -2237,11 +2338,16 @@ fn handleBreakpoint(
     backend: backend_mod.Backend,
     handle: *backend_mod.JobHandle,
     base_env: []const ir.EnvPair,
+    p: ir.Pipeline,
+    results: []const JobResult,
+    done: []const bool,
 ) BreakAction {
     shared.prompt_mutex.lock();
+    shared.prompt_owner.store(currentThreadId64(), .release);
     shared.prompt_active.store(true, .release);
     defer {
         shared.prompt_active.store(false, .release);
+        shared.prompt_owner.store(no_prompt_owner, .release);
         flushLogBuffer(opts, shared);
         shared.prompt_mutex.unlock();
     }
@@ -2265,9 +2371,16 @@ fn handleBreakpoint(
         const value = expr.interpolate(state_alloc, pair.value, env) catch pair.value;
         putPromptEnv(state_alloc, &prompt_env, .{ .name = pair.name, .value = value }) catch return .continue_;
     }
-    const state = makePromptState(state_alloc, opts, .breakpoint, shared.workspace_abs, job_index, job, step, step_index, prompt_env.items, prompt_workdir) catch return .continue_;
+    const job_statuses = buildJobDagStatuses(state_alloc, p, results, done, job_index) catch &.{};
+    const state = makePromptState(state_alloc, opts, .breakpoint, shared.workspace_abs, job_index, job, step, step_index, prompt_env.items, prompt_workdir, job_statuses) catch return .continue_;
 
-    logLine(opts, shared, alloc, job, step, "breakpoint — (c)ontinue (s)kip (e)nv (w)orkdir (sh)ell (a)bort");
+    // A TUI (or any other injected `prompt_fn`/`prompt_ctx`) renders its own
+    // header from `state` — printing the engine's plain-text one too gave
+    // the double-header the TUI transcript showed
+    // (`[test (rest)/...] breakpoint — ...` immediately followed by the
+    // TUI's own `[breakpoint] ...` block). Line-mode (no prompt_ctx) still
+    // needs this line since nothing else announces the prompt there.
+    if (opts.prompt_ctx == null) logLine(opts, shared, alloc, job, step, "breakpoint — (c)ontinue (s)kip (e)nv (w)orkdir (sh)ell (a)bort");
     while (true) {
         const cmd = if (opts.prompt_fn) |prompt| prompt(opts.prompt_ctx, state) else debug_mod.promptOnce(null, state);
         switch (cmd) {
@@ -2326,6 +2439,9 @@ fn handleStepFailure(
     step_index: usize,
     workdir: ?[]const u8,
     env: []const ir.EnvPair,
+    p: ir.Pipeline,
+    results: []const JobResult,
+    done: []const bool,
 ) FailureAction {
     switch (opts.on_failure) {
         .continue_ => return .continue_,
@@ -2337,9 +2453,11 @@ fn handleStepFailure(
     }
 
     shared.prompt_mutex.lock();
+    shared.prompt_owner.store(currentThreadId64(), .release);
     shared.prompt_active.store(true, .release);
     defer {
         shared.prompt_active.store(false, .release);
+        shared.prompt_owner.store(no_prompt_owner, .release);
         flushLogBuffer(opts, shared);
         shared.prompt_mutex.unlock();
     }
@@ -2353,13 +2471,17 @@ fn handleStepFailure(
         break :blk false;
     };
     if (!opened) logLine(opts, shared, alloc, job, step, "drop-to-shell not supported on this backend");
-    logLine(opts, shared, alloc, job, step, "failure shell exited — (c)ontinue (r)etry (a)bort");
+    // See the matching comment in handleBreakpoint: a TUI renders its own
+    // header, so the engine's plain-text one is redundant (and was the
+    // double-header bug) whenever a prompt_ctx is driving the prompt.
+    if (opts.prompt_ctx == null) logLine(opts, shared, alloc, job, step, "failure shell exited — (c)ontinue (r)etry (a)bort");
     var state_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer state_arena.deinit();
     const state_alloc = state_arena.allocator();
     var prompt_env: std.ArrayList(ir.EnvPair) = .empty;
     for (env) |pair| putPromptEnv(state_alloc, &prompt_env, pair) catch return .continue_;
-    const state = makePromptState(state_alloc, opts, .failure, shared.workspace_abs, job_index, job, step, step_index, prompt_env.items, workdir) catch return .continue_;
+    const job_statuses = buildJobDagStatuses(state_alloc, p, results, done, job_index) catch &.{};
+    const state = makePromptState(state_alloc, opts, .failure, shared.workspace_abs, job_index, job, step, step_index, prompt_env.items, workdir, job_statuses) catch return .continue_;
     while (true) {
         const cmd = if (opts.prompt_fn) |prompt| prompt(opts.prompt_ctx, state) else debug_mod.promptOnce(null, state);
         switch (cmd) {
@@ -2530,7 +2652,7 @@ fn runJob(
         if (lock_workspace) shared.workspace_mutex.lock();
         defer if (lock_workspace) shared.workspace_mutex.unlock();
 
-        if (opts.debug_all_steps or hasBreakpoint(opts, job, step, si)) switch (handleBreakpoint(alloc, opts, shared, index, job, step, si, &env, b, &handle, merged_env.items)) {
+        if (opts.debug_all_steps or hasBreakpoint(opts, job, step, si)) switch (handleBreakpoint(alloc, opts, shared, index, job, step, si, &env, b, &handle, merged_env.items, p, results, done)) {
             .continue_ => {},
             .skip => continue,
             .abort => {
@@ -2614,7 +2736,7 @@ fn runJob(
                     logFailureTail(opts, shared, alloc, job, step, "", steps[si].stderr);
                     if (!step.continue_on_error) {
                         const action = if (attempt == 0 or opts.on_failure == .stop)
-                            handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, null, step_env.items)
+                            handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, null, step_env.items, p, results, done)
                         else
                             FailureAction.continue_;
                         if (action == .retry and attempt == 0) {
@@ -2636,7 +2758,7 @@ fn runJob(
                     break :uses_attempt;
                 }
                 const action = if (attempt == 0 or opts.on_failure == .stop)
-                    handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, null, step_env.items)
+                    handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, null, step_env.items, p, results, done)
                 else
                     FailureAction.continue_;
                 if (action == .retry and attempt == 0) {
@@ -2704,7 +2826,7 @@ fn runJob(
                 logFailureTail(opts, shared, alloc, job, step, "", steps[si].stderr);
                 if (!step.continue_on_error) {
                     const action = if (attempt == 0 or opts.on_failure == .stop)
-                        handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, workdir, spawn_env.items)
+                        handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, workdir, spawn_env.items, p, results, done)
                     else
                         FailureAction.continue_;
                     if (action == .retry and attempt == 0) {
@@ -2726,7 +2848,7 @@ fn runJob(
                 break :run_attempt;
             }
             const action = if (attempt == 0 or opts.on_failure == .stop)
-                handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, workdir, spawn_env.items)
+                handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, workdir, spawn_env.items, p, results, done)
             else
                 FailureAction.continue_;
             if (action == .retry and attempt == 0) {
@@ -2853,14 +2975,21 @@ fn logFailureTail(opts: RunOptions, shared: *Shared, alloc: std.mem.Allocator, j
 /// beyond FIFO.
 fn emitLog(opts: RunOptions, shared: *Shared, line: []const u8) void {
     if (shared.prompt_active.load(.acquire)) {
-        shared.log_buffer_mutex.lock();
-        defer shared.log_buffer_mutex.unlock();
-        // Re-check under the lock: the prompt may have closed and flushed
-        // between the lockless load above and taking the lock here.
-        if (shared.prompt_active.load(.acquire)) {
-            const dup = shared.alloc.dupe(u8, line) catch return;
-            shared.log_buffered.append(shared.alloc, dup) catch return;
-            return;
+        const self_id = currentThreadId64();
+        // The thread that opened the prompt renders its own lines directly —
+        // otherwise its own "breakpoint — ..." prompt text would buffer
+        // behind itself and never appear, deadlocking on stdin (the bug this
+        // owner check fixes). Every other thread still buffers.
+        if (shared.prompt_owner.load(.acquire) != self_id) {
+            shared.log_buffer_mutex.lock();
+            defer shared.log_buffer_mutex.unlock();
+            // Re-check under the lock: the prompt may have closed and flushed
+            // between the lockless load above and taking the lock here.
+            if (shared.prompt_active.load(.acquire) and shared.prompt_owner.load(.acquire) != self_id) {
+                const dup = shared.alloc.dupe(u8, line) catch return;
+                shared.log_buffered.append(shared.alloc, dup) catch return;
+                return;
+            }
         }
     }
     if (opts.log) |f| f(line);
