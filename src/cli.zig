@@ -261,9 +261,17 @@ pub const RunArgs = struct {
     cache: ?bool = null,
     breaks: []const []const u8 = &.{},
     on_failure: []const u8 = "continue",
+    // True only when the user actually passed `--on-failure`; lets
+    // `effectiveOnFailure` tell "explicitly continue" apart from "unset, so
+    // pick a mode-appropriate default" (debug mode defaults to shell).
+    on_failure_explicit: bool = false,
     resume_run: ?[]const u8 = null,
     resume_at: ?[]const u8 = null,
     tui: bool = false,
+    // `--step-all`: break at every step (old `jalan debug` behavior). Off by
+    // default so debug mode runs to the first failure instead of stopping at
+    // every step.
+    step_all: bool = false,
 };
 
 test "parse run args" {
@@ -349,6 +357,38 @@ test "parseRunArgs validates phase 3 flag pairs and values" {
     const toggles = try parseRunArgs(a, &.{ "--snapshot", "--no-snapshot", "--cache", "--no-cache" });
     try std.testing.expectEqual(false, toggles.snapshot.?);
     try std.testing.expectEqual(false, toggles.cache.?);
+}
+
+test "parseRunArgs accepts --step-all, off by default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const default_r = try parseRunArgs(a, &[_][]const u8{"wf.yml"});
+    try std.testing.expect(!default_r.step_all);
+    try std.testing.expect(!default_r.on_failure_explicit);
+
+    const r = try parseRunArgs(a, &[_][]const u8{ "wf.yml", "--step-all" });
+    try std.testing.expect(r.step_all);
+}
+
+test "parseRunArgs marks on_failure_explicit only when --on-failure is passed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = try parseRunArgs(a, &[_][]const u8{ "wf.yml", "--on-failure", "continue" });
+    try std.testing.expect(r.on_failure_explicit);
+    try std.testing.expectEqualStrings("continue", r.on_failure);
+}
+
+test "effectiveOnFailure: debug mode defaults to shell, run mode keeps continue, explicit always wins" {
+    // jalan run, nothing passed -> unchanged "continue" default.
+    try std.testing.expectEqual(engine.OnFailure.continue_, effectiveOnFailure(.{ .tui = false }));
+    // jalan debug, nothing passed -> shell (that's what "debugging" means).
+    try std.testing.expectEqual(engine.OnFailure.shell, effectiveOnFailure(.{ .tui = true }));
+    // jalan debug --on-failure continue -> explicit wins over the debug default.
+    try std.testing.expectEqual(engine.OnFailure.continue_, effectiveOnFailure(.{ .tui = true, .on_failure = "continue", .on_failure_explicit = true }));
+    // jalan run --on-failure shell -> explicit wins (unchanged prior behavior).
+    try std.testing.expectEqual(engine.OnFailure.shell, effectiveOnFailure(.{ .tui = false, .on_failure = "shell", .on_failure_explicit = true }));
 }
 
 test "resolveToggle applies CLI over config over defaults" {
@@ -458,6 +498,9 @@ pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs
             i += 1;
             if (i >= args.len or !isValidOnFailure(args[i])) return error.BadArgs;
             r.on_failure = args[i];
+            r.on_failure_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--step-all")) {
+            r.step_all = true;
         } else if (std.mem.eql(u8, arg, "--resume")) {
             i += 1;
             if (i >= args.len) return error.BadArgs;
@@ -785,8 +828,10 @@ fn help() !u8 {
         \\            [--strict] [--no-color] [--backend <name>] [--pull]
         \\            [--snapshot|--no-snapshot] [--cache|--no-cache]
         \\            [--break <job/step>]... [--on-failure shell|stop|continue]
-        \\            [--resume <run-id> --at <job/step>]
+        \\            [--step-all] [--resume <run-id> --at <job/step>]
         \\  jalan debug [file] [same options as jalan run]
+        \\            (debug stops only at the first failure by default; pass
+        \\            --step-all to break at every step instead)
         \\  jalan translate [file] --to <provider> [-o <path>]
         \\            (providers: gha, gitlab, jenkins, circleci, azure, bitbucket)
         \\  jalan runs [--json]
@@ -811,6 +856,15 @@ fn onFailureMode(value: []const u8) engine.OnFailure {
     if (std.mem.eql(u8, value, "stop")) return .stop;
     if (std.mem.eql(u8, value, "shell")) return .shell;
     return .continue_;
+}
+
+/// Effective `--on-failure` mode: an explicit flag always wins. Left unset,
+/// `jalan debug` defaults to `shell` (that's what "debugging" means — stop
+/// only at the failure) while plain `jalan run` keeps defaulting to
+/// `continue` (unchanged behavior).
+pub fn effectiveOnFailure(ra: RunArgs) engine.OnFailure {
+    if (!ra.on_failure_explicit and ra.tui) return .shell;
+    return onFailureMode(ra.on_failure);
 }
 
 fn printResumeInvalid(alloc: std.mem.Allocator, run_id: []const u8) !void {
@@ -925,8 +979,8 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         .cache = cache_enabled,
         .workspace_abs = workspace_abs,
         .breakpoints = breakpoints.items,
-        .debug_all_steps = ra.tui,
-        .on_failure = onFailureMode(ra.on_failure),
+        .debug_all_steps = ra.step_all,
+        .on_failure = effectiveOnFailure(ra),
         .resume_from = resume_point,
         .prompt_fn = if (ra.tui) tui.Session.prompt else if (debug_mod.isTty()) debug_mod.promptOnce else null,
         .prompt_ctx = if (ra.tui) &tui_session else null,
@@ -1008,6 +1062,11 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
                 const mark = if (use_color) ansi_red ++ "\xe2\x9c\x97" ++ ansi_reset else "\xe2\x9c\x97";
                 if (failed_step) |fs| {
                     try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   failed at '{s}' (exit {d})\n", .{ mark, j.display_name, fs.name, fs.exit_code }));
+                } else if (j.infra_reason) |reason| {
+                    // Backend SETUP failed before any step ran — every step
+                    // stays `.skipped`, so without this the job would render
+                    // as if nothing went wrong.
+                    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   failed (backend setup failed: {s})\n", .{ mark, j.display_name, reason }));
                 } else {
                     try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   failed\n", .{ mark, j.display_name }));
                 }
