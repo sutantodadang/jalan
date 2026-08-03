@@ -8,6 +8,7 @@ pub const jenkins = @import("frontend/jenkins.zig");
 pub const circleci = @import("frontend/circleci.zig");
 pub const azure = @import("frontend/azure.zig");
 pub const bitbucket = @import("frontend/bitbucket.zig");
+pub const translate = @import("translate.zig");
 pub const groovy_ast = @import("groovy/ast.zig");
 pub const groovy_interp = @import("groovy/interp.zig");
 pub const native = @import("backend/native.zig");
@@ -41,6 +42,7 @@ test {
     _ = circleci;
     _ = azure;
     _ = bitbucket;
+    _ = translate;
     _ = groovy_ast;
     _ = groovy_interp;
     _ = native;
