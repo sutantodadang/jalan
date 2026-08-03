@@ -108,7 +108,7 @@ pub const Session = struct {
                 .continue_ => return .continue_,
                 .skip => if (state.kind == .breakpoint) return .skip,
                 .abort => return .abort,
-                .shell => if (state.kind == .breakpoint) return .shell,
+                .shell => return .shell,
                 .retry => if (state.kind == .failure) return .retry,
                 .toggle_env => self.view.show_env = !self.view.show_env,
                 .toggle_workdir => self.view.show_workdir = !self.view.show_workdir,
@@ -202,7 +202,7 @@ pub fn renderPrompt(
     for (watches) |key| try w.print("watch {s}={s}\n", .{ key, envValue(state.effective_env, key) orelse "<unset>" });
     if (view.show_env) for (state.effective_env) |pair| try w.print("env {s}={s}\n", .{ pair.name, pair.value });
     if (state.kind == .failure)
-        try w.writeAll("c continue; r retry; a abort; e env; w workdir; + KEY/- KEY watch; j/k select\n> ")
+        try w.writeAll("c continue; r retry; sh shell; a abort; e env; w workdir; + KEY/- KEY watch; j/k select\n> ")
     else
         try w.writeAll("c continue; s skip; a abort; sh shell; e env; w workdir; + KEY/- KEY watch; j/k select\n> ");
     return out.toOwnedSlice(alloc);
@@ -364,6 +364,7 @@ test "renderers show DAG, masked watch, and selected logs" {
     const failure_prompt = try renderPrompt(std.testing.allocator, pipeline, failure_state, .{}, &.{});
     defer std.testing.allocator.free(failure_prompt);
     try std.testing.expect(std.mem.indexOf(u8, failure_prompt, "r retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failure_prompt, "sh shell") != null);
     try std.testing.expect(std.mem.indexOf(u8, failure_prompt, "s skip") == null);
 
     var result_steps = [_]engine.StepResult{.{ .name = "compile", .status = .failed, .exit_code = 1, .duration_ms = 1, .stdout = "out", .stderr = "err" }};

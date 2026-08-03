@@ -1090,7 +1090,10 @@ test "on-failure shell dispatches through backend and retries once" {
         \\    steps:
         \\      - run: echo "${{ needs.j.outputs.stale }}"
     );
-    const commands = [_]debug_mod.PromptCmd{.retry};
+    // Prompt-first flow (see handleStepFailure): the shell no longer opens
+    // automatically on failure, so the script explicitly asks for it via
+    // `.shell` before continuing with `.retry`.
+    const commands = [_]debug_mod.PromptCmd{ .shell, .retry };
     const extra_env = [_]ir.EnvPair{.{ .name = "FOO", .value = "bar" }};
     var script = TestPromptScript{ .commands = &commands };
     const report = try run(a, p, .{
@@ -1143,6 +1146,128 @@ fn testLogContains(needle: []const u8) bool {
         if (std.mem.indexOf(u8, line, needle) != null) return true;
     }
     return false;
+}
+
+test "on-failure shell: prompt renders before any shell opens; sh opens exactly once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Fake = struct {
+        shells: usize = 0,
+        fn setup(_: *anyopaque, _: std.mem.Allocator, _: ir.Job, workspace: []const u8, _: ?backend_mod.LogFn) anyerror!backend_mod.JobHandle {
+            return .{ .workspace = workspace };
+        }
+        fn runStep(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, step: ir.Step, _: []const ir.EnvPair, _: ?[]const u8, _: *?[]const u8) anyerror!backend_mod.StepOutcome {
+            const failing = std.mem.indexOf(u8, step.script, "exit 1") != null;
+            return .{ .exit_code = if (failing) 1 else 0, .stdout = "", .stderr = if (failing) "boom" else "", .outputs = &.{} };
+        }
+        fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle) void {}
+        fn openShell(ctx: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, _: ?[]const u8, _: []const ir.EnvPair) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.shells += 1;
+        }
+    };
+    const fake_vtable = backend_mod.Backend.VTable{ .setupJob = Fake.setup, .runStep = Fake.runStep, .teardownJob = Fake.teardown, .openShell = Fake.openShell };
+    var fake = Fake{};
+    const fake_backend = backend_mod.Backend{ .ctx = @ptrCast(&fake), .vtable = &fake_vtable, .kind = .native };
+
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: bad
+        \\        run: exit 1
+    );
+
+    // `c` continues without ever opening a shell — the shell must not open
+    // automatically on failure anymore.
+    {
+        const commands = [_]debug_mod.PromptCmd{.continue_};
+        var script = TestPromptScript{ .commands = &commands };
+        const report = try run(a, p, .{
+            .exec_backend = fake_backend,
+            .on_failure = .shell,
+            .prompt_fn = &TestPromptScript.next,
+            .prompt_ctx = &script,
+        });
+        try std.testing.expect(!report.ok());
+        try std.testing.expectEqual(@as(usize, 0), fake.shells);
+    }
+
+    // `sh` opens the shell exactly once, announced before and after, and the
+    // failure evidence (logFailureTail) — which stands in for "the prompt
+    // already rendered" since prompt_ctx suppresses the plain-text header —
+    // appears before the shell-open announcement, never after.
+    {
+        fake.shells = 0;
+        testLogReset(a);
+        const commands = [_]debug_mod.PromptCmd{ .shell, .continue_ };
+        var script = TestPromptScript{ .commands = &commands };
+        const report = try run(a, p, .{
+            .exec_backend = fake_backend,
+            .on_failure = .shell,
+            .prompt_fn = &TestPromptScript.next,
+            .prompt_ctx = &script,
+            .log = testLogCapture,
+        });
+        try std.testing.expect(!report.ok());
+        try std.testing.expectEqual(@as(usize, 1), fake.shells);
+        try std.testing.expect(testLogContains("opening shell at failed step"));
+        try std.testing.expect(testLogContains("shell closed"));
+
+        var tail_idx: ?usize = null;
+        var shell_idx: ?usize = null;
+        for (test_log_lines.items, 0..) |line, i| {
+            if (tail_idx == null and std.mem.indexOf(u8, line, "log tail") != null) tail_idx = i;
+            if (shell_idx == null and std.mem.indexOf(u8, line, "opening shell at failed step") != null) shell_idx = i;
+        }
+        try std.testing.expect(tail_idx != null);
+        try std.testing.expect(shell_idx != null);
+        try std.testing.expect(tail_idx.? < shell_idx.?);
+    }
+}
+
+test "failure tail prints even when on_failure is shell (was suppressed pre-fix)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    testLogReset(a);
+
+    const Fake = struct {
+        fn setup(_: *anyopaque, _: std.mem.Allocator, _: ir.Job, workspace: []const u8, _: ?backend_mod.LogFn) anyerror!backend_mod.JobHandle {
+            return .{ .workspace = workspace };
+        }
+        fn runStep(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, step: ir.Step, _: []const ir.EnvPair, _: ?[]const u8, _: *?[]const u8) anyerror!backend_mod.StepOutcome {
+            const failing = std.mem.indexOf(u8, step.script, "exit 1") != null;
+            return .{ .exit_code = if (failing) 1 else 0, .stdout = "", .stderr = if (failing) "why it broke" else "", .outputs = &.{} };
+        }
+        fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle) void {}
+        fn openShell(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, _: ?[]const u8, _: []const ir.EnvPair) anyerror!void {}
+    };
+    const fake_vtable = backend_mod.Backend.VTable{ .setupJob = Fake.setup, .runStep = Fake.runStep, .teardownJob = Fake.teardown, .openShell = Fake.openShell };
+    var fake_ctx: u8 = 0;
+    const fake_backend = backend_mod.Backend{ .ctx = @ptrCast(&fake_ctx), .vtable = &fake_vtable, .kind = .native };
+
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: bad
+        \\        run: exit 1
+    );
+    const commands = [_]debug_mod.PromptCmd{.continue_};
+    var script = TestPromptScript{ .commands = &commands };
+    const report = try run(a, p, .{
+        .exec_backend = fake_backend,
+        .on_failure = .shell,
+        .prompt_fn = &TestPromptScript.next,
+        .prompt_ctx = &script,
+        .log = testLogCapture,
+    });
+    try std.testing.expect(!report.ok());
+    try std.testing.expect(testLogContains("log tail"));
+    try std.testing.expect(testLogContains("why it broke"));
 }
 
 test "backend setup failure logs the error name and records infra_reason" {
@@ -1322,7 +1447,9 @@ test "debug defaults (step_all off, on_failure shell): only the failing step pro
         \\      - id: skip
         \\        run: echo never
     );
-    const commands = [_]debug_mod.PromptCmd{.continue_};
+    // Prompt-first flow: `.shell` must be requested explicitly before the
+    // shell opens; `.continue_` alone would never touch openShell.
+    const commands = [_]debug_mod.PromptCmd{ .shell, .continue_ };
     var script = TestPromptScript{ .commands = &commands };
     // Mirrors cli.zig's `effectiveOnFailure`/`ra.step_all` defaults for
     // `jalan debug` with nothing explicitly passed: no --step-all (so no
@@ -2466,15 +2593,16 @@ fn handleStepFailure(
         return .continue_;
     }
 
-    const opened = debug_mod.shell(alloc, backend, handle, workdir, env) catch blk: {
-        logLine(opts, shared, alloc, job, step, "warning: drop-to-shell failed");
-        break :blk false;
-    };
-    if (!opened) logLine(opts, shared, alloc, job, step, "drop-to-shell not supported on this backend");
+    // Prompt first, shell on demand: the old behavior opened an interactive
+    // shell immediately, with zero announcement, before the user had any
+    // idea one was about to attach — their keystrokes fed a shell they never
+    // asked for (and, over a non-TTY docker exec, one whose output might not
+    // even surface). Now the failure prompt renders first; a shell only
+    // opens when the user explicitly asks for it via `sh`.
     // See the matching comment in handleBreakpoint: a TUI renders its own
     // header, so the engine's plain-text one is redundant (and was the
     // double-header bug) whenever a prompt_ctx is driving the prompt.
-    if (opts.prompt_ctx == null) logLine(opts, shared, alloc, job, step, "failure shell exited — (c)ontinue (r)etry (a)bort");
+    if (opts.prompt_ctx == null) logLine(opts, shared, alloc, job, step, "failure — (c)ontinue (r)etry (sh)ell (a)bort");
     var state_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer state_arena.deinit();
     const state_alloc = state_arena.allocator();
@@ -2491,7 +2619,18 @@ fn handleStepFailure(
                 shared.halt.store(true, .release);
                 return .abort;
             },
-            else => logLine(opts, shared, alloc, job, step, "invalid command; choose c, r, or a"),
+            .shell => {
+                logLine(opts, shared, alloc, job, step, "opening shell at failed step (type 'exit' to return)");
+                const opened = debug_mod.shell(alloc, backend, handle, workdir, env) catch blk: {
+                    logLine(opts, shared, alloc, job, step, "warning: drop-to-shell failed");
+                    break :blk false;
+                };
+                if (!opened)
+                    logLine(opts, shared, alloc, job, step, "drop-to-shell not supported on this backend")
+                else
+                    logLine(opts, shared, alloc, job, step, "shell closed");
+            },
+            else => logLine(opts, shared, alloc, job, step, "invalid command; choose c, r, sh, or a"),
         }
     }
 }
@@ -2932,26 +3071,20 @@ fn logJob(opts: RunOptions, shared: *Shared, alloc: std.mem.Allocator, job: ir.J
     emitLog(opts, shared, line);
 }
 
-/// True when a failing step will immediately get an interactive shell (the
-/// `handleStepFailure` .shell path actually opens a prompt) — in that case
-/// the user already gets to inspect the failure live, so the auto tail below
-/// is skipped to avoid double noise right before the prompt takes over.
-fn isInteractiveFailure(opts: RunOptions) bool {
-    return opts.on_failure == .shell and (opts.prompt_fn != null or debug_mod.isTty());
-}
-
 /// Auto-show failure evidence: log the last ~10 lines of the failing step's
 /// stderr (falling back to stdout when stderr is empty) the moment a step
-/// fails in a non-interactive run, so a silent backend (docker, long native
-/// commands) doesn't leave the user with nothing but an exit code until they
-/// dig through `l logs` / the final report. Mirrors the CLI summary's
-/// "── log tail: job/step ──" framing (see cli.zig's runMain) without
-/// reusing it directly — that helper renders 20 combined stdout+stderr lines
-/// from the finished Report, this is a smaller real-time slice via the same
-/// `opts.log` sink used for every other engine log line (and therefore also
-/// prompt-safe: see `emitLog`).
+/// fails, so a silent backend (docker, long native commands) doesn't leave
+/// the user with nothing but an exit code until they dig through `l logs` /
+/// the final report. This now always runs, even when the failure is about to
+/// open an interactive prompt/shell — the user needs to know *why* the step
+/// failed before deciding whether to drop into a shell to investigate, and
+/// the prompt-owner direct-print path in `emitLog` renders this fine even
+/// mid-prompt-cycle. Mirrors the CLI summary's "── log tail: job/step ──"
+/// framing (see cli.zig's runMain) without reusing it directly — that helper
+/// renders 20 combined stdout+stderr lines from the finished Report, this is
+/// a smaller real-time slice via the same `opts.log` sink used for every
+/// other engine log line (and therefore also prompt-safe: see `emitLog`).
 fn logFailureTail(opts: RunOptions, shared: *Shared, alloc: std.mem.Allocator, job: ir.Job, step: ir.Step, stdout: []const u8, stderr: []const u8) void {
-    if (isInteractiveFailure(opts)) return;
     const source = if (stderr.len > 0) stderr else stdout;
     if (source.len == 0) return;
     var all_lines: std.ArrayList([]const u8) = .empty;
