@@ -88,15 +88,12 @@ fn defaultShell(alloc: std.mem.Allocator) Shell {
 }
 
 fn defaultShellForProvider(alloc: std.mem.Allocator, provider: ir.Provider) Shell {
-    // GitLab/Jenkins/CircleCI/Bitbucket scripts are written for a POSIX
-    // shell; on Windows prefer bash (incl. Git Bash) over pwsh, where
-    // `$VAR` is not the env var. Azure `script:` steps keep the platform
-    // default shell, matching hosted agents.
-    const posix_provider = switch (provider) {
-        .gitlab, .jenkins, .circleci, .bitbucket => true,
-        .github_actions, .azure => false,
-    };
-    if (posix_provider and builtin.os.tag == .windows) {
+    // Non-GHA scripts are written for (or rewritten to) POSIX `${VAR}`
+    // expansion; on Windows prefer bash (incl. Git Bash) over pwsh, where
+    // `$VAR` is not the env var. Azure `$(X)` macros rewrite to `${X}` at
+    // lowering, so its default-shell steps need POSIX too — explicit
+    // pwsh/powershell/bat steps still get their declared shell.
+    if (provider != .github_actions and builtin.os.tag == .windows) {
         if (onPath(alloc, "bash") or gitBashExe(alloc, "bash") != null) return shellTable("bash").?;
         if (onPath(alloc, "sh") or gitBashExe(alloc, "sh") != null) return shellTable("sh").?;
     }
