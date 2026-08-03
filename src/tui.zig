@@ -208,9 +208,18 @@ pub fn renderReport(alloc: std.mem.Allocator, report: engine.Report, selected_st
     try w.writeAll("\nreport:\n");
     for (report.jobs) |job| {
         try w.print("{s} {s}\n", .{ @tagName(job.status), job.display_name });
+        if (job.status == .failed and job.infra_reason != null) {
+            // Backend SETUP failed before any step ran — every step below
+            // stays "(skipped, exit 0)" with no explanation otherwise.
+            try w.print("  (backend setup failed: {s})\n", .{job.infra_reason.?});
+        }
         for (job.steps) |step| {
             const selected = flat == selected_step;
             try w.print("{s} {s} ({s}, exit {d})\n", .{ if (selected) ">" else " ", step.name, @tagName(step.status), step.exit_code });
+            if (step.status == .failed) {
+                if (firstLine(step.stderr) orelse firstLine(step.stdout)) |reason|
+                    try w.print("    reason: {s}\n", .{reason});
+            }
             if (selected and show_logs) {
                 if (step.stdout.len > 0) try w.print("stdout:\n{s}\n", .{step.stdout});
                 if (step.stderr.len > 0) try w.print("stderr:\n{s}\n", .{step.stderr});
@@ -220,6 +229,17 @@ pub fn renderReport(alloc: std.mem.Allocator, report: engine.Report, selected_st
     }
     try w.writeAll("j/k select; l logs; q quit\n> ");
     return out.toOwnedSlice(alloc);
+}
+
+/// First non-empty line of `text`, or null (used for a one-line failure
+/// reason in the report — e.g. a spawn-failure `err_msg` like "bash not
+/// found ..." stored verbatim in the step's stderr).
+fn firstLine(text: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (line.len > 0) return line;
+    }
+    return null;
 }
 
 fn eq(a: []const u8, b: []const u8) bool {

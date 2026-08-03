@@ -7,7 +7,7 @@ jalan run [file] [-j <job>] [--step <id>] [--dry-run] [--env K=V]...
           [--strict] [--no-color] [--backend <name>] [--pull]
           [--snapshot|--no-snapshot] [--cache|--no-cache]
           [--break <job/step>]... [--on-failure shell|stop|continue]
-          [--resume <run-id> --at <job/step>]
+          [--step-all] [--resume <run-id> --at <job/step>]
 jalan debug [file] [same options as jalan run]
 jalan translate [file] --to <provider> [-o <path>]
           (providers: gha, gitlab, jenkins, circleci, azure, bitbucket)
@@ -64,7 +64,8 @@ Parses, then executes the pipeline.
 | `--snapshot` / `--no-snapshot` | tri-state, default from `.jalan/config` (`true` if unset) | Record every step's workspace state for time-travel/resume. |
 | `--cache` / `--no-cache` | tri-state, default from `.jalan/config` (`false` if unset) | Replay unchanged steps from the content-addressed cache. |
 | `--break <job/step>` | repeatable | Breakpoint selector. `step` may be a step id or a zero-based index. Requires the `job/step` shape (exactly one `/`). |
-| `--on-failure shell\|stop\|continue` | string, default `continue` | What to do when a step fails: drop to an interactive shell, stop the run, or keep going per normal `continue-on-error`/DAG semantics. |
+| `--on-failure shell\|stop\|continue` | string, default `continue` for `run`; defaults to `shell` for `debug` unless passed explicitly | What to do when a step fails: drop to an interactive shell, stop the run, or keep going per normal `continue-on-error`/DAG semantics. |
+| `--step-all` | flag, default off | Break at every step (the old `jalan debug` behavior), instead of only stopping at a failure or an explicit `--break`. |
 | `--resume <run-id> --at <job/step>` | pair, both or neither | Restore workspace state from a prior snapshot and resume execution from that job/step. |
 
 `--resume` and `--at` must be given together; giving one without the other
@@ -73,10 +74,12 @@ is a usage error (exit 2).
 ### `jalan debug [file]`
 
 Same flags as `jalan run`, plus it always runs with the full-screen TUI
-(`src/tui.zig`) and forces `--break`-style step-through of every step.
-Requires an interactive stdin and stdout. If the terminal isn't
-interactive, it errors immediately (exit 2) and suggests `jalan run` or
-`jalan runs` instead.
+(`src/tui.zig`). By default it stops only at the first failure (via the
+`--on-failure` default of `shell` — see the table above), not at every step;
+pass `--step-all` to break at every step instead, or `--break <job/step>` for
+specific breakpoints (both work the same as in `jalan run`). Requires an
+interactive stdin and stdout. If the terminal isn't interactive, it errors
+immediately (exit 2) and suggests `jalan run` or `jalan runs` instead.
 
 ### `jalan translate [file] --to <provider>`
 

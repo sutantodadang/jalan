@@ -1114,6 +1114,177 @@ test "on-failure shell dispatches through backend and retries once" {
     try std.testing.expect(!fake.saw_stale_retry_output);
 }
 
+// `RunOptions.log` is a bare `*const fn([]const u8) void` — no closure
+// context — so capturing lines in a test needs a small module-level sink
+// rather than an injectable ctx pointer (unlike `prompt_fn`/`prompt_ctx`).
+// Mutex-guarded since `run()` executes jobs on worker threads.
+var test_log_mutex: std.Thread.Mutex = .{};
+var test_log_lines: std.ArrayList([]const u8) = .empty;
+var test_log_alloc: std.mem.Allocator = undefined;
+
+fn testLogReset(alloc: std.mem.Allocator) void {
+    test_log_mutex.lock();
+    defer test_log_mutex.unlock();
+    test_log_alloc = alloc;
+    test_log_lines = .empty;
+}
+
+fn testLogCapture(line: []const u8) void {
+    test_log_mutex.lock();
+    defer test_log_mutex.unlock();
+    const dup = test_log_alloc.dupe(u8, line) catch return;
+    test_log_lines.append(test_log_alloc, dup) catch {};
+}
+
+fn testLogContains(needle: []const u8) bool {
+    test_log_mutex.lock();
+    defer test_log_mutex.unlock();
+    for (test_log_lines.items) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null) return true;
+    }
+    return false;
+}
+
+test "backend setup failure logs the error name and records infra_reason" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    testLogReset(a);
+
+    const Fake = struct {
+        fn setup(_: *anyopaque, _: std.mem.Allocator, _: ir.Job, _: []const u8, _: ?backend_mod.LogFn) anyerror!backend_mod.JobHandle {
+            return error.AccessDenied;
+        }
+        fn runStep(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, _: ir.Step, _: []const ir.EnvPair, _: ?[]const u8, _: *?[]const u8) anyerror!backend_mod.StepOutcome {
+            unreachable;
+        }
+        fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle) void {}
+    };
+    const fake_vtable = backend_mod.Backend.VTable{ .setupJob = Fake.setup, .runStep = Fake.runStep, .teardownJob = Fake.teardown };
+    var fake_ctx: u8 = 0;
+    const fake_backend = backend_mod.Backend{ .ctx = @ptrCast(&fake_ctx), .vtable = &fake_vtable, .kind = .native };
+
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  lint:
+        \\    steps:
+        \\      - run: echo unreachable
+    );
+    const report = try run(a, p, .{ .exec_backend = fake_backend, .log = &testLogCapture });
+    try std.testing.expect(!report.ok());
+    try std.testing.expectEqual(JobStatus.failed, report.jobs[0].status);
+    try std.testing.expectEqualStrings("AccessDenied", report.jobs[0].infra_reason.?);
+    try std.testing.expect(testLogContains("backend setup failed for job: AccessDenied"));
+}
+
+test "failed step auto-logs a stderr tail through opts.log" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    testLogReset(a);
+
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - run: echo boom-marker 1>&2; exit 1
+        \\        shell: sh
+    );
+    // on_failure defaults to .continue_ (non-interactive): the tail must be
+    // logged even though nothing ever opens a breakpoint/failure prompt.
+    const report = try run(a, p, .{ .log = &testLogCapture });
+    try std.testing.expect(!report.ok());
+    try std.testing.expect(testLogContains("boom-marker"));
+    try std.testing.expect(testLogContains("log tail"));
+}
+
+test "prompt-safe logging: lines buffer while a prompt is open, then flush in FIFO order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    testLogReset(a);
+
+    var shared = Shared{ .alloc = a };
+    const opts = RunOptions{ .log = &testLogCapture };
+
+    shared.prompt_active.store(true, .release);
+    emitLog(opts, &shared, "line-1");
+    emitLog(opts, &shared, "line-2");
+    try std.testing.expect(!testLogContains("line-1"));
+    try std.testing.expect(!testLogContains("line-2"));
+    try std.testing.expectEqual(@as(usize, 2), shared.log_buffered.items.len);
+
+    shared.prompt_active.store(false, .release);
+    flushLogBuffer(opts, &shared);
+    try std.testing.expectEqual(@as(usize, 0), shared.log_buffered.items.len);
+    try std.testing.expectEqual(@as(usize, 2), test_log_lines.items.len);
+    try std.testing.expectEqualStrings("line-1", test_log_lines.items[0]);
+    try std.testing.expectEqualStrings("line-2", test_log_lines.items[1]);
+}
+
+test "debug defaults (step_all off, on_failure shell): only the failing step prompts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A fake backend whose `openShell` just counts — the real native
+    // backend's openShell spawns an actual interactive shell process and
+    // blocks on it, which hangs a non-interactive test run.
+    const Fake = struct {
+        runs: usize = 0,
+        shells: usize = 0,
+        fn setup(_: *anyopaque, _: std.mem.Allocator, _: ir.Job, workspace: []const u8, _: ?backend_mod.LogFn) anyerror!backend_mod.JobHandle {
+            return .{ .workspace = workspace };
+        }
+        fn runStep(ctx: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, step: ir.Step, _: []const ir.EnvPair, _: ?[]const u8, _: *?[]const u8) anyerror!backend_mod.StepOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.runs += 1;
+            const failing = std.mem.indexOf(u8, step.script, "exit 1") != null;
+            return .{ .exit_code = if (failing) 1 else 0, .stdout = "", .stderr = "", .outputs = &.{} };
+        }
+        fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle) void {}
+        fn openShell(ctx: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, _: ?[]const u8, _: []const ir.EnvPair) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.shells += 1;
+        }
+    };
+    const fake_vtable = backend_mod.Backend.VTable{ .setupJob = Fake.setup, .runStep = Fake.runStep, .teardownJob = Fake.teardown, .openShell = Fake.openShell };
+    var fake = Fake{};
+    const fake_backend = backend_mod.Backend{ .ctx = @ptrCast(&fake), .vtable = &fake_vtable, .kind = .native };
+
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: ok
+        \\        run: echo fine
+        \\      - id: bad
+        \\        run: exit 1
+        \\      - id: skip
+        \\        run: echo never
+    );
+    const commands = [_]debug_mod.PromptCmd{.continue_};
+    var script = TestPromptScript{ .commands = &commands };
+    // Mirrors cli.zig's `effectiveOnFailure`/`ra.step_all` defaults for
+    // `jalan debug` with nothing explicitly passed: no --step-all (so no
+    // per-step breakpoints) and on_failure defaults to shell (so failure
+    // still gets an interactive prompt instead of silently continuing).
+    const report = try run(a, p, .{
+        .exec_backend = fake_backend,
+        .debug_all_steps = false,
+        .on_failure = .shell,
+        .prompt_fn = &TestPromptScript.next,
+        .prompt_ctx = &script,
+    });
+    try std.testing.expect(!report.ok());
+    try std.testing.expect(script.saw_state);
+    try std.testing.expectEqual(debug_mod.PromptKind.failure, script.last_kind.?);
+    try std.testing.expectEqualStrings("bad", script.last_step_id);
+    try std.testing.expectEqual(@as(usize, 1), fake.shells);
+    try std.testing.expectEqual(StepStatus.success, report.jobs[0].steps[0].status);
+    try std.testing.expectEqual(StepStatus.failed, report.jobs[0].steps[1].status);
+    try std.testing.expectEqual(StepStatus.skipped, report.jobs[0].steps[2].status);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -1131,6 +1302,11 @@ pub const JobResult = struct {
     display_name: []const u8,
     status: JobStatus,
     steps: []StepResult,
+    // Set when the job failed during backend SETUP, before any step ran (so
+    // `steps` stays all-skipped and would otherwise render with no
+    // explanation at all). Carries `@errorName(e)` plus whatever the backend
+    // itself reported via `log`.
+    infra_reason: ?[]const u8 = null,
 };
 
 pub const Report = struct {
@@ -1356,6 +1532,15 @@ const Shared = struct {
     workspace_mutex: std.Thread.Mutex = .{},
     non_tty_break_warned: bool = false,
     halt: std.atomic.Value(bool) = .init(false),
+    // Prompt-safe logging (fix-wave 2): while a breakpoint/failure prompt is
+    // open on one worker, other workers' log lines must not print through it
+    // (e.g. docker pull progress interleaving into the open prompt). Readers
+    // of `prompt_active` don't hold `prompt_mutex`, so it's a plain atomic;
+    // `log_buffer_mutex` separately guards `log_buffered` since appends can
+    // race with the flush that happens when the prompt closes.
+    prompt_active: std.atomic.Value(bool) = .init(false),
+    log_buffer_mutex: std.Thread.Mutex = .{},
+    log_buffered: std.ArrayList([]const u8) = .empty,
 };
 
 pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ OutOfMemory, InternalError, ResumeInvalid, RestoreFailed, StoreIo }!Report {
@@ -1685,7 +1870,7 @@ fn captureStep(alloc: std.mem.Allocator, opts: RunOptions, sh: *Shared, job: ir.
     const raw_pairs = expr.envToPairs(alloc, env) catch return null;
     const pairs = protectPairs(alloc, raw_pairs, opts.secrets) catch return null;
     const cap = snap_manifest.capture(alloc, opts.store_root, sh.workspace_abs, rec.run_id, rec.jobs[ji].id, @intCast(si), step.id, pairs) catch {
-        logJob(opts, alloc, job, "warning: snapshot capture failed — snapshots disabled for this run");
+        logJob(opts, sh, alloc, job, "warning: snapshot capture failed — snapshots disabled for this run");
         sh.record_mutex.lock();
         sh.snapshot_ok = false;
         sh.record_mutex.unlock();
@@ -1697,7 +1882,7 @@ fn captureStep(alloc: std.mem.Allocator, opts: RunOptions, sh: *Shared, job: ir.
     alloc_mutex.lock();
     const rel_path = sh.alloc.dupe(u8, cap.rel_path) catch {
         alloc_mutex.unlock();
-        logJob(opts, alloc, job, "warning: snapshot path allocation failed — snapshots disabled for this run");
+        logJob(opts, sh, alloc, job, "warning: snapshot path allocation failed — snapshots disabled for this run");
         sh.record_mutex.lock();
         sh.snapshot_ok = false;
         sh.record_mutex.unlock();
@@ -1794,6 +1979,7 @@ fn gitWorkspaceIdentity(alloc: std.mem.Allocator, workspace: []const u8) ![]cons
 fn cacheBegin(
     alloc: std.mem.Allocator,
     opts: RunOptions,
+    shared: *Shared,
     job: ir.Job,
     exec_backend: backend_mod.Backend,
     handle: *backend_mod.JobHandle,
@@ -1807,7 +1993,7 @@ fn cacheBegin(
     if (!opts.cache or !eligible or cache.usesSecrets(raw_step) or rawPairsUseSecrets(job.env) or
         interpolatedInputsContainSecret(key_step, eff_env, opts.secrets)) return .{};
     const pre = if (snapshot) |cap| cap.m.files else snap_manifest.scanTree(alloc, opts.store_root, workspace, false) catch {
-        logLine(opts, alloc, job, key_step, "warning: workspace scan failed — cache disabled for this step");
+        logLine(opts, shared, alloc, job, key_step, "warning: workspace scan failed — cache disabled for this step");
         return .{};
     };
     const pre_hash = if (snapshot) |cap| cap.m.tree_hash else snap_manifest.treeHash(alloc, pre) catch return .{};
@@ -1817,7 +2003,7 @@ fn cacheBegin(
     const entry = (cache.readEntry(alloc, opts.store_root, hex) catch null) orelse
         return .{ .hex = hex, .pre = pre };
     materializeEntry(alloc, opts.store_root, workspace, entry) catch {
-        logLine(opts, alloc, job, key_step, "warning: cache entry blobs missing — re-executing");
+        logLine(opts, shared, alloc, job, key_step, "warning: cache entry blobs missing — re-executing");
         return .{ .hex = hex, .pre = pre };
     };
     return .{ .hit = entry };
@@ -1942,6 +2128,7 @@ fn copyResult(alloc: std.mem.Allocator, r: JobResult) !JobResult {
         .display_name = try alloc.dupe(u8, r.display_name),
         .status = r.status,
         .steps = steps,
+        .infra_reason = if (r.infra_reason) |reason| try alloc.dupe(u8, reason) else null,
     };
 }
 
@@ -2052,11 +2239,16 @@ fn handleBreakpoint(
     base_env: []const ir.EnvPair,
 ) BreakAction {
     shared.prompt_mutex.lock();
-    defer shared.prompt_mutex.unlock();
+    shared.prompt_active.store(true, .release);
+    defer {
+        shared.prompt_active.store(false, .release);
+        flushLogBuffer(opts, shared);
+        shared.prompt_mutex.unlock();
+    }
 
     if (opts.prompt_fn == null and !debug_mod.isTty()) {
         if (!shared.non_tty_break_warned) {
-            logLine(opts, alloc, job, step, "warning: breakpoint ignored because stdin is not a TTY");
+            logLine(opts, shared, alloc, job, step, "warning: breakpoint ignored because stdin is not a TTY");
             shared.non_tty_break_warned = true;
         }
         return .continue_;
@@ -2075,7 +2267,7 @@ fn handleBreakpoint(
     }
     const state = makePromptState(state_alloc, opts, .breakpoint, shared.workspace_abs, job_index, job, step, step_index, prompt_env.items, prompt_workdir) catch return .continue_;
 
-    logLine(opts, alloc, job, step, "breakpoint — (c)ontinue (s)kip (e)nv (w)orkdir (sh)ell (a)bort");
+    logLine(opts, shared, alloc, job, step, "breakpoint — (c)ontinue (s)kip (e)nv (w)orkdir (sh)ell (a)bort");
     while (true) {
         const cmd = if (opts.prompt_fn) |prompt| prompt(opts.prompt_ctx, state) else debug_mod.promptOnce(null, state);
         switch (cmd) {
@@ -2084,24 +2276,24 @@ fn handleBreakpoint(
             .abort => return .abort,
             .env => {
                 const pairs = expr.envToPairs(alloc, env) catch {
-                    logLine(opts, alloc, job, step, "warning: cannot format breakpoint environment");
+                    logLine(opts, shared, alloc, job, step, "warning: cannot format breakpoint environment");
                     continue;
                 };
                 for (pairs) |pair| {
                     const masked = std.mem.startsWith(u8, pair.name, "secrets.") or isSecretValue(opts, pair.value);
                     const line = std.fmt.allocPrint(alloc, "env {s}={s}", .{ pair.name, if (masked) "***" else pair.value }) catch continue;
-                    logLine(opts, alloc, job, step, line);
+                    logLine(opts, shared, alloc, job, step, line);
                 }
             },
             .workdir => {
                 const wd = if (step.workdir) |raw| expr.interpolate(alloc, raw, env) catch raw else shared.workspace_abs;
                 const line = std.fmt.allocPrint(alloc, "workspace={s} workdir={s}", .{ shared.workspace_abs, if (isSecretValue(opts, wd)) "***" else wd }) catch continue;
-                logLine(opts, alloc, job, step, line);
+                logLine(opts, shared, alloc, job, step, line);
             },
             .shell => {
                 var shell_env: std.ArrayList(ir.EnvPair) = .empty;
                 shell_env.appendSlice(alloc, base_env) catch {
-                    logLine(opts, alloc, job, step, "warning: cannot build shell environment");
+                    logLine(opts, shared, alloc, job, step, "warning: cannot build shell environment");
                     continue;
                 };
                 for (step.env) |pair| {
@@ -2110,12 +2302,12 @@ fn handleBreakpoint(
                 }
                 const workdir = if (step.workdir) |raw| expr.interpolate(alloc, raw, env) catch raw else null;
                 const opened = debug_mod.shell(alloc, backend, handle, workdir, shell_env.items) catch {
-                    logLine(opts, alloc, job, step, "warning: drop-to-shell failed");
+                    logLine(opts, shared, alloc, job, step, "warning: drop-to-shell failed");
                     continue;
                 };
-                if (!opened) logLine(opts, alloc, job, step, "drop-to-shell not supported on this backend");
+                if (!opened) logLine(opts, shared, alloc, job, step, "drop-to-shell not supported on this backend");
             },
-            .retry, .invalid => logLine(opts, alloc, job, step, "invalid command; choose c, s, e, w, sh, or a"),
+            .retry, .invalid => logLine(opts, shared, alloc, job, step, "invalid command; choose c, s, e, w, sh, or a"),
         }
     }
 }
@@ -2145,18 +2337,23 @@ fn handleStepFailure(
     }
 
     shared.prompt_mutex.lock();
-    defer shared.prompt_mutex.unlock();
+    shared.prompt_active.store(true, .release);
+    defer {
+        shared.prompt_active.store(false, .release);
+        flushLogBuffer(opts, shared);
+        shared.prompt_mutex.unlock();
+    }
     if (opts.prompt_fn == null and !debug_mod.isTty()) {
-        logLine(opts, alloc, job, step, "warning: --on-failure shell ignored because stdin is not a TTY");
+        logLine(opts, shared, alloc, job, step, "warning: --on-failure shell ignored because stdin is not a TTY");
         return .continue_;
     }
 
     const opened = debug_mod.shell(alloc, backend, handle, workdir, env) catch blk: {
-        logLine(opts, alloc, job, step, "warning: drop-to-shell failed");
+        logLine(opts, shared, alloc, job, step, "warning: drop-to-shell failed");
         break :blk false;
     };
-    if (!opened) logLine(opts, alloc, job, step, "drop-to-shell not supported on this backend");
-    logLine(opts, alloc, job, step, "failure shell exited — (c)ontinue (r)etry (a)bort");
+    if (!opened) logLine(opts, shared, alloc, job, step, "drop-to-shell not supported on this backend");
+    logLine(opts, shared, alloc, job, step, "failure shell exited — (c)ontinue (r)etry (a)bort");
     var state_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer state_arena.deinit();
     const state_alloc = state_arena.allocator();
@@ -2172,7 +2369,7 @@ fn handleStepFailure(
                 shared.halt.store(true, .release);
                 return .abort;
             },
-            else => logLine(opts, alloc, job, step, "invalid command; choose c, r, or a"),
+            else => logLine(opts, shared, alloc, job, step, "invalid command; choose c, r, or a"),
         }
     }
 }
@@ -2197,7 +2394,7 @@ fn runJob(
 
     if (opts.job_filter) |f| if (!std.mem.eql(u8, f, job.id)) return skipped;
     if (job.manual and opts.job_filter == null) {
-        logJob(opts, alloc, job, "manual job skipped (run with --job)");
+        logJob(opts, shared, alloc, job, "manual job skipped (run with --job)");
         return skipped;
     }
     if (!gha.matrixMatches(job, opts.matrix_filter)) return skipped;
@@ -2261,7 +2458,7 @@ fn runJob(
         for (merged_env.items) |*e| {
             e.value = expr.interpolate(alloc, e.value, &env) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                logJob(opts, alloc, job, try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, job failed", .{e.name}));
+                logJob(opts, shared, alloc, job, try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, job failed", .{e.name}));
                 return .{ .job_index = index, .display_name = job.display_name, .status = .failed, .steps = steps };
             };
         }
@@ -2287,9 +2484,15 @@ fn runJob(
     const b = opts.exec_backend orelse backend_mod.native();
     var handle = b.setupJob(alloc, job, cwd, opts.log) catch |e| {
         if (e == error.OutOfMemory) return error.OutOfMemory;
-        // infra failure: whole job fails before any step runs
-        logJob(opts, alloc, job, "backend setup failed for job");
-        return .{ .job_index = index, .display_name = job.display_name, .status = .failed, .steps = steps };
+        // infra failure: whole job fails before any step runs. The backend
+        // itself may already have logged a detailed message via `opts.log`
+        // (docker/nix do for socket/pull/image failures) — this line adds
+        // the error name so the engine's own summary is never bare "failed"
+        // with zero cause when the backend didn't log anything.
+        const reason = @errorName(e);
+        const msg = std.fmt.allocPrint(alloc, "backend setup failed for job: {s}", .{reason}) catch "backend setup failed for job";
+        logJob(opts, shared, alloc, job, msg);
+        return .{ .job_index = index, .display_name = job.display_name, .status = .failed, .steps = steps, .infra_reason = reason };
     };
     defer b.teardownJob(alloc, &handle);
 
@@ -2307,18 +2510,18 @@ fn runJob(
         if (step.cond) |cond| {
             const ast = expr.parseExpr(alloc, cond) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                logLine(opts, alloc, job, step, "warning: bad if expression, step skipped");
+                logLine(opts, shared, alloc, job, step, "warning: bad if expression, step skipped");
                 continue;
             };
             const v = expr.eval(alloc, ast, &env) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                logLine(opts, alloc, job, step, "warning: if evaluation failed, step skipped");
+                logLine(opts, shared, alloc, job, step, "warning: if evaluation failed, step skipped");
                 continue;
             };
             if (!v.truthy()) continue; // stays .skipped
         }
         if (opts.dry_run) {
-            logLine(opts, alloc, job, step, "[dry-run] would run step");
+            logLine(opts, shared, alloc, job, step, "[dry-run] would run step");
             steps[si].status = .success;
             continue;
         }
@@ -2352,7 +2555,7 @@ fn runJob(
                 const val = expr.interpolate(alloc, w.value, &env) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     const msg = try std.fmt.allocPrint(alloc, "warning: expression error in with {s}, step failed", .{w.name});
-                    logLine(opts, alloc, job, step, msg);
+                    logLine(opts, shared, alloc, job, step, msg);
                     steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
                     if (!step.continue_on_error) job_status = .failed;
                     continue :step_loop;
@@ -2369,7 +2572,7 @@ fn runJob(
                 const val = expr.interpolate(alloc, e.value, &env) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     const msg = try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, step failed", .{e.name});
-                    logLine(opts, alloc, job, step, msg);
+                    logLine(opts, shared, alloc, job, step, msg);
                     steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
                     if (!step.continue_on_error) job_status = .failed;
                     continue :step_loop;
@@ -2384,6 +2587,7 @@ fn runJob(
             const cb = cacheBegin(
                 alloc,
                 opts,
+                shared,
                 job,
                 b,
                 &handle,
@@ -2397,7 +2601,7 @@ fn runJob(
             if (cb.hit) |entry| {
                 const cached_outcome = backend_mod.StepOutcome{ .exit_code = entry.exit_code, .stdout = entry.stdout, .stderr = entry.stderr, .outputs = entry.outputs };
                 const cok = try applyStepOutcome(alloc, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
-                logLine(opts, alloc, job, step, "(cached)");
+                logLine(opts, shared, alloc, job, step, "(cached)");
                 if (!cok and !step.continue_on_error) job_status = .failed;
                 continue;
             }
@@ -2407,6 +2611,7 @@ fn runJob(
                 var err_msg: ?[]const u8 = null;
                 const outcome = runner.runUses(alloc, step, with_list.items, step_env.items, b, &handle, &env, opts.log, opts.force_pull, &err_msg) catch {
                     steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
+                    logFailureTail(opts, shared, alloc, job, step, "", steps[si].stderr);
                     if (!step.continue_on_error) {
                         const action = if (attempt == 0 or opts.on_failure == .stop)
                             handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, null, step_env.items)
@@ -2425,6 +2630,7 @@ fn runJob(
                     if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, outcome);
                     break :uses_attempt;
                 }
+                logFailureTail(opts, shared, alloc, job, step, outcome.stdout, outcome.stderr);
                 if (step.continue_on_error) {
                     try publishStepOutputs(alloc, step, outcome.outputs, job, shared, mutex, &env);
                     break :uses_attempt;
@@ -2450,7 +2656,7 @@ fn runJob(
         const script = expr.interpolate(alloc, step.script, &env) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             const msg = "warning: expression error in script, step failed";
-            logLine(opts, alloc, job, step, msg);
+            logLine(opts, shared, alloc, job, step, msg);
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
             if (!step.continue_on_error) job_status = .failed;
             continue;
@@ -2461,7 +2667,7 @@ fn runJob(
             const val = expr.interpolate(alloc, e.value, &env) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 const msg = try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, step failed", .{e.name});
-                logLine(opts, alloc, job, step, msg);
+                logLine(opts, shared, alloc, job, step, msg);
                 steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
                 if (!step.continue_on_error) job_status = .failed;
                 continue :step_loop;
@@ -2474,17 +2680,17 @@ fn runJob(
         const workdir = if (step.workdir) |w| expr.interpolate(alloc, w, &env) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             const msg = "warning: expression error in working-directory, step failed";
-            logLine(opts, alloc, job, step, msg);
+            logLine(opts, shared, alloc, job, step, msg);
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
             if (!step.continue_on_error) job_status = .failed;
             continue;
         } else null;
 
-        const cb = cacheBegin(alloc, opts, job, b, &handle, step, patched, spawn_env.items, shared.workspace_abs, snapshot_cap, true);
+        const cb = cacheBegin(alloc, opts, shared, job, b, &handle, step, patched, spawn_env.items, shared.workspace_abs, snapshot_cap, true);
         if (cb.hit) |entry| {
             const cached_outcome = backend_mod.StepOutcome{ .exit_code = entry.exit_code, .stdout = entry.stdout, .stderr = entry.stderr, .outputs = entry.outputs };
             const cok = try applyStepOutcome(alloc, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
-            logLine(opts, alloc, job, step, "(cached)");
+            logLine(opts, shared, alloc, job, step, "(cached)");
             if (!cok and !step.continue_on_error) job_status = .failed;
             continue;
         }
@@ -2495,6 +2701,7 @@ fn runJob(
             var err_msg: ?[]const u8 = null;
             const outcome = b.runStep(alloc, &handle, patched, spawn_env.items, workdir, &err_msg) catch {
                 steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = err_msg orelse "spawn failed" };
+                logFailureTail(opts, shared, alloc, job, step, "", steps[si].stderr);
                 if (!step.continue_on_error) {
                     const action = if (attempt == 0 or opts.on_failure == .stop)
                         handleStepFailure(alloc, opts, shared, index, b, &handle, job, step, si, workdir, spawn_env.items)
@@ -2513,6 +2720,7 @@ fn runJob(
                 if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, outcome);
                 break :run_attempt;
             }
+            logFailureTail(opts, shared, alloc, job, step, outcome.stdout, outcome.stderr);
             if (step.continue_on_error) {
                 try publishStepOutputs(alloc, step, outcome.outputs, job, shared, mutex, &env);
                 break :run_attempt;
@@ -2592,16 +2800,80 @@ fn key2(alloc: std.mem.Allocator, root: []const u8, name: []const u8) ![]const u
     return std.fmt.allocPrint(alloc, "{s}.{s}", .{ root, name });
 }
 
-fn logLine(opts: RunOptions, alloc: std.mem.Allocator, job: ir.Job, step: ir.Step, msg: []const u8) void {
-    if (opts.log) |f| {
-        const line = std.fmt.allocPrint(alloc, "[{s}/{s}] {s}", .{ job.display_name, step.name, msg }) catch return;
-        f(line);
-    }
+fn logLine(opts: RunOptions, shared: *Shared, alloc: std.mem.Allocator, job: ir.Job, step: ir.Step, msg: []const u8) void {
+    const line = std.fmt.allocPrint(alloc, "[{s}/{s}] {s}", .{ job.display_name, step.name, msg }) catch return;
+    emitLog(opts, shared, line);
 }
 
-fn logJob(opts: RunOptions, alloc: std.mem.Allocator, job: ir.Job, msg: []const u8) void {
-    if (opts.log) |f| {
-        const line = std.fmt.allocPrint(alloc, "[{s}] {s}", .{ job.display_name, msg }) catch return;
-        f(line);
+fn logJob(opts: RunOptions, shared: *Shared, alloc: std.mem.Allocator, job: ir.Job, msg: []const u8) void {
+    const line = std.fmt.allocPrint(alloc, "[{s}] {s}", .{ job.display_name, msg }) catch return;
+    emitLog(opts, shared, line);
+}
+
+/// True when a failing step will immediately get an interactive shell (the
+/// `handleStepFailure` .shell path actually opens a prompt) — in that case
+/// the user already gets to inspect the failure live, so the auto tail below
+/// is skipped to avoid double noise right before the prompt takes over.
+fn isInteractiveFailure(opts: RunOptions) bool {
+    return opts.on_failure == .shell and (opts.prompt_fn != null or debug_mod.isTty());
+}
+
+/// Auto-show failure evidence: log the last ~10 lines of the failing step's
+/// stderr (falling back to stdout when stderr is empty) the moment a step
+/// fails in a non-interactive run, so a silent backend (docker, long native
+/// commands) doesn't leave the user with nothing but an exit code until they
+/// dig through `l logs` / the final report. Mirrors the CLI summary's
+/// "── log tail: job/step ──" framing (see cli.zig's runMain) without
+/// reusing it directly — that helper renders 20 combined stdout+stderr lines
+/// from the finished Report, this is a smaller real-time slice via the same
+/// `opts.log` sink used for every other engine log line (and therefore also
+/// prompt-safe: see `emitLog`).
+fn logFailureTail(opts: RunOptions, shared: *Shared, alloc: std.mem.Allocator, job: ir.Job, step: ir.Step, stdout: []const u8, stderr: []const u8) void {
+    if (isInteractiveFailure(opts)) return;
+    const source = if (stderr.len > 0) stderr else stdout;
+    if (source.len == 0) return;
+    var all_lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, source, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        all_lines.append(alloc, line) catch return;
     }
+    if (all_lines.items.len == 0) return;
+    const start = if (all_lines.items.len > 10) all_lines.items.len - 10 else 0;
+    logLine(opts, shared, alloc, job, step, "── log tail ──");
+    for (all_lines.items[start..]) |line| logLine(opts, shared, alloc, job, step, line);
+}
+
+/// Prompt-safe log sink: while a breakpoint/failure prompt is open on some
+/// worker (`shared.prompt_active`), other workers' lines are buffered rather
+/// than printed — printing through an open interactive prompt is exactly the
+/// "docker pull progress garbles the `>` prompt" bug this exists to fix.
+/// Buffered lines are flushed in FIFO order the moment the prompt closes
+/// (see `handleBreakpoint`/`handleStepFailure`). No timestamps, no reordering
+/// beyond FIFO.
+fn emitLog(opts: RunOptions, shared: *Shared, line: []const u8) void {
+    if (shared.prompt_active.load(.acquire)) {
+        shared.log_buffer_mutex.lock();
+        defer shared.log_buffer_mutex.unlock();
+        // Re-check under the lock: the prompt may have closed and flushed
+        // between the lockless load above and taking the lock here.
+        if (shared.prompt_active.load(.acquire)) {
+            const dup = shared.alloc.dupe(u8, line) catch return;
+            shared.log_buffered.append(shared.alloc, dup) catch return;
+            return;
+        }
+    }
+    if (opts.log) |f| f(line);
+}
+
+/// Flush any lines buffered while a prompt was open, in FIFO order. Called
+/// once the prompt closes, still under `prompt_mutex` (see call sites) so no
+/// new lines get buffered until this drains — flush-then-unlock keeps the
+/// ordering simple: nothing buffered can be printed out of order relative to
+/// what flushes here.
+fn flushLogBuffer(opts: RunOptions, shared: *Shared) void {
+    shared.log_buffer_mutex.lock();
+    defer shared.log_buffer_mutex.unlock();
+    if (opts.log) |f| for (shared.log_buffered.items) |line| f(line);
+    shared.log_buffered.clearRetainingCapacity();
 }
