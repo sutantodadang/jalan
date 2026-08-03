@@ -6,6 +6,7 @@ pub const gha = @import("frontend/gha.zig");
 pub const gitlab = @import("frontend/gitlab.zig");
 pub const jenkins = @import("frontend/jenkins.zig");
 pub const groovy_ast = @import("groovy/ast.zig");
+pub const groovy_interp = @import("groovy/interp.zig");
 pub const native = @import("backend/native.zig");
 pub const backend = @import("backend.zig");
 pub const engine = @import("engine.zig");
@@ -35,6 +36,7 @@ test {
     _ = gitlab;
     _ = jenkins;
     _ = groovy_ast;
+    _ = groovy_interp;
     _ = native;
     _ = backend;
     _ = engine;
