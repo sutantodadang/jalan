@@ -11,9 +11,9 @@ const job_keys = [_][]const u8{
     "after_script",  "artifacts", "cache", "dependencies",   "rules",         "only",     "except",   "tags",     "extends",
     "interruptible", "timeout",   "retry", "resource_group", "trigger",       "coverage", "release",  "when",     "environment",
 };
-const job_supported = [_][]const u8{ "script", "stage", "needs", "variables", "before_script", "image", "services", "parallel", "allow_failure" };
-const unsafe_job_keys = [_][]const u8{ "rules", "only", "except", "when", "extends", "after_script" };
-const unsafe_root_keys = [_][]const u8{ "workflow", "default", "include", "image", "services", "after_script" };
+const job_supported = [_][]const u8{ "script", "stage", "needs", "variables", "before_script", "image", "services", "parallel", "allow_failure", "extends", "after_script" };
+const unsafe_job_keys = [_][]const u8{ "rules", "only", "except", "when" };
+const unsafe_root_keys = [_][]const u8{ "workflow", "include" };
 
 fn contains(list: []const []const u8, value: []const u8) bool {
     for (list) |item| if (std.mem.eql(u8, item, value)) return true;
@@ -232,12 +232,89 @@ const BaseJob = struct {
     combos: ComboList,
 };
 
+const Defaults = struct {
+    image: ?yaml.Node = null,
+    services: ?yaml.Node = null,
+    before_script: ?[]const []const u8 = null,
+    after_script: ?[]const []const u8 = null,
+};
+
+fn mergeNodes(alloc: std.mem.Allocator, base: yaml.Node, override: yaml.Node) !yaml.Node {
+    const base_map = switch (base.data) {
+        .map => |m| m,
+        else => return override,
+    };
+    const override_map = switch (override.data) {
+        .map => |m| m,
+        else => return override,
+    };
+    var out: yaml.Map = .empty;
+    var it = base_map.iterator();
+    while (it.next()) |entry| try out.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+    var it2 = override_map.iterator();
+    while (it2.next()) |entry| {
+        if (out.getPtr(entry.key_ptr.*)) |existing| {
+            if (existing.data == .map and entry.value_ptr.data == .map) {
+                const merged = try mergeNodes(alloc, existing.*, entry.value_ptr.*);
+                existing.* = merged;
+                continue;
+            }
+        }
+        try out.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    return .{ .line = override.line, .col = override.col, .data = .{ .map = out } };
+}
+
+fn resolveExtends(
+    alloc: std.mem.Allocator,
+    id: []const u8,
+    node: yaml.Node,
+    root_map: yaml.Map,
+    templates: std.StringArrayHashMapUnmanaged(yaml.Node),
+    visiting: *std.StringArrayHashMapUnmanaged(void),
+    diags: *yaml.Diags,
+) !yaml.Node {
+    const extends_node = node.get("extends") orelse return node;
+    var names: std.ArrayList([]const u8) = .empty;
+    switch (extends_node.data) {
+        .scalar => |value| try names.append(alloc, value),
+        .seq => |items| for (items) |item| switch (item.data) {
+            .scalar => |value| try names.append(alloc, value),
+            else => {
+                try diags.add(extends_node.line, extends_node.col, "'extends' must be a name or list of names", .{});
+                return node;
+            },
+        },
+        .map => {
+            try diags.add(extends_node.line, extends_node.col, "'extends' must be a name or list of names", .{});
+            return node;
+        },
+    }
+    var merged: ?yaml.Node = null;
+    for (names.items) |name| {
+        if (visiting.contains(name)) {
+            try diags.add(extends_node.line, extends_node.col, "circular 'extends' chain involving '{s}'", .{name});
+            continue;
+        }
+        const target = templates.get(name) orelse root_map.get(name) orelse {
+            try diags.add(extends_node.line, extends_node.col, "job '{s}' extends unknown job '{s}'", .{ id, name });
+            continue;
+        };
+        try visiting.put(alloc, name, {});
+        const resolved_target = try resolveExtends(alloc, name, target, root_map, templates, visiting, diags);
+        _ = visiting.swapRemove(name);
+        merged = if (merged) |m| try mergeNodes(alloc, m, resolved_target) else resolved_target;
+    }
+    const base = merged orelse return node;
+    return try mergeNodes(alloc, base, node);
+}
+
 fn lowerJob(
     alloc: std.mem.Allocator,
     id: []const u8,
     node: yaml.Node,
     root_env: []const ir.EnvPair,
-    root_before: []const []const u8,
+    defaults: Defaults,
     diags: *yaml.Diags,
 ) !BaseJob {
     const stage = if (node.get("stage")) |stage_node| stage_node.scalarOr("") else "test";
@@ -247,7 +324,7 @@ fn lowerJob(
     };
     const script_lines = try scripts(alloc, script_node, "script", diags);
     if (script_lines.len == 0) try diags.add(script_node.line, script_node.col, "job '{s}' has an empty script", .{id});
-    const before = if (node.get("before_script")) |local| try scripts(alloc, local, "before_script", diags) else root_before;
+    const before = if (node.get("before_script")) |local| try scripts(alloc, local, "before_script", diags) else defaults.before_script orelse &.{};
     var commands: std.ArrayList([]const u8) = .empty;
     try commands.appendSlice(alloc, before);
     try commands.appendSlice(alloc, script_lines);
@@ -271,15 +348,34 @@ fn lowerJob(
     if (node.get("needs")) |needs| try warn(diags, needs, "needs artifact transfer is not simulated", .{});
     try checkJobKeys(node, diags);
 
-    var steps = try alloc.alloc(ir.Step, 1);
-    steps[0] = .{
+    const after_script_node = node.get("after_script");
+    const after: ?[]const []const u8 = if (after_script_node) |local| try scripts(alloc, local, "after_script", diags) else defaults.after_script;
+
+    var steps_list: std.ArrayList(ir.Step) = .empty;
+    try steps_list.append(alloc, .{
         .id = "script",
         .name = "script",
         .kind = .run,
         .script = try std.mem.join(alloc, "\n", commands.items),
         .continue_on_error = allow_failure,
         .src_line = script_node.line,
+    });
+    if (after) |lines| if (lines.len > 0) {
+        const after_src_line = if (after_script_node) |n| n.line else node.line;
+        try steps_list.append(alloc, .{
+            .id = "after_script",
+            .name = "after_script",
+            .kind = .run,
+            .script = try std.mem.join(alloc, "\n", lines),
+            .cond = "always()",
+            .continue_on_error = true,
+            .src_line = after_src_line,
+        });
     };
+    const steps = try steps_list.toOwnedSlice(alloc);
+
+    const image_node = node.get("image") orelse defaults.image;
+    const services_node = node.get("services") orelse defaults.services;
     return .{
         .job = .{
             .id = id,
@@ -288,8 +384,8 @@ fn lowerJob(
             .env = try env.toOwnedSlice(alloc),
             .steps = steps,
             .src_line = node.line,
-            .container_image = try imageName(node.get("image"), diags),
-            .services = try lowerServices(alloc, node.get("services"), diags),
+            .container_image = try imageName(image_node, diags),
+            .services = try lowerServices(alloc, services_node, diags),
             .provider = .gitlab,
         },
         .stage = stage,
@@ -390,26 +486,66 @@ pub fn parsePipeline(alloc: std.mem.Allocator, source_path: []const u8, source: 
     const stages = if (root.get("stages")) |node| try stringList(alloc, node, "stages", diags) else try alloc.dupe([]const u8, &default_stages);
     if (stages.len == 0) try diags.add(root.line, root.col, "'stages' must not be empty", .{});
     const root_env = try envPairs(alloc, root.get("variables"), diags);
-    const root_before = if (root.get("before_script")) |node| try scripts(alloc, node, "before_script", diags) else &.{};
+
+    var defaults = Defaults{};
+    if (root.get("default")) |def_node| switch (def_node.data) {
+        .map => |m| {
+            var dit = m.iterator();
+            while (dit.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (std.mem.eql(u8, key, "image")) {
+                    defaults.image = entry.value_ptr.*;
+                } else if (std.mem.eql(u8, key, "services")) {
+                    defaults.services = entry.value_ptr.*;
+                } else if (std.mem.eql(u8, key, "before_script")) {
+                    defaults.before_script = try scripts(alloc, entry.value_ptr.*, "before_script", diags);
+                } else if (std.mem.eql(u8, key, "after_script")) {
+                    defaults.after_script = try scripts(alloc, entry.value_ptr.*, "after_script", diags);
+                } else {
+                    try warn(diags, entry.value_ptr.*, "default key '{s}' is not simulated (ignored)", .{key});
+                }
+            }
+        },
+        else => try diags.add(def_node.line, def_node.col, "'default' must be a mapping", .{}),
+    };
+    if (defaults.image == null) if (root.get("image")) |node| {
+        defaults.image = node;
+    };
+    if (defaults.services == null) if (root.get("services")) |node| {
+        defaults.services = node;
+    };
+    if (root.get("before_script")) |node| defaults.before_script = try scripts(alloc, node, "before_script", diags);
+    if (defaults.after_script == null) if (root.get("after_script")) |node| {
+        defaults.after_script = try scripts(alloc, node, "after_script", diags);
+    };
 
     for (root_keys) |key| if (root.get(key)) |node| {
         if (contains(&unsafe_root_keys, key))
             try diags.add(node.line, node.col, "global key '{s}' affects execution and is not supported", .{key})
-        else if (!contains(&.{ "stages", "variables", "before_script" }, key))
+        else if (!contains(&.{ "stages", "variables", "before_script", "after_script", "default", "image", "services" }, key))
             try warn(diags, node, "global key '{s}' is not simulated (ignored)", .{key});
     };
+
+    var templates: std.StringArrayHashMapUnmanaged(yaml.Node) = .empty;
+    var tmpl_it = root_map.iterator();
+    while (tmpl_it.next()) |entry| {
+        const id = entry.key_ptr.*;
+        if (contains(&root_keys, id)) continue;
+        if (std.mem.startsWith(u8, id, ".")) try templates.put(alloc, id, entry.value_ptr.*);
+    }
 
     var bases: std.ArrayList(BaseJob) = .empty;
     var it = root_map.iterator();
     while (it.next()) |entry| {
         const id = entry.key_ptr.*;
         if (contains(&root_keys, id)) continue;
-        if (std.mem.startsWith(u8, id, ".")) {
-            try warn(diags, entry.value_ptr.*, "hidden job/template '{s}' is not supported (ignored)", .{id});
-            continue;
-        }
+        if (std.mem.startsWith(u8, id, ".")) continue;
         switch (entry.value_ptr.data) {
-            .map => try bases.append(alloc, try lowerJob(alloc, id, entry.value_ptr.*, root_env, root_before, diags)),
+            .map => {
+                var visiting: std.StringArrayHashMapUnmanaged(void) = .empty;
+                const effective = try resolveExtends(alloc, id, entry.value_ptr.*, root_map, templates, &visiting, diags);
+                try bases.append(alloc, try lowerJob(alloc, id, effective, root_env, defaults, diags));
+            },
             else => try diags.add(entry.value_ptr.line, entry.value_ptr.col, "job '{s}' must be a mapping", .{id}),
         }
     }
@@ -572,9 +708,193 @@ test "execution gates and inherited execution config are hard diagnostics" {
         \\  script: echo unsafe
         \\  rules:
         \\    - when: never
-        \\  after_script: cleanup
+        \\  except: main
     ;
     try std.testing.expectError(error.ParseFailed, parsePipeline(a, ".gitlab-ci.yml", source, &diags));
     try std.testing.expect(diags.list.items.len >= 3);
     for (diags.list.items) |diag| try std.testing.expect(!std.mem.startsWith(u8, diag.msg, "warning: "));
+}
+
+test "extends merges template into job; job variables override on collision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\.base:
+        \\  image: node:18
+        \\  variables:
+        \\    SHARED: base
+        \\    ONLY_BASE: keep
+        \\job:
+        \\  extends: .base
+        \\  variables:
+        \\    SHARED: job
+        \\  script: echo hi
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expectEqualStrings("node:18", pipeline.jobs[0].container_image);
+    var shared: ?[]const u8 = null;
+    var only_base: ?[]const u8 = null;
+    for (pipeline.jobs[0].env) |e| {
+        if (std.mem.eql(u8, e.name, "SHARED")) shared = e.value;
+        if (std.mem.eql(u8, e.name, "ONLY_BASE")) only_base = e.value;
+    }
+    try std.testing.expectEqualStrings("job", shared.?);
+    try std.testing.expectEqualStrings("keep", only_base.?);
+}
+
+test "extends list applies templates in order so later entries win" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\.a:
+        \\  image: image-a
+        \\.b:
+        \\  image: image-b
+        \\job:
+        \\  extends: [.a, .b]
+        \\  script: echo hi
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqualStrings("image-b", pipeline.jobs[0].container_image);
+}
+
+test "extends unknown target is a hard diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\job:
+        \\  extends: .missing
+        \\  script: echo hi
+    ;
+    try std.testing.expectError(error.ParseFailed, parsePipeline(a, ".gitlab-ci.yml", source, &diags));
+    var found = false;
+    for (diags.list.items) |diag| if (std.mem.indexOf(u8, diag.msg, "extends unknown job '.missing'") != null) {
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "circular extends chain is a hard diagnostic without crashing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\.a:
+        \\  extends: .b
+        \\  script: echo a
+        \\.b:
+        \\  extends: .a
+        \\  script: echo b
+        \\job:
+        \\  extends: .a
+        \\  script: echo job
+    ;
+    try std.testing.expectError(error.ParseFailed, parsePipeline(a, ".gitlab-ci.yml", source, &diags));
+    var found = false;
+    for (diags.list.items) |diag| if (std.mem.indexOf(u8, diag.msg, "circular 'extends' chain") != null) {
+        found = true;
+    };
+    try std.testing.expect(found);
+}
+
+test "hidden template produces no job and emits no diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\.template:
+        \\  image: node:18
+        \\job:
+        \\  script: echo hi
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expectEqual(@as(usize, 0), diags.list.items.len);
+}
+
+test "default image and before_script are inherited; job image overrides default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\default:
+        \\  image: node:18
+        \\  before_script:
+        \\    - echo default-before
+        \\a:
+        \\  script: echo a
+        \\b:
+        \\  image: node:20
+        \\  script: echo b
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqualStrings("node:18", pipeline.jobs[0].container_image);
+    try std.testing.expectEqualStrings("echo default-before\necho a", pipeline.jobs[0].steps[0].script);
+    try std.testing.expectEqualStrings("node:20", pipeline.jobs[1].container_image);
+}
+
+test "legacy root image is a default fallback; default.image takes precedence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\image: legacy:1
+        \\a:
+        \\  script: echo a
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqualStrings("legacy:1", pipeline.jobs[0].container_image);
+
+    var diags2 = yaml.Diags.init(a);
+    const source2 =
+        \\image: legacy:1
+        \\default:
+        \\  image: preferred:1
+        \\a:
+        \\  script: echo a
+    ;
+    const pipeline2 = try parsePipeline(a, ".gitlab-ci.yml", source2, &diags2);
+    try std.testing.expectEqualStrings("preferred:1", pipeline2.jobs[0].container_image);
+}
+
+test "after_script lowers to a second always() step; root after_script is inherited" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\a:
+        \\  script: echo a
+        \\  after_script:
+        \\    - echo cleanup-a
+        \\b:
+        \\  script: echo b
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.jobs[0].steps.len);
+    try std.testing.expectEqualStrings("always()", pipeline.jobs[0].steps[1].cond.?);
+    try std.testing.expect(pipeline.jobs[0].steps[1].continue_on_error);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs[1].steps.len);
+
+    var diags2 = yaml.Diags.init(a);
+    const source2 =
+        \\after_script:
+        \\  - echo root-cleanup
+        \\a:
+        \\  script: echo a
+    ;
+    const pipeline2 = try parsePipeline(a, ".gitlab-ci.yml", source2, &diags2);
+    try std.testing.expectEqual(@as(usize, 2), pipeline2.jobs[0].steps.len);
+    try std.testing.expectEqualStrings("echo root-cleanup", pipeline2.jobs[0].steps[1].script);
 }

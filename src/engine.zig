@@ -126,6 +126,35 @@ test "if condition false skips step; dry run executes nothing" {
     try std.testing.expectEqual(@as(usize, 0), dry.jobs[0].steps[1].stdout.len);
 }
 
+test "always() step runs after a prior step fails; without it stays skipped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - run: exit 1
+        \\      - run: echo cleanup
+        \\        if: always()
+    );
+    const report = try run(a, p, .{});
+    try std.testing.expectEqual(JobStatus.failed, report.jobs[0].status);
+    try std.testing.expectEqual(StepStatus.failed, report.jobs[0].steps[0].status);
+    try std.testing.expectEqual(StepStatus.success, report.jobs[0].steps[1].status);
+
+    const p2 = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - run: exit 1
+        \\      - run: echo cleanup
+    );
+    const report2 = try run(a, p2, .{});
+    try std.testing.expectEqual(JobStatus.failed, report2.jobs[0].status);
+    try std.testing.expectEqual(StepStatus.skipped, report2.jobs[0].steps[1].status);
+}
+
 test "spawn failure (unknown shell) respects continue-on-error" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2234,7 +2263,10 @@ fn runJob(
         if (shared.halt.load(.acquire)) break;
         if (opts.step_filter) |f| if (!std.mem.eql(u8, f, step.id)) continue;
         if (si < resume_start) continue; // resume: steps before the target stay skipped
-        if (job_status == .failed) break;
+        if (job_status == .failed) {
+            const cond = step.cond orelse continue;
+            if (std.mem.indexOf(u8, cond, "always()") == null) continue; // stays .skipped
+        }
         const t0 = std.time.milliTimestamp();
 
         if (step.cond) |cond| {
