@@ -88,9 +88,12 @@ fn defaultShell(alloc: std.mem.Allocator) Shell {
 }
 
 fn defaultShellForProvider(alloc: std.mem.Allocator, provider: ir.Provider) Shell {
-    // GitLab scripts are written for a POSIX shell; on Windows prefer
-    // bash (incl. Git Bash) over pwsh, where `$VAR` is not the env var.
-    if ((provider == .gitlab or provider == .jenkins) and builtin.os.tag == .windows) {
+    // Non-GHA scripts are written for (or rewritten to) POSIX `${VAR}`
+    // expansion; on Windows prefer bash (incl. Git Bash) over pwsh, where
+    // `$VAR` is not the env var. Azure `$(X)` macros rewrite to `${X}` at
+    // lowering, so its default-shell steps need POSIX too — explicit
+    // pwsh/powershell/bat steps still get their declared shell.
+    if (provider != .github_actions and builtin.os.tag == .windows) {
         if (onPath(alloc, "bash") or gitBashExe(alloc, "bash") != null) return shellTable("bash").?;
         if (onPath(alloc, "sh") or gitBashExe(alloc, "sh") != null) return shellTable("sh").?;
     }

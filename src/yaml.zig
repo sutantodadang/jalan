@@ -196,6 +196,13 @@ const Parser = struct {
                     // not the first line inside the block.
                     value.line = ln.no;
                     value.col = ln.indent + 1;
+                } else if (next.indent == base_indent and std.mem.startsWith(u8, next.text, "-")) {
+                    // YAML allows a sequence value to sit at the SAME indent
+                    // as its parent key (`jobs:\n- job: x`) — common in Azure
+                    // and CircleCI configs.
+                    value = try self.parseSeqBlock(base_indent, base_indent);
+                    value.line = ln.no;
+                    value.col = ln.indent + 1;
                 } else {
                     value = .{ .line = ln.no, .col = ln.indent + 1, .data = .{ .scalar = "" } };
                 }
