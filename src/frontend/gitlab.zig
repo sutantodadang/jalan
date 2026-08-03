@@ -11,9 +11,10 @@ const job_keys = [_][]const u8{
     "after_script",  "artifacts", "cache", "dependencies",   "rules",         "only",     "except",   "tags",     "extends",
     "interruptible", "timeout",   "retry", "resource_group", "trigger",       "coverage", "release",  "when",     "environment",
 };
-const job_supported = [_][]const u8{ "script", "stage", "needs", "variables", "before_script", "image", "services", "parallel", "allow_failure", "extends", "after_script" };
-const unsafe_job_keys = [_][]const u8{ "rules", "only", "except", "when" };
-const unsafe_root_keys = [_][]const u8{ "workflow", "include" };
+const job_supported = [_][]const u8{ "script", "stage", "needs", "variables", "before_script", "image", "services", "parallel", "allow_failure", "extends", "after_script", "rules", "when" };
+const unsafe_job_keys = [_][]const u8{};
+const unsafe_root_keys = [_][]const u8{"include"};
+const rule_keys = [_][]const u8{ "if", "when", "variables", "allow_failure", "changes", "exists" };
 
 fn contains(list: []const []const u8, value: []const u8) bool {
     for (list) |item| if (std.mem.eql(u8, item, value)) return true;
@@ -29,6 +30,247 @@ fn hasHardError(diags: *const yaml.Diags) bool {
         if (!std.mem.startsWith(u8, d.msg, "warning: ")) return true;
     }
     return false;
+}
+
+const RuleVars = struct {
+    pairs: []const ir.EnvPair,
+
+    fn get(self: RuleVars, name: []const u8) ?[]const u8 {
+        var i = self.pairs.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.pairs[i].name, name)) return self.pairs[i].value;
+        }
+        return null;
+    }
+};
+
+fn buildRuleVars(alloc: std.mem.Allocator, predefined: []const ir.EnvPair, root_env: []const ir.EnvPair, local_vars: []const ir.EnvPair) !RuleVars {
+    var out: std.ArrayList(ir.EnvPair) = .empty;
+    try out.appendSlice(alloc, predefined);
+    try out.appendSlice(alloc, root_env);
+    try out.appendSlice(alloc, local_vars);
+    return .{ .pairs = try out.toOwnedSlice(alloc) };
+}
+
+const RuleValue = union(enum) {
+    scalar: ?[]const u8,
+    regex: []const u8,
+    boolean: bool,
+
+    fn asScalar(self: RuleValue) ?[]const u8 {
+        return switch (self) {
+            .scalar => |s| s,
+            .regex => |r| r,
+            .boolean => |b| if (b) "true" else null,
+        };
+    }
+
+    fn truthy(self: RuleValue) bool {
+        return switch (self) {
+            .scalar => |s| if (s) |v| v.len > 0 else false,
+            .regex => true,
+            .boolean => |b| b,
+        };
+    }
+};
+
+fn ruleValuesEqual(a: RuleValue, b: RuleValue) bool {
+    const as = a.asScalar();
+    const bs = b.asScalar();
+    if (as == null or bs == null) return as == null and bs == null;
+    return std.mem.eql(u8, as.?, bs.?);
+}
+
+const RuleParseError = error{BadExpr} || std.mem.Allocator.Error;
+
+const RuleParser = struct {
+    src: []const u8,
+    pos: usize = 0,
+    vars: RuleVars,
+    diags: *yaml.Diags,
+    node: yaml.Node,
+    warned_regex: bool = false,
+
+    fn warnRegexOnce(self: *RuleParser) !void {
+        if (self.warned_regex) return;
+        self.warned_regex = true;
+        try warn(self.diags, self.node, "regex match in rules is not supported (treated as matching)", .{});
+    }
+
+    fn skipWs(self: *RuleParser) void {
+        while (self.pos < self.src.len and (self.src[self.pos] == ' ' or self.src[self.pos] == '\t')) self.pos += 1;
+    }
+
+    fn atEnd(self: *RuleParser) bool {
+        self.skipWs();
+        return self.pos >= self.src.len;
+    }
+
+    fn peekByte(self: *RuleParser) ?u8 {
+        self.skipWs();
+        if (self.pos >= self.src.len) return null;
+        return self.src[self.pos];
+    }
+
+    fn eatStr(self: *RuleParser, s: []const u8) bool {
+        self.skipWs();
+        if (self.pos + s.len <= self.src.len and std.mem.eql(u8, self.src[self.pos .. self.pos + s.len], s)) {
+            self.pos += s.len;
+            return true;
+        }
+        return false;
+    }
+
+    fn isIdentChar(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or c == '_';
+    }
+
+    fn parseOr(self: *RuleParser) RuleParseError!bool {
+        var v = try self.parseAnd();
+        while (self.eatStr("||")) {
+            const rhs = try self.parseAnd();
+            v = v or rhs;
+        }
+        return v;
+    }
+
+    fn parseAnd(self: *RuleParser) RuleParseError!bool {
+        var v = try self.parseCmp();
+        while (self.eatStr("&&")) {
+            const rhs = try self.parseCmp();
+            v = v and rhs;
+        }
+        return v;
+    }
+
+    fn parseCmp(self: *RuleParser) RuleParseError!bool {
+        const lhs = try self.parsePrimary();
+        if (self.eatStr("==")) {
+            const rhs = try self.parsePrimary();
+            return ruleValuesEqual(lhs, rhs);
+        } else if (self.eatStr("!=")) {
+            const rhs = try self.parsePrimary();
+            return !ruleValuesEqual(lhs, rhs);
+        } else if (self.eatStr("=~")) {
+            _ = try self.parsePrimary();
+            try self.warnRegexOnce();
+            return true;
+        } else if (self.eatStr("!~")) {
+            _ = try self.parsePrimary();
+            try self.warnRegexOnce();
+            return true;
+        }
+        return lhs.truthy();
+    }
+
+    fn parsePrimary(self: *RuleParser) RuleParseError!RuleValue {
+        const c = self.peekByte() orelse return error.BadExpr;
+        if (c == '(') {
+            self.pos += 1;
+            const inner = try self.parseOr();
+            if (!self.eatStr(")")) return error.BadExpr;
+            return .{ .boolean = inner };
+        }
+        if (c == '$') {
+            self.pos += 1;
+            const start = self.pos;
+            while (self.pos < self.src.len and isIdentChar(self.src[self.pos])) self.pos += 1;
+            if (self.pos == start) return error.BadExpr;
+            return .{ .scalar = self.vars.get(self.src[start..self.pos]) };
+        }
+        if (c == '"' or c == '\'') {
+            self.pos += 1;
+            const start = self.pos;
+            while (self.pos < self.src.len and self.src[self.pos] != c) self.pos += 1;
+            if (self.pos >= self.src.len) return error.BadExpr;
+            const value = self.src[start..self.pos];
+            self.pos += 1;
+            return .{ .scalar = value };
+        }
+        if (c == '/') {
+            self.pos += 1;
+            const start = self.pos;
+            while (self.pos < self.src.len and self.src[self.pos] != '/') self.pos += 1;
+            if (self.pos >= self.src.len) return error.BadExpr;
+            const value = self.src[start..self.pos];
+            self.pos += 1;
+            return .{ .regex = value };
+        }
+        if (self.eatStr("null")) return .{ .scalar = null };
+        return error.BadExpr;
+    }
+};
+
+fn evalRuleIf(alloc: std.mem.Allocator, src: []const u8, vars: RuleVars, node: yaml.Node, diags: *yaml.Diags) !bool {
+    _ = alloc;
+    var p = RuleParser{ .src = src, .vars = vars, .diags = diags, .node = node };
+    const result = p.parseOr() catch |err| switch (err) {
+        error.BadExpr => {
+            try warn(diags, node, "cannot evaluate rule expression '{s}' (treated as matching)", .{src});
+            return true;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    if (!p.atEnd()) {
+        try warn(diags, node, "cannot evaluate rule expression '{s}' (treated as matching)", .{src});
+        return true;
+    }
+    return result;
+}
+
+const RuleMatch = struct {
+    when: []const u8 = "on_success",
+    variables: []ir.EnvPair = &.{},
+    allow_failure: ?bool = null,
+};
+
+const RulesOutcome = union(enum) {
+    malformed,
+    no_match,
+    matched: RuleMatch,
+};
+
+fn evalRuleList(alloc: std.mem.Allocator, rules_node: yaml.Node, vars: RuleVars, diags: *yaml.Diags) !RulesOutcome {
+    const items = switch (rules_node.data) {
+        .seq => |s| s,
+        else => {
+            try diags.add(rules_node.line, rules_node.col, "'rules' must be a list of mappings", .{});
+            return .malformed;
+        },
+    };
+    for (items) |rule_node| {
+        switch (rule_node.data) {
+            .map => {},
+            else => {
+                try diags.add(rule_node.line, rule_node.col, "'rules' must be a list of mappings", .{});
+                continue;
+            },
+        }
+        var matched = true;
+        if (rule_node.get("if")) |if_node| {
+            const src = if_node.scalarOr("");
+            matched = try evalRuleIf(alloc, src, vars, if_node, diags);
+        }
+        if (rule_node.get("changes")) |cnode| try warn(diags, cnode, "rule key 'changes' is not evaluated locally (treated as matching)", .{});
+        if (rule_node.get("exists")) |enode| try warn(diags, enode, "rule key 'exists' is not evaluated locally (treated as matching)", .{});
+        const rm = rule_node.data.map;
+        var it = rm.iterator();
+        while (it.next()) |entry| {
+            if (!contains(&rule_keys, entry.key_ptr.*))
+                try warn(diags, entry.value_ptr.*, "rule key '{s}' is not simulated (ignored)", .{entry.key_ptr.*});
+        }
+        if (!matched) continue;
+        var result = RuleMatch{};
+        if (rule_node.get("when")) |when_node| result.when = when_node.scalarOr("on_success");
+        if (rule_node.get("variables")) |vnode| result.variables = try envPairs(alloc, vnode, diags);
+        if (rule_node.get("allow_failure")) |afnode| switch (afnode.data) {
+            .scalar => |v| result.allow_failure = std.ascii.eqlIgnoreCase(v, "true"),
+            else => try warn(diags, afnode, "allow_failure forms other than boolean are not simulated (ignored)", .{}),
+        };
+        return .{ .matched = result };
+    }
+    return .no_match;
 }
 
 fn envPairs(alloc: std.mem.Allocator, node: ?yaml.Node, diags: *yaml.Diags) ![]ir.EnvPair {
@@ -316,7 +558,7 @@ fn lowerJob(
     root_env: []const ir.EnvPair,
     defaults: Defaults,
     diags: *yaml.Diags,
-) !BaseJob {
+) !?BaseJob {
     const stage = if (node.get("stage")) |stage_node| stage_node.scalarOr("") else "test";
     const script_node = node.get("script") orelse {
         try diags.add(node.line, node.col, "job '{s}' has no script", .{id});
@@ -329,22 +571,78 @@ fn lowerJob(
     try commands.appendSlice(alloc, before);
     try commands.appendSlice(alloc, script_lines);
 
+    const job_vars = try envPairs(alloc, node.get("variables"), diags);
+    const predefined = &[_]ir.EnvPair{
+        .{ .name = "CI", .value = "true" },
+        .{ .name = "GITLAB_CI", .value = "true" },
+        .{ .name = "CI_PIPELINE_SOURCE", .value = "push" },
+        .{ .name = "CI_JOB_NAME", .value = id },
+        .{ .name = "CI_JOB_STAGE", .value = stage },
+    };
+    const rule_vars = try buildRuleVars(alloc, predefined, root_env, job_vars);
+
+    var manual = false;
+    var allow_failure_override: ?bool = null;
+    var rule_extra_vars: []ir.EnvPair = &.{};
+
+    if (node.get("rules")) |rules_node| {
+        if (node.get("when")) |_| try warn(diags, node, "'when' is ignored when 'rules' is present", .{});
+        const outcome = try evalRuleList(alloc, rules_node, rule_vars, diags);
+        switch (outcome) {
+            .malformed => {},
+            .no_match => {
+                try warn(diags, node, "job '{s}' excluded by rules (no rule matched)", .{id});
+                return null;
+            },
+            .matched => |m| {
+                if (std.mem.eql(u8, m.when, "never")) {
+                    try warn(diags, node, "job '{s}' excluded by rules", .{id});
+                    return null;
+                } else if (std.mem.eql(u8, m.when, "manual")) {
+                    manual = true;
+                } else if (std.mem.eql(u8, m.when, "delayed")) {
+                    try warn(diags, node, "delayed jobs run immediately in local simulation", .{});
+                } else if (std.mem.eql(u8, m.when, "always")) {
+                    try warn(diags, node, "when: always is treated as on_success locally", .{});
+                }
+                rule_extra_vars = m.variables;
+                allow_failure_override = m.allow_failure;
+            },
+        }
+    } else if (node.get("when")) |when_node| {
+        const w = when_node.scalarOr("");
+        if (std.mem.eql(u8, w, "never")) {
+            try warn(diags, node, "job '{s}' excluded by when: never", .{id});
+            return null;
+        } else if (std.mem.eql(u8, w, "manual")) {
+            manual = true;
+        } else if (std.mem.eql(u8, w, "always")) {
+            try warn(diags, node, "when: always is treated as on_success locally", .{});
+        } else if (std.mem.eql(u8, w, "delayed")) {
+            try warn(diags, node, "delayed jobs run immediately in local simulation", .{});
+        } else if (!std.mem.eql(u8, w, "on_success")) {
+            try diags.add(when_node.line, when_node.col, "invalid 'when' value '{s}'", .{w});
+        }
+    }
+
     var env: std.ArrayList(ir.EnvPair) = .empty;
     try env.appendSlice(alloc, root_env);
-    try env.appendSlice(alloc, try envPairs(alloc, node.get("variables"), diags));
+    try env.appendSlice(alloc, job_vars);
+    try env.appendSlice(alloc, rule_extra_vars);
     try env.appendSlice(alloc, &.{
         .{ .name = "GITLAB_CI", .value = "true" },
         .{ .name = "CI_JOB_NAME", .value = id },
         .{ .name = "CI_JOB_STAGE", .value = stage },
     });
 
-    const allow_failure = if (node.get("allow_failure")) |allow| switch (allow.data) {
+    var allow_failure = if (node.get("allow_failure")) |allow| switch (allow.data) {
         .scalar => |value| std.ascii.eqlIgnoreCase(value, "true"),
         else => blk: {
             try warn(diags, allow, "allow_failure forms other than boolean are not simulated (ignored)", .{});
             break :blk false;
         },
     } else false;
+    if (allow_failure_override) |v| allow_failure = v;
     if (node.get("needs")) |needs| try warn(diags, needs, "needs artifact transfer is not simulated", .{});
     try checkJobKeys(node, diags);
 
@@ -387,6 +685,7 @@ fn lowerJob(
             .container_image = try imageName(image_node, diags),
             .services = try lowerServices(alloc, services_node, diags),
             .provider = .gitlab,
+            .manual = manual,
         },
         .stage = stage,
         .explicit_needs = node.get("needs") != null,
@@ -485,7 +784,41 @@ pub fn parsePipeline(alloc: std.mem.Allocator, source_path: []const u8, source: 
     };
     const stages = if (root.get("stages")) |node| try stringList(alloc, node, "stages", diags) else try alloc.dupe([]const u8, &default_stages);
     if (stages.len == 0) try diags.add(root.line, root.col, "'stages' must not be empty", .{});
-    const root_env = try envPairs(alloc, root.get("variables"), diags);
+    var root_env: []ir.EnvPair = try envPairs(alloc, root.get("variables"), diags);
+
+    if (root.get("workflow")) |workflow_node| switch (workflow_node.data) {
+        .map => {
+            var wit = workflow_node.data.map.iterator();
+            while (wit.next()) |entry| {
+                if (!std.mem.eql(u8, entry.key_ptr.*, "rules"))
+                    try warn(diags, entry.value_ptr.*, "workflow key '{s}' is not simulated (ignored)", .{entry.key_ptr.*});
+            }
+            if (workflow_node.get("rules")) |rules_node| {
+                const wf_predefined = &[_]ir.EnvPair{
+                    .{ .name = "CI", .value = "true" },
+                    .{ .name = "GITLAB_CI", .value = "true" },
+                    .{ .name = "CI_PIPELINE_SOURCE", .value = "push" },
+                };
+                const wf_vars = try buildRuleVars(alloc, wf_predefined, root_env, &.{});
+                const outcome = try evalRuleList(alloc, rules_node, wf_vars, diags);
+                switch (outcome) {
+                    .malformed => {},
+                    .no_match => try warn(diags, workflow_node, "no workflow rule matched — GitLab would skip this pipeline (running anyway)", .{}),
+                    .matched => |m| {
+                        if (std.mem.eql(u8, m.when, "never"))
+                            try warn(diags, workflow_node, "workflow rules would skip this pipeline on GitLab (running anyway)", .{});
+                        if (m.variables.len > 0) {
+                            var combined: std.ArrayList(ir.EnvPair) = .empty;
+                            try combined.appendSlice(alloc, root_env);
+                            try combined.appendSlice(alloc, m.variables);
+                            root_env = try combined.toOwnedSlice(alloc);
+                        }
+                    },
+                }
+            }
+        },
+        else => try diags.add(workflow_node.line, workflow_node.col, "'workflow' must be a mapping", .{}),
+    };
 
     var defaults = Defaults{};
     if (root.get("default")) |def_node| switch (def_node.data) {
@@ -522,7 +855,7 @@ pub fn parsePipeline(alloc: std.mem.Allocator, source_path: []const u8, source: 
     for (root_keys) |key| if (root.get(key)) |node| {
         if (contains(&unsafe_root_keys, key))
             try diags.add(node.line, node.col, "global key '{s}' affects execution and is not supported", .{key})
-        else if (!contains(&.{ "stages", "variables", "before_script", "after_script", "default", "image", "services" }, key))
+        else if (!contains(&.{ "stages", "variables", "before_script", "after_script", "default", "image", "services", "workflow" }, key))
             try warn(diags, node, "global key '{s}' is not simulated (ignored)", .{key});
     };
 
@@ -544,7 +877,9 @@ pub fn parsePipeline(alloc: std.mem.Allocator, source_path: []const u8, source: 
             .map => {
                 var visiting: std.StringArrayHashMapUnmanaged(void) = .empty;
                 const effective = try resolveExtends(alloc, id, entry.value_ptr.*, root_map, templates, &visiting, diags);
-                try bases.append(alloc, try lowerJob(alloc, id, effective, root_env, defaults, diags));
+                if (try lowerJob(alloc, id, effective, root_env, defaults, diags)) |base| {
+                    try bases.append(alloc, base);
+                }
             },
             else => try diags.add(entry.value_ptr.line, entry.value_ptr.col, "job '{s}' must be a mapping", .{id}),
         }
@@ -695,24 +1030,24 @@ test "unsupported job features warn without hiding the job" {
     for (diags.list.items) |diag| try std.testing.expect(std.mem.startsWith(u8, diag.msg, "warning: "));
 }
 
-test "execution gates and inherited execution config are hard diagnostics" {
+test "'include' at root is still a hard diagnostic" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var diags = yaml.Diags.init(a);
     const source =
-        \\workflow:
-        \\  rules:
-        \\    - when: never
+        \\include:
+        \\  - local: other.yml
         \\job:
-        \\  script: echo unsafe
-        \\  rules:
-        \\    - when: never
-        \\  except: main
+        \\  script: echo ok
     ;
     try std.testing.expectError(error.ParseFailed, parsePipeline(a, ".gitlab-ci.yml", source, &diags));
-    try std.testing.expect(diags.list.items.len >= 3);
-    for (diags.list.items) |diag| try std.testing.expect(!std.mem.startsWith(u8, diag.msg, "warning: "));
+    var found_include = false;
+    for (diags.list.items) |diag| {
+        if (std.mem.indexOf(u8, diag.msg, "include") != null and !std.mem.startsWith(u8, diag.msg, "warning: "))
+            found_include = true;
+    }
+    try std.testing.expect(found_include);
 }
 
 test "extends merges template into job; job variables override on collision" {
@@ -897,4 +1232,262 @@ test "after_script lowers to a second always() step; root after_script is inheri
     const pipeline2 = try parsePipeline(a, ".gitlab-ci.yml", source2, &diags2);
     try std.testing.expectEqual(@as(usize, 2), pipeline2.jobs[0].steps.len);
     try std.testing.expectEqualStrings("echo root-cleanup", pipeline2.jobs[0].steps[1].script);
+}
+
+fn findEnv(env: []const ir.EnvPair, name: []const u8) ?[]const u8 {
+    for (env) |e| if (std.mem.eql(u8, e.name, name)) return e.value;
+    return null;
+}
+
+fn anyDiagContains(diags: *const yaml.Diags, needle: []const u8) bool {
+    for (diags.list.items) |d| if (std.mem.indexOf(u8, d.msg, needle) != null) return true;
+    return false;
+}
+
+test "rule if evaluator: equality, inequality, and/or, parens, truthiness, null" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const node = yaml.Node{ .line = 1, .col = 1, .data = .{ .scalar = "" } };
+    const vars = [_]ir.EnvPair{ .{ .name = "V", .value = "x" }, .{ .name = "EMPTY", .value = "" } };
+    const rv = RuleVars{ .pairs = &vars };
+
+    try std.testing.expect(try evalRuleIf(a, "$V == \"x\"", rv, node, &diags));
+    try std.testing.expect(!(try evalRuleIf(a, "$V == \"y\"", rv, node, &diags)));
+    try std.testing.expect(try evalRuleIf(a, "$V != \"y\"", rv, node, &diags));
+    try std.testing.expect(try evalRuleIf(a, "$V == 'x'", rv, node, &diags));
+    try std.testing.expect(try evalRuleIf(a, "$V", rv, node, &diags));
+    try std.testing.expect(!(try evalRuleIf(a, "$EMPTY", rv, node, &diags)));
+    try std.testing.expect(!(try evalRuleIf(a, "$MISSING", rv, node, &diags)));
+    try std.testing.expect(try evalRuleIf(a, "$MISSING == null", rv, node, &diags));
+    try std.testing.expect(try evalRuleIf(a, "$V == \"x\" && $EMPTY == \"\"", rv, node, &diags));
+    try std.testing.expect(try evalRuleIf(a, "$V == \"y\" || $V == \"x\"", rv, node, &diags));
+    try std.testing.expect(try evalRuleIf(a, "($V == \"y\" || $V == \"x\") && $EMPTY == \"\"", rv, node, &diags));
+}
+
+test "rule if evaluator: regex ops warn once and match; garbage expression warns and matches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const node = yaml.Node{ .line = 1, .col = 1, .data = .{ .scalar = "" } };
+    const vars = [_]ir.EnvPair{.{ .name = "V", .value = "x" }};
+    const rv = RuleVars{ .pairs = &vars };
+
+    const before = diags.list.items.len;
+    try std.testing.expect(try evalRuleIf(a, "$V =~ /x/", rv, node, &diags));
+    try std.testing.expect(diags.list.items.len > before);
+
+    var diags2 = yaml.Diags.init(a);
+    try std.testing.expect(try evalRuleIf(a, "$V !~ /y/", rv, node, &diags2));
+    try std.testing.expect(diags2.list.items.len > 0);
+
+    var diags3 = yaml.Diags.init(a);
+    try std.testing.expect(try evalRuleIf(a, "$V ===", rv, node, &diags3));
+    try std.testing.expect(diags3.list.items.len > 0);
+}
+
+test "job rules: first matching rule wins; later rules are not evaluated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\job:
+        \\  script: echo ok
+        \\  rules:
+        \\    - if: '$CI == "true"'
+        \\      when: on_success
+        \\    - when: never
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+}
+
+test "job rules: no rule matches excludes the job with a warning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\a:
+        \\  script: echo a
+        \\  rules:
+        \\    - if: '$MISSING == "x"'
+        \\b:
+        \\  script: echo b
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expectEqualStrings("b", pipeline.jobs[0].id);
+    try std.testing.expect(anyDiagContains(&diags, "no rule matched"));
+}
+
+test "job rules: when: never in the matched rule excludes the job" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\a:
+        \\  script: echo a
+        \\  rules:
+        \\    - when: never
+        \\b:
+        \\  script: echo b
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expectEqualStrings("b", pipeline.jobs[0].id);
+    try std.testing.expect(anyDiagContains(&diags, "excluded by rules"));
+}
+
+test "job rules: matched rule variables land in env and allow_failure override applies" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\job:
+        \\  script: echo hi
+        \\  variables:
+        \\    BASE: v
+        \\  allow_failure: false
+        \\  rules:
+        \\    - if: '$BASE == "v"'
+        \\      when: on_success
+        \\      variables:
+        \\        EXTRA: yes
+        \\      allow_failure: true
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expectEqualStrings("yes", findEnv(pipeline.jobs[0].env, "EXTRA").?);
+    try std.testing.expect(pipeline.jobs[0].steps[0].continue_on_error);
+}
+
+test "job rules: changes clause warns and is treated as matching" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\job:
+        \\  script: echo hi
+        \\  rules:
+        \\    - changes: [file.txt]
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expect(anyDiagContains(&diags, "not evaluated locally"));
+}
+
+test "top-level when: never excludes a job; when: manual sets Job.manual" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\a:
+        \\  script: echo a
+        \\  when: never
+        \\b:
+        \\  script: echo b
+        \\  when: manual
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expectEqualStrings("b", pipeline.jobs[0].id);
+    try std.testing.expect(pipeline.jobs[0].manual);
+}
+
+test "rules and top-level when together: rules wins and when is ignored (warn)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\job:
+        \\  script: echo hi
+        \\  when: manual
+        \\  rules:
+        \\    - when: on_success
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expect(!pipeline.jobs[0].manual);
+    try std.testing.expect(anyDiagContains(&diags, "'when' is ignored when 'rules' is present"));
+}
+
+test "workflow when: never warns but jobs still lower" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\workflow:
+        \\  rules:
+        \\    - when: never
+        \\job:
+        \\  script: echo hi
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expect(anyDiagContains(&diags, "workflow rules would skip this pipeline"));
+}
+
+test "workflow rule variables land in job env" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\workflow:
+        \\  rules:
+        \\    - if: '$CI == "true"'
+        \\      variables:
+        \\        WF: yes
+        \\job:
+        \\  script: echo hi
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqualStrings("yes", findEnv(pipeline.jobs[0].env, "WF").?);
+}
+
+test "workflow no rule matched warns but jobs still lower" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\workflow:
+        \\  rules:
+        \\    - if: '$MISSING == "x"'
+        \\job:
+        \\  script: echo hi
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expect(anyDiagContains(&diags, "no workflow rule matched"));
+}
+
+test "only and except are recognized but not simulated; job stays" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const source =
+        \\job:
+        \\  script: echo hi
+        \\  only:
+        \\    - main
+        \\  except:
+        \\    - develop
+    ;
+    const pipeline = try parsePipeline(a, ".gitlab-ci.yml", source, &diags);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.jobs.len);
+    try std.testing.expect(anyDiagContains(&diags, "'only' is recognized but not simulated"));
+    try std.testing.expect(anyDiagContains(&diags, "'except' is recognized but not simulated"));
+    for (diags.list.items) |diag| try std.testing.expect(std.mem.startsWith(u8, diag.msg, "warning: "));
 }

@@ -105,6 +105,27 @@ test "failed job skips dependents, continue-on-error does not fail job" {
     try std.testing.expectEqual(StepStatus.failed, report.jobs[0].steps[0].status);
 }
 
+test "manual job is skipped without --job (dependent skipped, not failed); --job runs it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var man_steps = [_]ir.Step{.{ .id = "s", .name = "s", .kind = .run, .script = "echo hi" }};
+    var dep_steps = [_]ir.Step{.{ .id = "s2", .name = "s2", .kind = .run, .script = "echo dep" }};
+    var needs = [_][]const u8{"man"};
+    var jobs = [_]ir.Job{
+        .{ .id = "man", .display_name = "man", .steps = &man_steps, .manual = true },
+        .{ .id = "dep", .display_name = "dep", .needs = &needs, .steps = &dep_steps },
+    };
+    const p = ir.Pipeline{ .name = "p", .source_path = "x.yml", .jobs = &jobs };
+
+    const report = try run(a, p, .{});
+    try std.testing.expectEqual(JobStatus.skipped, report.jobs[0].status);
+    try std.testing.expectEqual(JobStatus.skipped, report.jobs[1].status);
+
+    const report2 = try run(a, p, .{ .job_filter = "man" });
+    try std.testing.expectEqual(JobStatus.success, report2.jobs[0].status);
+}
+
 test "if condition false skips step; dry run executes nothing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2167,6 +2188,10 @@ fn runJob(
     if (shared.halt.load(.acquire)) return skipped;
 
     if (opts.job_filter) |f| if (!std.mem.eql(u8, f, job.id)) return skipped;
+    if (job.manual and opts.job_filter == null) {
+        logJob(opts, alloc, job, "manual job skipped (run with --job)");
+        return skipped;
+    }
     if (!gha.matrixMatches(job, opts.matrix_filter)) return skipped;
     if (opts.resume_from == null) {
         if (needsFailed(p, results, done, job)) return skipped;
