@@ -409,6 +409,136 @@ test "matrixMatches filters combos" {
     _ = a;
 }
 
+test "matrix include adds a new standalone combo when it matches no product entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    strategy:
+        \\      matrix:
+        \\        os: [ubuntu-latest, macos-15, windows-latest]
+        \\        optimize: [Debug, ReleaseSafe]
+        \\        include:
+        \\          - os: ubuntu-latest
+        \\            optimize: ReleaseFast
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "m.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 7), p.jobs.len);
+    const last = p.jobs[p.jobs.len - 1];
+    try std.testing.expectEqualStrings("os", last.matrix[0].name);
+    try std.testing.expectEqualStrings("ubuntu-latest", last.matrix[0].value);
+    try std.testing.expectEqualStrings("optimize", last.matrix[1].name);
+    try std.testing.expectEqualStrings("ReleaseFast", last.matrix[1].value);
+}
+
+test "matrix include extends an existing combo with an extra key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    strategy:
+        \\      matrix:
+        \\        os: [a, b]
+        \\        include:
+        \\          - os: a
+        \\            experimental: "true"
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "m.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 2), p.jobs.len);
+    for (p.jobs) |j| {
+        const os_val = for (j.matrix) |m| {
+            if (std.mem.eql(u8, m.name, "os")) break m.value;
+        } else "";
+        var has_experimental = false;
+        for (j.matrix) |m| {
+            if (std.mem.eql(u8, m.name, "experimental")) has_experimental = true;
+        }
+        if (std.mem.eql(u8, os_val, "a")) {
+            try std.testing.expect(has_experimental);
+        } else {
+            try std.testing.expect(!has_experimental);
+        }
+    }
+}
+
+test "matrix exclude removes a matching combo" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    strategy:
+        \\      matrix:
+        \\        os: [a, b]
+        \\        opt: [x, y]
+        \\        exclude:
+        \\          - os: a
+        \\            opt: y
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "m.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 3), p.jobs.len);
+}
+
+test "matrix include-only (no axes) produces one job per entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    strategy:
+        \\      matrix:
+        \\        include:
+        \\          - os: a
+        \\          - os: b
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "m.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 2), p.jobs.len);
+}
+
+test "matrix exclude with unknown key matches nothing and warns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diags = yaml.Diags.init(a);
+    const src =
+        \\jobs:
+        \\  build:
+        \\    strategy:
+        \\      matrix:
+        \\        os: [a, b]
+        \\        opt: [x, y]
+        \\        exclude:
+        \\          - ghost: a
+        \\    steps:
+        \\      - run: echo hi
+    ;
+    const p = try parseWorkflow(a, "m.yml", src, &diags);
+    try std.testing.expectEqual(@as(usize, 4), p.jobs.len);
+    var found = false;
+    for (diags.list.items) |d| {
+        if (std.mem.indexOf(u8, d.msg, "matrix exclude entry has unknown key 'ghost'") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "dangling needs and cycle are hard errors, unknown shell warns" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -652,8 +782,8 @@ pub fn parseWorkflow(
                 const job_id = e.key_ptr.*;
                 const jn = e.value_ptr.*;
                 const base = try lowerJob(alloc, job_id, jn, wf_env, wf_defaults, diags);
-                const axes = try readMatrix(alloc, jn, diags);
-                try appendExpanded(alloc, &jobs, base, axes);
+                const spec = try readMatrix(alloc, jn, diags);
+                try appendExpanded(alloc, &jobs, base, spec, diags);
             }
         },
         else => {
@@ -791,17 +921,55 @@ fn lowerJob(
 
 const Axis = struct { name: []const u8, values: [][]const u8 };
 
-fn readMatrix(alloc: std.mem.Allocator, jn: yaml.Node, diags: *yaml.Diags) ![]Axis {
+/// One `include`/`exclude` entry: a map of key -> scalar value. `line`/`col`
+/// point at the entry itself so diagnostics about it (unknown keys, etc.)
+/// land on the right source location.
+const MatrixEntry = struct { pairs: []ir.EnvPair, line: u32, col: u32 };
+
+const MatrixSpec = struct {
+    axes: []Axis,
+    include: []MatrixEntry,
+    exclude: []MatrixEntry,
+};
+
+/// Parses the sequence-of-maps shape shared by `matrix.include` and
+/// `matrix.exclude`. A non-map entry (or a non-sequence value) is malformed —
+/// warn and drop it rather than hard-failing, since include/exclude are
+/// additive/subtractive sugar on top of the axis product.
+fn readMatrixEntries(alloc: std.mem.Allocator, node: yaml.Node, kind: []const u8, diags: *yaml.Diags) ![]MatrixEntry {
+    var out: std.ArrayList(MatrixEntry) = .empty;
+    switch (node.data) {
+        .seq => |items| for (items) |item| switch (item.data) {
+            .map => |m| {
+                var pairs: std.ArrayList(ir.EnvPair) = .empty;
+                var it = m.iterator();
+                while (it.next()) |e| try pairs.append(alloc, .{ .name = e.key_ptr.*, .value = e.value_ptr.*.scalarOr("") });
+                try out.append(alloc, .{ .pairs = try pairs.toOwnedSlice(alloc), .line = item.line, .col = item.col });
+            },
+            else => try addWarn(diags, item.line, item.col, "matrix {s} entry must be a mapping (ignored)", .{kind}),
+        },
+        else => try addWarn(diags, node.line, node.col, "matrix {s} must be a list (ignored)", .{kind}),
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn readMatrix(alloc: std.mem.Allocator, jn: yaml.Node, diags: *yaml.Diags) !MatrixSpec {
     var axes: std.ArrayList(Axis) = .empty;
-    const strategy = jn.get("strategy") orelse return axes.toOwnedSlice(alloc);
-    const matrix = strategy.get("matrix") orelse return axes.toOwnedSlice(alloc);
+    var include: []MatrixEntry = &.{};
+    var exclude: []MatrixEntry = &.{};
+    const strategy = jn.get("strategy") orelse return .{ .axes = try axes.toOwnedSlice(alloc), .include = include, .exclude = exclude };
+    const matrix = strategy.get("matrix") orelse return .{ .axes = try axes.toOwnedSlice(alloc), .include = include, .exclude = exclude };
     switch (matrix.data) {
         .map => |m| {
             var it = m.iterator();
             while (it.next()) |e| {
                 const axis_name = e.key_ptr.*;
-                if (std.mem.eql(u8, axis_name, "include") or std.mem.eql(u8, axis_name, "exclude")) {
-                    try addWarn(diags, e.value_ptr.line, e.value_ptr.col, "matrix {s} is not supported in phase 1 (ignored)", .{axis_name});
+                if (std.mem.eql(u8, axis_name, "include")) {
+                    include = try readMatrixEntries(alloc, e.value_ptr.*, "include", diags);
+                    continue;
+                }
+                if (std.mem.eql(u8, axis_name, "exclude")) {
+                    exclude = try readMatrixEntries(alloc, e.value_ptr.*, "exclude", diags);
                     continue;
                 }
                 var vals: std.ArrayList([]const u8) = .empty;
@@ -819,22 +987,77 @@ fn readMatrix(alloc: std.mem.Allocator, jn: yaml.Node, diags: *yaml.Diags) ![]Ax
         },
         else => try diags.add(matrix.line, matrix.col, "'matrix' must be a mapping", .{}),
     }
-    return axes.toOwnedSlice(alloc);
+    return .{ .axes = try axes.toOwnedSlice(alloc), .include = include, .exclude = exclude };
 }
 
-fn appendExpanded(alloc: std.mem.Allocator, jobs: *std.ArrayList(ir.Job), base: ir.Job, axes: []Axis) !void {
+/// True when every pair in `entry` is present (name+value) in `combo`. Used
+/// both for exclude removal and include matching — an entry with zero pairs
+/// vacuously matches every combo (that's how a keyless include entry is
+/// documented to extend *all* combos).
+fn comboMatches(entry: []const ir.EnvPair, combo: []const ir.EnvPair) bool {
+    for (entry) |ep| {
+        var found = false;
+        for (combo) |cp| {
+            if (std.mem.eql(u8, ep.name, cp.name) and std.mem.eql(u8, ep.value, cp.value)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// Adds/overwrites `pair` into `combo` in place (include's "extra key"
+/// semantics: last one wins if two include entries touch the same key).
+fn mergePair(alloc: std.mem.Allocator, combo: *std.ArrayList(ir.EnvPair), pair: ir.EnvPair) !void {
+    for (combo.items) |*p| {
+        if (std.mem.eql(u8, p.name, pair.name)) {
+            p.value = pair.value;
+            return;
+        }
+    }
+    try combo.append(alloc, pair);
+}
+
+fn appendComboJob(alloc: std.mem.Allocator, jobs: *std.ArrayList(ir.Job), base: ir.Job, pairs: []ir.EnvPair) !void {
+    var names: std.ArrayList([]const u8) = .empty;
+    for (pairs) |p| try names.append(alloc, p.value);
+    var j = base;
+    j.matrix = pairs;
+    j.display_name = try std.fmt.allocPrint(alloc, "{s} ({s})", .{ base.id, try std.mem.join(alloc, ", ", names.items) });
+    try jobs.append(alloc, j);
+}
+
+/// Expands `base` into one job per matrix combination: cartesian product of
+/// `spec.axes`, then `exclude` removes combos, then `include` either extends
+/// a still-present combo (all of the entry's axis-named keys match it) or —
+/// when no combo matches (e.g. a value outside the axis, or no axes at all)
+/// — is appended as a brand new standalone combo. Order: exclude before
+/// include, matching GitHub's documented behavior.
+fn appendExpanded(alloc: std.mem.Allocator, jobs: *std.ArrayList(ir.Job), base: ir.Job, spec: MatrixSpec, diags: *yaml.Diags) !void {
+    const axes = spec.axes;
     if (axes.len == 0) {
-        try jobs.append(alloc, base);
+        if (spec.include.len == 0) {
+            try jobs.append(alloc, base);
+            return;
+        }
+        // No axes to build a product from: every include entry is its own
+        // combo (GitHub supports include-only matrices).
+        for (spec.include) |entry| try appendComboJob(alloc, jobs, base, entry.pairs);
         return;
     }
-    // readMatrix never appends an axis with 0 values (empty axes are a hard
-    // diagnostic), so plain lengths are safe here — no @max(...,1) needed.
+
+    // 1. Build the original cartesian product. readMatrix never appends an
+    // axis with 0 values (empty axes are a hard diagnostic), so plain
+    // lengths are safe here — no @max(...,1) needed.
     var total: usize = 1;
     for (axes) |ax| total *= ax.values.len;
+    var combos: std.ArrayList(std.ArrayList(ir.EnvPair)) = .empty;
+    var removed: std.ArrayList(bool) = .empty;
     var combo_idx: usize = 0;
     while (combo_idx < total) : (combo_idx += 1) {
         var combo: std.ArrayList(ir.EnvPair) = .empty;
-        var names: std.ArrayList([]const u8) = .empty;
         var rem = combo_idx;
         var stride: usize = total;
         for (axes) |ax| {
@@ -842,12 +1065,78 @@ fn appendExpanded(alloc: std.mem.Allocator, jobs: *std.ArrayList(ir.Job), base: 
             const v = ax.values[(rem / stride) % ax.values.len];
             rem %= stride;
             try combo.append(alloc, .{ .name = ax.name, .value = v });
-            try names.append(alloc, v);
         }
-        var j = base;
-        j.matrix = try combo.toOwnedSlice(alloc);
-        j.display_name = try std.fmt.allocPrint(alloc, "{s} ({s})", .{ base.id, try std.mem.join(alloc, ", ", names.items) });
-        try jobs.append(alloc, j);
+        try combos.append(alloc, combo);
+        try removed.append(alloc, false);
+    }
+
+    // 2. Apply exclude. An entry referencing a key that isn't an axis name
+    // can never legitimately match a product combo, so it matches nothing —
+    // warn rather than silently excluding everything (or nothing).
+    for (spec.exclude) |entry| {
+        var unknown = false;
+        for (entry.pairs) |p| {
+            var is_axis = false;
+            for (axes) |ax| {
+                if (std.mem.eql(u8, ax.name, p.name)) {
+                    is_axis = true;
+                    break;
+                }
+            }
+            if (!is_axis) {
+                try addWarn(diags, entry.line, entry.col, "matrix exclude entry has unknown key '{s}' (ignored)", .{p.name});
+                unknown = true;
+            }
+        }
+        if (unknown) continue;
+        for (combos.items, 0..) |combo, i| {
+            if (!removed.items[i] and comboMatches(entry.pairs, combo.items)) removed.items[i] = true;
+        }
+    }
+
+    // 3. Snapshot which original-product combos survive exclude — include
+    // matching is only ever against this fixed set, never against combos
+    // appended by an earlier include entry.
+    var base_indices: std.ArrayList(usize) = .empty;
+    for (combos.items, 0..) |_, i| if (!removed.items[i]) try base_indices.append(alloc, i);
+
+    // 4. Apply include, in order.
+    var extra_combos: std.ArrayList(std.ArrayList(ir.EnvPair)) = .empty;
+    for (spec.include) |entry| {
+        var axis_pairs: std.ArrayList(ir.EnvPair) = .empty;
+        var extra_pairs: std.ArrayList(ir.EnvPair) = .empty;
+        for (entry.pairs) |p| {
+            var is_axis = false;
+            for (axes) |ax| {
+                if (std.mem.eql(u8, ax.name, p.name)) {
+                    is_axis = true;
+                    break;
+                }
+            }
+            if (is_axis) try axis_pairs.append(alloc, p) else try extra_pairs.append(alloc, p);
+        }
+        var matched = false;
+        for (base_indices.items) |i| {
+            if (comboMatches(axis_pairs.items, combos.items[i].items)) {
+                matched = true;
+                for (extra_pairs.items) |ep| try mergePair(alloc, &combos.items[i], ep);
+            }
+        }
+        if (!matched) {
+            var nc: std.ArrayList(ir.EnvPair) = .empty;
+            try nc.appendSlice(alloc, entry.pairs);
+            try extra_combos.append(alloc, nc);
+        }
+    }
+
+    // 5. Materialize: surviving original-product combos first (in product
+    // order), then standalone combos appended by include (in include order).
+    for (combos.items, 0..) |combo, i| {
+        if (removed.items[i]) continue;
+        try appendComboJob(alloc, jobs, base, combo.items);
+    }
+    for (extra_combos.items) |combo| {
+        try appendComboJob(alloc, jobs, base, combo.items);
     }
 }
 
