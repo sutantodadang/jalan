@@ -259,6 +259,11 @@ pub const RunArgs = struct {
     pull: bool = false,
     snapshot: ?bool = null,
     cache: ?bool = null,
+    // `--isolate`/`--no-isolate`: force per-job workspace copies on/off.
+    // null -> engine.RunOptions's auto rule (see there). Phase 3 modes
+    // (snapshot/cache/breakpoints/step_all/resume) always force this off
+    // regardless of what's passed here — the engine logs a warning if so.
+    isolate: ?bool = null,
     breaks: []const []const u8 = &.{},
     on_failure: []const u8 = "continue",
     // True only when the user actually passed `--on-failure`; lets
@@ -490,6 +495,10 @@ pub fn parseRunArgs(alloc: std.mem.Allocator, args: []const []const u8) !RunArgs
             r.cache = true;
         } else if (std.mem.eql(u8, arg, "--no-cache")) {
             r.cache = false;
+        } else if (std.mem.eql(u8, arg, "--isolate")) {
+            r.isolate = true;
+        } else if (std.mem.eql(u8, arg, "--no-isolate")) {
+            r.isolate = false;
         } else if (std.mem.eql(u8, arg, "--break")) {
             i += 1;
             if (i >= args.len or splitSelector(args[i]) == null) return error.BadArgs;
@@ -806,15 +815,248 @@ fn print(s: []const u8) !u8 {
     return 0;
 }
 
-var stderr_log_mutex: std.Thread.Mutex = .{};
-
 // Thread-safe per RunOptions.log contract: called from worker threads under
-// parallel job execution.
+// parallel job execution. Shares `progress_mutex` with the status renderer
+// below so a log line can never interleave with (and corrupt) a live status
+// block: clear the block, print the line, repaint the block.
 fn logToStderr(line: []const u8) void {
-    stderr_log_mutex.lock();
-    defer stderr_log_mutex.unlock();
-    std.fs.File.stderr().writeAll(line) catch return;
-    std.fs.File.stderr().writeAll("\n") catch return;
+    progress_mutex.lock();
+    defer progress_mutex.unlock();
+    if (progress_active and progress_is_tty) progressClearLocked();
+    std.fs.File.stderr().writeAll(line) catch {};
+    std.fs.File.stderr().writeAll("\n") catch {};
+    if (progress_active and progress_is_tty) progressRedrawLocked();
+}
+
+// ---------------------------------------------------------------------
+// Live progress renderer for plain `jalan run` (not `--tui`, which uses the
+// full-screen TUI in tui.zig instead — this only activates on the plain
+// path, see the wiring in `runMain`).
+//
+// `RunOptions.progress` is a bare `*const fn(engine.ProgressEvent) void`
+// with no closure context — the same constraint `RunOptions.log` already
+// lives with (see `logToStderr` above) — so all renderer state below is
+// module-level and guarded by `progress_mutex`.
+//
+// On a TTY: a background thread redraws a status block every 500ms (header
+// + one spinner line per running job); finished jobs print once as a
+// permanent line above the block. Piped (non-TTY): no ANSI redraws, just a
+// one-line start/finish per job plus a heartbeat at most every 30s while
+// jobs are still running, so a long docker pull isn't silent for minutes.
+// ---------------------------------------------------------------------
+
+const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
+
+const ProgressJob = struct {
+    name: []const u8 = "",
+    state: enum { pending, running, done } = .pending,
+    step: []const u8 = "",
+    started_ms: i64 = 0,
+    ok: bool = true,
+    wall_ms: u64 = 0,
+};
+
+var progress_mutex: std.Thread.Mutex = .{};
+var progress_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+var progress_jobs: []ProgressJob = &.{};
+var progress_total: usize = 0;
+var progress_done: usize = 0;
+var progress_run_started_ms: i64 = 0;
+var progress_is_tty: bool = false;
+var progress_use_color: bool = true;
+var progress_active: bool = false;
+var progress_lines_drawn: usize = 0;
+var progress_cursor_hidden: bool = false;
+var progress_spinner: usize = 0;
+var progress_last_heartbeat_ms: i64 = 0;
+var progress_stop_flag: std.atomic.Value(bool) = .init(false);
+var progress_thread: ?std.Thread = null;
+
+/// Start the renderer. Called from `runMain` right before `engine.run`, only
+/// when not `--tui`. `total` seeds the header's job count; `is_tty` picks
+/// spinner-block redraw vs. periodic heartbeat.
+fn progressStart(total: usize, is_tty: bool, use_color: bool) void {
+    progress_mutex.lock();
+    _ = progress_arena.reset(.retain_capacity);
+    const a = progress_arena.allocator();
+    progress_jobs = a.alloc(ProgressJob, total) catch &.{};
+    for (progress_jobs) |*j| j.* = .{};
+    progress_total = total;
+    progress_done = 0;
+    progress_run_started_ms = std.time.milliTimestamp();
+    progress_is_tty = is_tty;
+    progress_use_color = use_color;
+    progress_lines_drawn = 0;
+    progress_cursor_hidden = false;
+    progress_spinner = 0;
+    progress_last_heartbeat_ms = progress_run_started_ms;
+    progress_active = true;
+    progress_stop_flag.store(false, .release);
+    progress_mutex.unlock();
+    progress_thread = std.Thread.spawn(.{}, progressLoop, .{}) catch null;
+}
+
+/// Stop the renderer: join the tick thread, clear any drawn status block,
+/// and restore the cursor. Called via `defer` right after `progressStart` so
+/// it always runs — including on every early error return from `runMain` —
+/// never leaving the cursor hidden or a half-drawn block on screen.
+fn progressStop() void {
+    progress_stop_flag.store(true, .release);
+    if (progress_thread) |t| t.join();
+    progress_thread = null;
+    progress_mutex.lock();
+    defer progress_mutex.unlock();
+    if (progress_is_tty) progressClearLocked();
+    if (progress_cursor_hidden) {
+        std.fs.File.stderr().writeAll("\x1b[?25h") catch {};
+        progress_cursor_hidden = false;
+    }
+    progress_active = false;
+    progress_jobs = &.{};
+}
+
+/// Move the cursor up over the currently-drawn block and clear everything
+/// below it, so the next redraw starts clean regardless of how many lines
+/// the block used last time (job count changes as jobs finish).
+fn progressClearLocked() void {
+    if (progress_lines_drawn == 0) return;
+    var buf: [32]u8 = undefined;
+    const up = std.fmt.bufPrint(&buf, "\x1b[{d}A", .{progress_lines_drawn}) catch return;
+    std.fs.File.stderr().writeAll(up) catch {};
+    std.fs.File.stderr().writeAll("\x1b[J") catch {};
+    progress_lines_drawn = 0;
+}
+
+fn progressWriteLocked(line: []const u8) void {
+    std.fs.File.stderr().writeAll(line) catch {};
+    std.fs.File.stderr().writeAll("\n") catch {};
+}
+
+/// TTY redraw: header line + one spinner line per running job. Called with
+/// `progress_mutex` held.
+fn progressRedrawLocked() void {
+    progressClearLocked();
+    if (!progress_cursor_hidden) {
+        std.fs.File.stderr().writeAll("\x1b[?25l") catch {};
+        progress_cursor_hidden = true;
+    }
+    const a = progress_arena.allocator();
+    const now = std.time.milliTimestamp();
+    const elapsed: u64 = @intCast(@max(now - progress_run_started_ms, 0));
+    var lines: usize = 0;
+    if (std.fmt.allocPrint(a, "jobs: {d}/{d} done \xc2\xb7 elapsed {s}", .{ progress_done, progress_total, fmtDur(a, elapsed) })) |header| {
+        progressWriteLocked(header);
+        lines += 1;
+    } else |_| {}
+    for (progress_jobs) |j| {
+        if (j.state != .running) continue;
+        const job_elapsed: u64 = @intCast(@max(now - j.started_ms, 0));
+        const step = if (j.step.len > 0) j.step else "...";
+        const line = std.fmt.allocPrint(a, "{s} {s} \xc2\xb7 {s} \xc2\xb7 {s}", .{ spinner_frames[progress_spinner], j.name, step, fmtDur(a, job_elapsed) }) catch continue;
+        progressWriteLocked(line);
+        lines += 1;
+    }
+    progress_lines_drawn = lines;
+}
+
+/// Non-TTY: at most one heartbeat every 30s, only while something is
+/// running (a quiet run between batches or before the first job stays
+/// quiet). Called with `progress_mutex` held.
+fn progressMaybeHeartbeatLocked() void {
+    const now = std.time.milliTimestamp();
+    if (now - progress_last_heartbeat_ms < 30_000) return;
+    var running: usize = 0;
+    for (progress_jobs) |j| {
+        if (j.state == .running) running += 1;
+    }
+    if (running == 0) return;
+    progress_last_heartbeat_ms = now;
+    const a = progress_arena.allocator();
+    var parts: std.ArrayList(u8) = .empty;
+    var first = true;
+    for (progress_jobs) |j| {
+        if (j.state != .running) continue;
+        const job_elapsed: u64 = @intCast(@max(now - j.started_ms, 0));
+        if (!first) parts.appendSlice(a, ", ") catch {};
+        first = false;
+        const piece = std.fmt.allocPrint(a, "{s} ({s})", .{ j.name, fmtDur(a, job_elapsed) }) catch continue;
+        parts.appendSlice(a, piece) catch {};
+    }
+    const line = std.fmt.allocPrint(a, "\xe2\x8f\xb3 {d} running: {s} \xc2\xb7 {d}/{d} done", .{ running, parts.items, progress_done, progress_total }) catch return;
+    progressWriteLocked(line);
+}
+
+fn progressLoop() void {
+    while (!progress_stop_flag.load(.acquire)) {
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+        if (progress_stop_flag.load(.acquire)) break;
+        progress_mutex.lock();
+        defer progress_mutex.unlock();
+        if (!progress_active) return;
+        progress_spinner = (progress_spinner + 1) % spinner_frames.len;
+        if (progress_is_tty) {
+            progressRedrawLocked();
+        } else {
+            progressMaybeHeartbeatLocked();
+        }
+    }
+}
+
+fn progressFindByName(name: []const u8) ?usize {
+    for (progress_jobs, 0..) |j, i| {
+        if (j.state != .pending and std.mem.eql(u8, j.name, name)) return i;
+    }
+    return null;
+}
+
+/// `RunOptions.progress` sink: routes engine job/step lifecycle events into
+/// the module-level state above. See `ProgressEvent` in engine.zig for the
+/// string-lifetime contract — names/steps are duped into `progress_arena`
+/// since they're kept past the callback.
+fn onProgress(ev: engine.ProgressEvent) void {
+    progress_mutex.lock();
+    defer progress_mutex.unlock();
+    if (!progress_active) return;
+    const a = progress_arena.allocator();
+    switch (ev) {
+        .job_started => |e| {
+            if (e.index >= progress_jobs.len) return;
+            progress_jobs[e.index] = .{
+                .name = a.dupe(u8, e.job) catch e.job,
+                .state = .running,
+                .started_ms = std.time.milliTimestamp(),
+            };
+            if (progress_is_tty) {
+                progressRedrawLocked();
+            } else if (std.fmt.allocPrint(a, "\xe2\x96\xb6 {s} started", .{e.job})) |line| {
+                progressWriteLocked(line);
+            } else |_| {}
+        },
+        .step_started => |e| {
+            const idx = progressFindByName(e.job) orelse return;
+            progress_jobs[idx].step = a.dupe(u8, e.step) catch e.step;
+            if (progress_is_tty) progressRedrawLocked();
+        },
+        .step_finished => {},
+        .job_finished => |e| {
+            if (progressFindByName(e.job)) |i| {
+                progress_jobs[i].state = .done;
+                progress_jobs[i].ok = e.status == .success;
+                progress_jobs[i].wall_ms = e.wall_ms;
+            }
+            progress_done += 1;
+            const mark = if (e.status == .success) "\xe2\x9c\x93" else if (e.status == .skipped) "\xe2\x97\x8b" else "\xe2\x9c\x97";
+            const color = if (!progress_use_color) "" else if (e.status == .success) ansi_green else if (e.status == .skipped) ansi_dim_yellow else ansi_red;
+            const reset = if (progress_use_color) ansi_reset else "";
+            if (progress_is_tty) {
+                progressClearLocked();
+                if (std.fmt.allocPrint(a, "{s}{s}{s} {s}  {s}", .{ color, mark, reset, e.job, fmtDur(a, e.wall_ms) })) |line| progressWriteLocked(line) else |_| {}
+                progressRedrawLocked();
+            } else if (std.fmt.allocPrint(a, "{s}{s}{s} {s} {s}", .{ color, mark, reset, e.job, fmtDur(a, e.wall_ms) })) |line| {
+                progressWriteLocked(line);
+            } else |_| {}
+        },
+    }
 }
 
 fn help() !u8 {
@@ -827,6 +1069,7 @@ fn help() !u8 {
         \\            [--secret-file <path>] [--matrix k=v]... [--max-parallel N]
         \\            [--strict] [--no-color] [--backend <name>] [--pull]
         \\            [--snapshot|--no-snapshot] [--cache|--no-cache]
+        \\            [--isolate|--no-isolate]
         \\            [--break <job/step>]... [--on-failure shell|stop|continue]
         \\            [--step-all] [--resume <run-id> --at <job/step>]
         \\  jalan debug [file] [same options as jalan run]
@@ -850,6 +1093,45 @@ fn colorsEnabled(alloc: std.mem.Allocator, ra: RunArgs) bool {
     if (ra.no_color) return false;
     const has = std.process.hasEnvVar(alloc, "NO_COLOR") catch false;
     return !has;
+}
+
+/// Humanize a millisecond duration for display in the summary and the
+/// progress renderer. A raw `310117ms` tells a user nothing; `5m10s` does.
+/// Buckets: sub-10s keeps one decimal (steps are usually this fast, and the
+/// precision matters at that scale), sub-60s whole seconds, sub-1h
+/// minutes+seconds, else hours+minutes. See the unit tests below for the
+/// exact bucket boundaries (9999/10000, 59999/60000, 3599999/3600000).
+pub fn fmtDur(alloc: std.mem.Allocator, ms: u64) []const u8 {
+    if (ms < 10_000) {
+        return std.fmt.allocPrint(alloc, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "?s";
+    }
+    if (ms < 60_000) {
+        return std.fmt.allocPrint(alloc, "{d}s", .{ms / 1000}) catch "?s";
+    }
+    if (ms < 3_600_000) {
+        const total_s = ms / 1000;
+        return std.fmt.allocPrint(alloc, "{d}m{d:0>2}s", .{ total_s / 60, total_s % 60 }) catch "?m";
+    }
+    const total_m = ms / 60_000;
+    return std.fmt.allocPrint(alloc, "{d}h{d:0>2}m", .{ total_m / 60, total_m % 60 }) catch "?h";
+}
+
+test "fmtDur: bucket boundaries" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { ms: u64, want: []const u8 }{
+        .{ .ms = 0, .want = "0.0s" },
+        .{ .ms = 9999, .want = "9.9s" },
+        .{ .ms = 10000, .want = "10s" },
+        .{ .ms = 59999, .want = "59s" },
+        .{ .ms = 60000, .want = "1m00s" },
+        .{ .ms = 3599999, .want = "59m59s" },
+        .{ .ms = 3600000, .want = "1h00m" },
+    };
+    for (cases) |c| {
+        const got = fmtDur(a, c.ms);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
 }
 
 fn onFailureMode(value: []const u8) engine.OnFailure {
@@ -921,10 +1203,29 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         if (out.items.len > 0) _ = try print(out.items);
     }
     if (ra.strict and diags.list.items.len > 0) return 2;
+    const use_color = colorsEnabled(alloc, ra);
 
     const cfg = try config.load(alloc);
-    const snapshot = resolveToggle(ra.snapshot, cfg.snapshot);
-    const cache_enabled = resolveToggle(ra.cache, cfg.cache);
+    var snapshot = resolveToggle(ra.snapshot, cfg.snapshot);
+    var cache_enabled = resolveToggle(ra.cache, cfg.cache);
+    // Multi-job runs want per-job workspace isolation (parallel jobs racing
+    // on one shared build cache is how matrix builds die with AccessDenied),
+    // but the engine force-disables isolation whenever snapshot/cache are on
+    // — and `Config.snapshot` defaults to true, so without this the config
+    // default silently vetoes isolation on every plain matrix run. When
+    // snapshots are on ONLY via config default (no explicit --snapshot /
+    // --cache) and no debug/resume mode needs the shared timeline, parallel
+    // correctness wins: drop snapshot/cache so isolation can engage.
+    // Explicit flags keep today's shared-workspace serialized behavior.
+    const needs_shared_timeline = ra.resume_run != null or ra.breaks.len > 0 or ra.step_all;
+    if (pipeline.jobs.len > 1 and !needs_shared_timeline and
+        ra.snapshot == null and ra.cache == null and (ra.isolate orelse true) and
+        (snapshot or cache_enabled))
+    {
+        snapshot = false;
+        cache_enabled = false;
+        _ = try print("multi-job run: isolating workspaces per job; snapshots/cache off (pass --snapshot to keep them on a shared workspace)\n");
+    }
     const backend_choice = resolveBackendChoice(ra.backend, cfg.backend);
     const picked = pickBackend(alloc, backend_choice, cfg, &logToStderr) catch |e| switch (e) {
         error.BackendUnavailable => return 3, // message already printed by pickBackend
@@ -964,6 +1265,13 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         } else |_| {}
     }
 
+    // Live progress (spinner/heartbeat) only makes sense for the plain
+    // path; `jalan debug`/`--tui` renders its own full-screen view.
+    const use_progress = !ra.tui;
+    if (use_progress) progressStart(pipeline.jobs.len, tui.isInteractive(), use_color);
+    defer if (use_progress) progressStop();
+    const run_t0 = std.time.milliTimestamp();
+
     const report = engine.run(alloc, pipeline, .{
         .job_filter = ra.job,
         .step_filter = ra.step,
@@ -973,10 +1281,12 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         .secrets = secrets,
         .matrix_filter = ra.matrix,
         .log = &logToStderr,
+        .progress = if (use_progress) &onProgress else null,
         .exec_backend = picked.b,
         .force_pull = ra.pull,
         .snapshot = snapshot,
         .cache = cache_enabled,
+        .isolate_workspaces = ra.isolate,
         .workspace_abs = workspace_abs,
         .breakpoints = breakpoints.items,
         .debug_all_steps = ra.step_all,
@@ -999,6 +1309,7 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
         },
         error.OutOfMemory => return error.OutOfMemory,
     };
+    const run_wall_ms: u64 = @intCast(@max(std.time.milliTimestamp() - run_t0, 0));
 
     if (ra.job != null or ra.matrix.len > 0) {
         if (!anyJobRan(report.jobs)) {
@@ -1019,7 +1330,6 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
 
     if (ra.tui) return tui_session.finish(report);
 
-    const use_color = colorsEnabled(alloc, ra);
     var out: std.ArrayList(u8) = .empty;
     for (report.jobs) |j| {
         for (j.steps) |s| {
@@ -1041,10 +1351,16 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
     for (report.jobs) |j| {
         switch (j.status) {
             .success => {
+                // `wall_ms` (setup+steps+teardown) is the truer number when
+                // available — it includes things like a slow image pull that
+                // never show up in the per-step sum. Fall back to the sum
+                // for older/synthetic results that never went through the
+                // wall-clock path (wall_ms stays 0).
                 var total_ms: u64 = 0;
                 for (j.steps) |s| total_ms += s.duration_ms;
+                const shown_ms = if (j.wall_ms > 0) j.wall_ms else total_ms;
                 const mark = if (use_color) ansi_green ++ "\xe2\x9c\x93" ++ ansi_reset else "\xe2\x9c\x93";
-                try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   {d} steps   {d}ms\n", .{ mark, j.display_name, j.steps.len, total_ms }));
+                try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   {d} steps   {s}\n", .{ mark, j.display_name, j.steps.len, fmtDur(alloc, shown_ms) }));
             },
             .failed => {
                 // A job can have multiple `.failed` steps if earlier ones were
@@ -1070,6 +1386,13 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
                 } else {
                     try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "{s} {s}   failed\n", .{ mark, j.display_name }));
                 }
+                // Per-step duration breakdown so a slow-then-failing job
+                // shows where the time went, not just the final verdict.
+                for (j.steps) |s| {
+                    if (s.status == .skipped) continue;
+                    const step_mark = if (s.status == .failed) " \xe2\x9c\x97" else "";
+                    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "    {s} {s}{s}\n", .{ s.name, fmtDur(alloc, s.duration_ms), step_mark }));
+                }
             },
             .skipped => {
                 const mark = if (use_color) ansi_dim_yellow ++ "\xe2\x97\x8b" ++ ansi_reset else "\xe2\x97\x8b";
@@ -1077,6 +1400,7 @@ pub fn runMain(alloc: std.mem.Allocator, ra: RunArgs) !u8 {
             },
         }
     }
+    try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "total: {s}\n", .{fmtDur(alloc, run_wall_ms)}));
 
     // Log tail: last 20 lines of the failing step's stdout+stderr, for each failed job.
     for (report.jobs) |j| {
