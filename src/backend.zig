@@ -29,6 +29,19 @@ pub const JobHandle = struct {
     /// so mutating it from one job's step would leak into every other job
     /// running concurrently.
     nix_packages: []const []const u8 = &.{},
+    /// Extra `PATH` prepends accumulated from prior steps' `GITHUB_PATH`
+    /// writes in this job (e.g. a remote `setup-go` action installing a
+    /// toolchain under `/opt/hostedtoolcache/...`). Populated by the docker
+    /// backend's `runStep` after each step, consumed by the next step's
+    /// shell prologue (`buildPrologue` in `backend/docker.zig`). Per-job and
+    /// arena-allocated — same ownership pattern as `nix_packages`, never
+    /// written back into anything shared across jobs.
+    extra_paths: []const []const u8 = &.{},
+    /// Extra environment variables accumulated from prior steps' `GITHUB_ENV`
+    /// writes in this job, mirroring `extra_paths` above but for `NAME=value`
+    /// exports rather than `PATH` entries. Same per-job, arena-allocated,
+    /// docker-only ownership as `extra_paths`.
+    extra_env: []const ir.EnvPair = &.{},
 };
 
 pub const LogFn = *const fn (line: []const u8) void;
@@ -39,7 +52,8 @@ pub const LogFn = *const fn (line: []const u8) void;
 /// (`runContainerAction` is only non-null for `.docker`, but the marker is
 /// cheaper to branch on than an optional-fn null check at every call site),
 /// whether a local JS action is allowed to run inside a container (`.docker`
-/// + a workspace-relative action, vs. a remote one — phase 2.1), and whether
+/// + a workspace-relative action, resolved on the host filesystem, vs. a
+/// remote one, tar-staged into the container via `stageActionDir`), and whether
 /// `setup-node`/`setup-python`/`setup-go` should be intercepted as nix
 /// package installs (`.nix` only).
 pub const Kind = enum { native, docker, nix };
@@ -90,6 +104,15 @@ pub const Backend = struct {
         /// Stable identity of the effective execution environment used by
         /// cache keys (selected Docker image, effective Nix packages, etc.).
         cacheIdentity: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, handle: *JobHandle, step: ir.Step) anyerror![]const u8 = null,
+        /// Stages a host-side directory (a remote action's fetched/cached
+        /// files) into the job's execution environment so a subsequent
+        /// `node`/script invocation inside the container can reach it,
+        /// returning the container-side absolute path it landed at. Docker
+        /// only — `runUses` (`actions/runner.zig`) checks this is non-null
+        /// before calling it, same pattern as `runContainerAction`; native
+        /// and nix run `node` on the host, where the cache dir is already
+        /// reachable, so they leave this `null`.
+        stageActionDir: ?*const fn (ctx: *anyopaque, alloc: std.mem.Allocator, handle: *JobHandle, host_dir: []const u8, name: []const u8, err_msg: *?[]const u8) anyerror![]const u8 = null,
     };
 
     pub fn setupJob(self: Backend, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: []const u8, log: ?LogFn) !JobHandle {
@@ -113,6 +136,12 @@ pub const Backend = struct {
     pub fn cacheIdentity(self: Backend, alloc: std.mem.Allocator, job: ir.Job, handle: *JobHandle, step: ir.Step) ![]const u8 {
         if (self.vtable.cacheIdentity) |identity| return identity(self.ctx, alloc, job, handle, step);
         return @tagName(self.kind);
+    }
+    /// Callers must check `self.vtable.stageActionDir != null` first (this
+    /// asserts non-null rather than silently no-oping) — `runUses` is the one
+    /// caller and it always checks before calling.
+    pub fn stageActionDir(self: Backend, alloc: std.mem.Allocator, handle: *JobHandle, host_dir: []const u8, name: []const u8, err_msg: *?[]const u8) ![]const u8 {
+        return self.vtable.stageActionDir.?(self.ctx, alloc, handle, host_dir, name, err_msg);
     }
 };
 

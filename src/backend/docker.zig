@@ -8,11 +8,20 @@ const ir = @import("../ir.zig");
 const config = @import("../config.zig");
 const backend_iface = @import("../backend.zig");
 const client = @import("../docker/client.zig");
+const resolve = @import("../actions/resolve.zig");
 
 /// Default image used when neither `container:` nor a config image-map
-/// entry supplies one. Chosen because it ships `bash`, `sh`, and `python`,
-/// covering every shell this backend supports.
-pub const default_image = "node:20-bookworm-slim";
+/// entry supplies one. Chosen because it ships `bash`, `sh`, and `python`
+/// (covering every shell this backend supports) plus `node` for JS actions.
+/// Deliberately NOT the `-slim` variant: slim lacks `ca-certificates` (so
+/// every TLS connection a toolchain makes — `go mod download`, `pip`,
+/// `cargo` — dies with "certificate signed by unknown authority"; node
+/// itself was immune because it bundles its own Mozilla root store, which
+/// made the failure look selective) and lacks `gcc` (Go 1.20+ silently
+/// defaults `CGO_ENABLED=0` without a C compiler, breaking `go test
+/// -race`). The full image matches what GitHub's own runners provide far
+/// more closely, at the cost of a bigger first pull.
+pub const default_image = "node:20-bookworm";
 
 /// Pure precedence: job `container:` image > `cfg.imageFor(runs_on)` >
 /// `default_image`. Never touches the network or emits diagnostics — the
@@ -58,6 +67,23 @@ fn toBindSource(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
     var out = try alloc.alloc(u8, path.len);
     for (path, 0..) |ch, i| out[i] = if (ch == '/') '\\' else ch;
     return out;
+}
+
+/// Best-effort host directory for the shared tool cache
+/// (`%LOCALAPPDATA%\jalan\toolcache` on Windows — a sibling of
+/// `resolve.cacheRoot()`'s `...\jalan\actions`), bind-mounted into every job
+/// container at `/opt/hostedtoolcache` so `setup-go`/`setup-node`-style
+/// actions persist downloaded toolchains across runs instead of
+/// re-downloading into a throwaway container every time. Returns `null` on
+/// ANY failure (env var missing, `makePath` failure) — the toolcache mount is
+/// a performance nicety, never a reason to fail job setup; the caller logs a
+/// warning and proceeds without the mount.
+fn toolcacheHostDir(alloc: std.mem.Allocator) ?[]const u8 {
+    const actions_root = resolve.cacheRoot(alloc) catch return null;
+    const jalan_root = std.fs.path.dirname(actions_root) orelse return null;
+    const dir = std.fs.path.join(alloc, &.{ jalan_root, "toolcache" }) catch return null;
+    std.fs.cwd().makePath(dir) catch return null;
+    return dir;
 }
 
 /// Replaces path-unsafe characters in a step id with `-`, so it's safe to
@@ -106,6 +132,12 @@ fn formatEnvPairs(alloc: std.mem.Allocator, pairs: []const ir.EnvPair, extra: []
 /// - `aliases` non-empty (only meaningful alongside `network_id`) adds
 ///   `NetworkingConfig.EndpointsConfig.<network_id>.Aliases`, the DNS names
 ///   other containers on the network can reach this one by.
+/// - `extra_binds` are additional already-formatted `"src:dst"` bind strings
+///   (e.g. the host toolcache directory mounted at `/opt/hostedtoolcache`),
+///   emitted after the workspace bind. `Binds` is emitted even when
+///   `workspace_abs` is null as long as `extra_binds` is non-empty, though in
+///   practice only the job container passes any — service containers always
+///   pass `&.{}`.
 fn buildContainerCreateSpec(
     alloc: std.mem.Allocator,
     image: []const u8,
@@ -114,6 +146,7 @@ fn buildContainerCreateSpec(
     workspace_abs: ?[]const u8,
     network_id: ?[]const u8,
     aliases: []const []const u8,
+    extra_binds: []const []const u8,
 ) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(alloc, "{\"Image\":");
@@ -135,11 +168,20 @@ fn buildContainerCreateSpec(
 
     try out.appendSlice(alloc, ",\"HostConfig\":{");
     var host_field_written = false;
-    if (workspace_abs) |ws| {
-        const bind_source = try toBindSource(alloc, ws);
+    if (workspace_abs != null or extra_binds.len > 0) {
         try out.appendSlice(alloc, "\"Binds\":[");
-        const bind = try std.fmt.allocPrint(alloc, "{s}:/github/workspace", .{bind_source});
-        try jsonStrAppend(&out, alloc, bind);
+        var wrote_bind = false;
+        if (workspace_abs) |ws| {
+            const bind_source = try toBindSource(alloc, ws);
+            const bind = try std.fmt.allocPrint(alloc, "{s}:/github/workspace", .{bind_source});
+            try jsonStrAppend(&out, alloc, bind);
+            wrote_bind = true;
+        }
+        for (extra_binds) |b| {
+            if (wrote_bind) try out.append(alloc, ',');
+            try jsonStrAppend(&out, alloc, b);
+            wrote_bind = true;
+        }
         try out.append(alloc, ']');
         host_field_written = true;
     }
@@ -170,18 +212,123 @@ fn buildContainerCreateSpec(
     return out.toOwnedSlice(alloc);
 }
 
-/// Parses `k=v` lines (as written to `GITHUB_OUTPUT`) into `ir.EnvPair`s.
-/// Same shape as `backend/native.zig`'s inline parser.
-fn parseOutputs(alloc: std.mem.Allocator, data: []const u8) ![]ir.EnvPair {
+/// Parses the GitHub Actions kv file format: plain `k=v` lines plus the
+/// heredoc form `k<<DELIM\n...lines...\nDELIM` (what `@actions/core` writes
+/// for multiline values — `setup-go`, `setup-node`, etc. use it for every
+/// output/env write that isn't a single short token). Used for both
+/// `GITHUB_OUTPUT` and `GITHUB_ENV`, since both files share this format.
+///
+/// Heredoc detection: a line containing `<<` where the part before `<<` is
+/// non-empty and contains no `=` is treated as `name<<DELIM`; every
+/// subsequent line is collected as the value until one exactly matches
+/// `DELIM`, joined with `\n`. An unterminated heredoc (no matching delimiter
+/// before EOF) is handled leniently: the value is whatever was collected up
+/// to the end of the file, rather than erroring the whole parse over one
+/// malformed entry. Anything else falls back to the plain `k=v` split on the
+/// first `=`.
+fn parseKvFile(alloc: std.mem.Allocator, data: []const u8) ![]ir.EnvPair {
     var outputs: std.ArrayList(ir.EnvPair) = .empty;
-    var it = std.mem.splitScalar(u8, data, '\n');
-    while (it.next()) |line| {
-        const l = std.mem.trim(u8, line, " \r");
-        if (std.mem.indexOfScalar(u8, l, '=')) |eq| {
-            if (eq > 0) try outputs.append(alloc, .{ .name = l[0..eq], .value = l[eq + 1 ..] });
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \r");
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, "<<")) |marker| {
+            const name = line[0..marker];
+            const delim = std.mem.trim(u8, line[marker + 2 ..], " \r");
+            if (name.len == 0 or std.mem.indexOfScalar(u8, name, '=') != null) {
+                // Not actually a heredoc header (e.g. a `k=v<<x` value) — fall
+                // through to the plain k=v handling below.
+            } else {
+                var value: std.ArrayList(u8) = .empty;
+                var first = true;
+                while (lines.next()) |body_line| {
+                    const trimmed = std.mem.trim(u8, body_line, "\r");
+                    if (std.mem.eql(u8, trimmed, delim)) break;
+                    if (!first) try value.append(alloc, '\n');
+                    try value.appendSlice(alloc, body_line);
+                    first = false;
+                }
+                try outputs.append(alloc, .{ .name = name, .value = try value.toOwnedSlice(alloc) });
+                continue;
+            }
+        }
+        if (std.mem.indexOfScalar(u8, line, '=')) |eq| {
+            if (eq > 0) try outputs.append(alloc, .{ .name = line[0..eq], .value = line[eq + 1 ..] });
         }
     }
     return outputs.toOwnedSlice(alloc);
+}
+
+/// Builds the shell prologue prepended to every bash/sh step script: `mkdir`
+/// for the runner-managed directories, plus `export`s accumulated from prior
+/// steps' `GITHUB_PATH`/`GITHUB_ENV` writes (see `JobHandle.extra_paths` /
+/// `.extra_env`). Pure — no I/O — so it's testable without a container.
+/// `PATH` entries are joined into one `export PATH='a':'b':"$PATH"` line
+/// (prepended, matching GitHub Actions' own semantics: newer `GITHUB_PATH`
+/// writes should win over the image's baseline `PATH`); each env pair gets
+/// its own `export NAME='value'` line. Single-quoted values are escaped by
+/// replacing `'` with `'\''` (the standard POSIX-shell single-quote escape).
+/// A `NAME` outside `[A-Za-z0-9_]` is skipped rather than risking shell
+/// injection through an action-supplied variable name.
+fn buildPrologue(alloc: std.mem.Allocator, extra_paths: []const []const u8, extra_env: []const ir.EnvPair) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(alloc, "mkdir -p /tmp/runner-temp /opt/hostedtoolcache\n");
+    // `@actions/core`'s file commands refuse to run when the target file
+    // doesn't exist yet ("Missing file at path: ...") — the real runner
+    // pre-creates GITHUB_OUTPUT/GITHUB_ENV/GITHUB_PATH before every step,
+    // so do the same. The vars are always set by `run()`'s exec env.
+    try out.appendSlice(alloc, "touch \"$GITHUB_OUTPUT\" \"$GITHUB_ENV\" \"$GITHUB_PATH\"\n");
+    // GitHub's runner images have passwordless sudo and workflows lean on it
+    // (`sudo apt-get install ...`); job containers here already run as root
+    // and typically ship no `sudo` binary, so those steps die with exit 127.
+    // Define a passthrough function only when the real binary is absent —
+    // an image that ships sudo keeps its own.
+    try out.appendSlice(alloc, "command -v sudo >/dev/null 2>&1 || sudo() { \"$@\"; }\n");
+
+    if (extra_paths.len > 0) {
+        var joined: std.ArrayList(u8) = .empty;
+        for (extra_paths, 0..) |p, i| {
+            if (i > 0) try joined.append(alloc, ':');
+            try joined.appendSlice(alloc, p);
+        }
+        try out.appendSlice(alloc, "export PATH=");
+        try appendShellSingleQuoted(&out, alloc, joined.items);
+        try out.appendSlice(alloc, ":\"$PATH\"\n");
+    }
+
+    for (extra_env) |pair| {
+        if (!isSafeEnvName(pair.name)) continue;
+        try out.appendSlice(alloc, "export ");
+        try out.appendSlice(alloc, pair.name);
+        try out.append(alloc, '=');
+        try appendShellSingleQuoted(&out, alloc, pair.value);
+        try out.append(alloc, '\n');
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
+fn isSafeEnvName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    }
+    return true;
+}
+
+/// Appends `s` to `out` as a single-quoted POSIX shell word: `'` characters
+/// inside `s` are escaped as `'\''` (close quote, literal escaped quote,
+/// reopen quote) since single quotes admit no escape sequences of their own.
+fn appendShellSingleQuoted(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+    try out.append(alloc, '\'');
+    for (s) |c| {
+        if (c == '\'') {
+            try out.appendSlice(alloc, "'\\''");
+        } else {
+            try out.append(alloc, c);
+        }
+    }
+    try out.append(alloc, '\'');
 }
 
 pub const DockerBackend = struct {
@@ -200,7 +347,33 @@ const vtable = backend_iface.Backend.VTable{
     .runContainerAction = runContainerAction,
     .openShell = openShell,
     .cacheIdentity = cacheIdentity,
+    .stageActionDir = stageActionDir,
 };
+
+/// Stages a remote action's host-cached directory into the job container so
+/// a subsequent `node <path>` invocation (see `runner.zig`'s `runNodeAction`)
+/// can find it: tars `host_dir` (via `client.tarDirectory`, rooted under
+/// `name`) and `putArchive`s it into `/tmp/jalan-actions`, creating that
+/// directory first if needed. Returns the container-side path the action's
+/// files landed at (`/tmp/jalan-actions/<name>`), which the caller joins with
+/// `action.yml`'s `runs.main`.
+fn stageActionDir(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHandle, host_dir: []const u8, name: []const u8, err_msg: *?[]const u8) anyerror![]const u8 {
+    const self: *DockerBackend = @ptrCast(@alignCast(ctx));
+    var mkdir_err: ?[]const u8 = null;
+    _ = client.execRun(alloc, self.client, handle.container_id, &.{ "mkdir", "-p", "/tmp/jalan-actions" }, &.{}, null, &mkdir_err) catch |e| {
+        err_msg.* = mkdir_err;
+        return e;
+    };
+
+    const tar = try client.tarDirectory(alloc, host_dir, name);
+    var put_err: ?[]const u8 = null;
+    client.putArchive(alloc, self.client, handle.container_id, "/tmp/jalan-actions", tar, &put_err) catch |e| {
+        err_msg.* = put_err;
+        return e;
+    };
+
+    return std.fmt.allocPrint(alloc, "/tmp/jalan-actions/{s}", .{name});
+}
 
 fn cacheIdentity(ctx: *anyopaque, alloc: std.mem.Allocator, _: ir.Job, handle: *backend_iface.JobHandle, step: ir.Step) anyerror![]const u8 {
     const self: *DockerBackend = @ptrCast(@alignCast(ctx));
@@ -342,7 +515,7 @@ fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: 
                 runtime_hash.update(&.{0});
             }
             const svc_env = try formatEnvPairs(alloc, svc.env, &.{});
-            const svc_spec = try buildContainerCreateSpec(alloc, svc.image, null, svc_env, null, network_id, &.{svc.name});
+            const svc_spec = try buildContainerCreateSpec(alloc, svc.image, null, svc_env, null, network_id, &.{svc.name}, &.{});
             const svc_id = client.containerCreate(alloc, self.client, svc_spec, null, &err) catch |e| {
                 if (log) |l| if (err) |m| l(m);
                 cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
@@ -363,7 +536,20 @@ fn setup(ctx: *anyopaque, alloc: std.mem.Allocator, job: ir.Job, workspace_abs: 
     else
         try formatEnvPairs(alloc, job.env, &.{ "CI=true", "JALAN=true" });
     const job_network: ?[]const u8 = if (network_id.len > 0) network_id else null;
-    const spec = try buildContainerCreateSpec(alloc, image, &.{ "sleep", "infinity" }, container_env, workspace_abs, job_network, &.{});
+
+    var extra_binds: []const []const u8 = &.{};
+    if (toolcacheHostDir(alloc)) |tc| {
+        // Heap-allocate the one-element slice: `&.{bind}` would point at a
+        // stack temporary scoped to this block, dangling by the time
+        // `buildContainerCreateSpec` reads it below.
+        const binds = try alloc.alloc([]const u8, 1);
+        binds[0] = try std.fmt.allocPrint(alloc, "{s}:/opt/hostedtoolcache", .{try toBindSource(alloc, tc)});
+        extra_binds = binds;
+    } else if (log) |l| {
+        l("warning: could not prepare host tool cache dir \xe2\x80\x94 setup-* actions will re-download toolchains every run");
+    }
+
+    const spec = try buildContainerCreateSpec(alloc, image, &.{ "sleep", "infinity" }, container_env, workspace_abs, job_network, &.{}, extra_binds);
     const id = client.containerCreate(alloc, self.client, spec, null, &err) catch |e| {
         if (log) |l| if (err) |m| l(m);
         cleanupServicesAndNetwork(alloc, self.client, service_ids.items, network_id);
@@ -395,21 +581,42 @@ fn run(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHand
     const script_name = try std.fmt.allocPrint(alloc, "step-{s}.sh", .{safe_id});
     const script_path = try std.fmt.allocPrint(alloc, "/tmp/{s}", .{script_name});
     const out_path = try std.fmt.allocPrint(alloc, "/tmp/out-{s}.txt", .{safe_id});
+    const github_env_path = try std.fmt.allocPrint(alloc, "/tmp/env-{s}.txt", .{safe_id});
+    const github_path_path = try std.fmt.allocPrint(alloc, "/tmp/path-{s}.txt", .{safe_id});
 
     const argv = shellArgv(alloc, step.shell, script_path) catch {
         err_msg.* = try std.fmt.allocPrint(alloc, "shell '{s}' not available in linux containers", .{step.shell orelse "bash"});
         return error.SpawnFailed;
     };
 
+    // The PATH/ENV-export prologue only makes sense for the shells that
+    // actually source it as shell code; a python step's script is uploaded
+    // unchanged.
+    const shell_name = step.shell orelse "bash";
+    const wants_prologue = std.mem.eql(u8, shell_name, "bash") or std.mem.eql(u8, shell_name, "sh");
+    const script_body = if (wants_prologue)
+        try std.fmt.allocPrint(alloc, "{s}{s}", .{ try buildPrologue(alloc, handle.extra_paths, handle.extra_env), step.script })
+    else
+        step.script;
+
     var err: ?[]const u8 = null;
-    const tar_bytes = try client.tarSingleFile(alloc, script_name, step.script, 0o755);
+    const tar_bytes = try client.tarSingleFile(alloc, script_name, script_body, 0o755);
     client.putArchive(alloc, self.client, handle.container_id, "/tmp", tar_bytes, &err) catch |e| {
         err_msg.* = err;
         return e;
     };
 
     const github_output = try std.fmt.allocPrint(alloc, "GITHUB_OUTPUT={s}", .{out_path});
-    const exec_env = try formatEnvPairs(alloc, env, &.{github_output});
+    const github_env_var = try std.fmt.allocPrint(alloc, "GITHUB_ENV={s}", .{github_env_path});
+    const github_path_var = try std.fmt.allocPrint(alloc, "GITHUB_PATH={s}", .{github_path_path});
+    const exec_env = try formatEnvPairs(alloc, env, &.{
+        github_output,
+        github_env_var,
+        github_path_var,
+        "RUNNER_TEMP=/tmp/runner-temp",
+        "RUNNER_TOOL_CACHE=/opt/hostedtoolcache",
+        "GITHUB_WORKSPACE=/github/workspace",
+    });
 
     const exec_result = client.execRun(alloc, self.client, handle.container_id, argv, exec_env, workdir, &err) catch |e| {
         err_msg.* = err;
@@ -420,7 +627,47 @@ fn run(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHand
     var outputs: []ir.EnvPair = &.{};
     var cat_err: ?[]const u8 = null;
     const cat_result: ?client.ExecResult = client.execRun(alloc, self.client, handle.container_id, &.{ "cat", out_path }, &.{}, null, &cat_err) catch null;
-    if (cat_result) |cr| outputs = try parseOutputs(alloc, cr.stdout);
+    if (cat_result) |cr| outputs = try parseKvFile(alloc, cr.stdout);
+
+    // Propagate this step's GITHUB_PATH/GITHUB_ENV writes to the *next* step
+    // in this job (mirrors `nixSetupIntercept`'s per-job `nix_packages`
+    // accumulation in `actions/runner.zig`). Both cats are best-effort — a
+    // step that never touched either file just gets an empty/failed `cat`,
+    // same as the GITHUB_OUTPUT read above, and `handle.*` is left unchanged
+    // in that case.
+    var path_cat_err: ?[]const u8 = null;
+    if (client.execRun(alloc, self.client, handle.container_id, &.{ "cat", github_path_path }, &.{}, null, &path_cat_err) catch null) |pr| {
+        var list: std.ArrayList([]const u8) = .empty;
+        try list.appendSlice(alloc, handle.extra_paths);
+        var lines = std.mem.splitScalar(u8, pr.stdout, '\n');
+        while (lines.next()) |raw_line| {
+            const p = std.mem.trim(u8, raw_line, " \r");
+            if (p.len == 0) continue;
+            if (!containsPathStr(list.items, p)) try list.append(alloc, p);
+        }
+        handle.extra_paths = try list.toOwnedSlice(alloc);
+    }
+
+    var env_cat_err: ?[]const u8 = null;
+    if (client.execRun(alloc, self.client, handle.container_id, &.{ "cat", github_env_path }, &.{}, null, &env_cat_err) catch null) |er| {
+        const new_pairs = try parseKvFile(alloc, er.stdout);
+        if (new_pairs.len > 0) {
+            var list: std.ArrayList(ir.EnvPair) = .empty;
+            try list.appendSlice(alloc, handle.extra_env);
+            for (new_pairs) |np| {
+                var replaced = false;
+                for (list.items) |*existing| {
+                    if (std.mem.eql(u8, existing.name, np.name)) {
+                        existing.value = np.value;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) try list.append(alloc, np);
+            }
+            handle.extra_env = try list.toOwnedSlice(alloc);
+        }
+    }
 
     return .{
         .exit_code = exec_result.exit_code,
@@ -428,6 +675,11 @@ fn run(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHand
         .stderr = exec_result.stderr,
         .outputs = outputs,
     };
+}
+
+fn containsPathStr(list: []const []const u8, s: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, s)) return true;
+    return false;
 }
 
 fn openShell(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backend_iface.JobHandle, workdir: ?[]const u8, env: []const ir.EnvPair) anyerror!void {
@@ -475,7 +727,7 @@ fn runContainerAction(ctx: *anyopaque, alloc: std.mem.Allocator, handle: *backen
     const cmd: ?[]const []const u8 = if (cmd_args.len > 0) cmd_args else null;
     const env_strs = try formatEnvPairs(alloc, env_pairs, &.{});
     const network_id: ?[]const u8 = if (handle.network_id.len > 0) handle.network_id else null;
-    const spec = try buildContainerCreateSpec(alloc, image, cmd, env_strs, null, network_id, &.{});
+    const spec = try buildContainerCreateSpec(alloc, image, cmd, env_strs, null, network_id, &.{}, &.{});
 
     const id = client.containerCreate(alloc, self.client, spec, null, &err) catch |e| {
         err_msg.* = err;
@@ -589,7 +841,7 @@ test "buildContainerCreateSpec embeds image, workspace bind, and env" {
     defer arena.deinit();
     const a = arena.allocator();
     const workspace = "/home/user/proj";
-    const spec = try buildContainerCreateSpec(a, "node:20-bookworm-slim", &.{ "sleep", "infinity" }, &.{"CI=true"}, workspace, null, &.{});
+    const spec = try buildContainerCreateSpec(a, "node:20-bookworm-slim", &.{ "sleep", "infinity" }, &.{"CI=true"}, workspace, null, &.{}, &.{});
     const raw_bind = try std.fmt.allocPrint(a, "{s}:/github/workspace", .{try toBindSource(a, workspace)});
     // jsonStrAppend escapes backslashes (Windows bind sources can contain
     // them); build the same escaped form so this assertion works on both OSes.
@@ -609,7 +861,7 @@ test "buildContainerCreateSpec includes NetworkMode and Aliases when network_id 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const spec = try buildContainerCreateSpec(a, "redis:7-alpine", null, &.{}, null, "net123", &.{"redis"});
+    const spec = try buildContainerCreateSpec(a, "redis:7-alpine", null, &.{}, null, "net123", &.{"redis"}, &.{});
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"NetworkMode\":\"net123\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"NetworkingConfig\":{\"EndpointsConfig\":{\"net123\":{\"Aliases\":[\"redis\"]}}}") != null);
     // service spec: no Cmd override (uses image default), no workspace bind.
@@ -623,7 +875,7 @@ test "buildContainerCreateSpec: job container with services sets both Binds and 
     defer arena.deinit();
     const a = arena.allocator();
     const workspace = "/home/user/proj";
-    const spec = try buildContainerCreateSpec(a, "node:20-bookworm-slim", &.{ "sleep", "infinity" }, &.{"CI=true"}, workspace, "net123", &.{});
+    const spec = try buildContainerCreateSpec(a, "node:20-bookworm-slim", &.{ "sleep", "infinity" }, &.{"CI=true"}, workspace, "net123", &.{}, &.{});
     const raw_bind = try std.fmt.allocPrint(a, "{s}:/github/workspace", .{try toBindSource(a, workspace)});
     var escaped: std.ArrayList(u8) = .empty;
     for (raw_bind) |c| {
@@ -637,16 +889,80 @@ test "buildContainerCreateSpec: job container with services sets both Binds and 
     try std.testing.expect(std.mem.indexOf(u8, spec, "\"NetworkingConfig\"") == null);
 }
 
-test "parseOutputs parses k=v lines, ignores blanks and malformed lines" {
+test "parseKvFile parses k=v lines, ignores blanks and malformed lines" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const outs = try parseOutputs(a, "k=v\n\nbad-line\nver=1.2\r\n");
+    const outs = try parseKvFile(a, "k=v\n\nbad-line\nver=1.2\r\n");
     try std.testing.expectEqual(@as(usize, 2), outs.len);
     try std.testing.expectEqualStrings("k", outs[0].name);
     try std.testing.expectEqualStrings("v", outs[0].value);
     try std.testing.expectEqualStrings("ver", outs[1].name);
     try std.testing.expectEqualStrings("1.2", outs[1].value);
+}
+
+test "parseKvFile: heredoc single-line value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const outs = try parseKvFile(a, "GOROOT<<EOF_abc123\n/opt/hostedtoolcache/go/1.22.0/x64\nEOF_abc123\n");
+    try std.testing.expectEqual(@as(usize, 1), outs.len);
+    try std.testing.expectEqualStrings("GOROOT", outs[0].name);
+    try std.testing.expectEqualStrings("/opt/hostedtoolcache/go/1.22.0/x64", outs[0].value);
+}
+
+test "parseKvFile: heredoc multiline value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const outs = try parseKvFile(a, "NOTES<<EOF\nline one\nline two\nEOF\n");
+    try std.testing.expectEqual(@as(usize, 1), outs.len);
+    try std.testing.expectEqualStrings("NOTES", outs[0].name);
+    try std.testing.expectEqualStrings("line one\nline two", outs[0].value);
+}
+
+test "parseKvFile: mixed plain and heredoc entries in one file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const outs = try parseKvFile(a, "plain=1\nBODY<<D\nfirst\nsecond\nD\nother=2\n");
+    try std.testing.expectEqual(@as(usize, 3), outs.len);
+    try std.testing.expectEqualStrings("plain", outs[0].name);
+    try std.testing.expectEqualStrings("1", outs[0].value);
+    try std.testing.expectEqualStrings("BODY", outs[1].name);
+    try std.testing.expectEqualStrings("first\nsecond", outs[1].value);
+    try std.testing.expectEqualStrings("other", outs[2].name);
+    try std.testing.expectEqualStrings("2", outs[2].value);
+}
+
+test "buildPrologue: exports PATH and env vars with single-quote escaping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const paths = [_][]const u8{"/opt/hostedtoolcache/go/1.22.0/x64/bin"};
+    const envs = [_]ir.EnvPair{.{ .name = "GOROOT", .value = "/opt/x" }};
+    const out = try buildPrologue(a, &paths, &envs);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mkdir -p /tmp/runner-temp /opt/hostedtoolcache\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export PATH='/opt/hostedtoolcache/go/1.22.0/x64/bin':\"$PATH\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export GOROOT='/opt/x'\n") != null);
+}
+
+test "buildPrologue: escapes embedded single quotes in env values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const envs = [_]ir.EnvPair{.{ .name = "MSG", .value = "it's ok" }};
+    const out = try buildPrologue(a, &.{}, &envs);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export MSG='it'\\''s ok'\n") != null);
+}
+
+test "buildPrologue: skips unsafe env var names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const envs = [_]ir.EnvPair{.{ .name = "bad name;rm -rf", .value = "x" }};
+    const out = try buildPrologue(a, &.{}, &envs);
+    try std.testing.expect(std.mem.indexOf(u8, out, "export bad") == null);
 }
 
 test "docker backend runs a two-step job sharing filesystem (skips without daemon)" {

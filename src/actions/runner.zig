@@ -324,20 +324,34 @@ fn buildInputEnv(alloc: std.mem.Allocator, with: []const ir.EnvPair, defaults: [
     return out.toOwnedSlice(alloc);
 }
 
+/// Replaces path-unsafe characters in `s` with `-`, so a github ref's
+/// owner/repo/ref triple is safe to splice into a container-side directory
+/// name under `/tmp/jalan-actions`. Deliberately not shared with
+/// `backend/docker.zig`'s `sanitizeStepId` (same four lines, private there)
+/// rather than exporting it across a module boundary for one caller.
+fn sanitizeName(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const out = try alloc.alloc(u8, s.len);
+    for (s, 0..) |c, i| out[i] = if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') c else '-';
+    return out;
+}
+
 /// `node24`/`node20`/`node16` action: runs `node "<abs main path>"` through the
 /// backend's own `runStep` as a synthetic `.run` step (env = `INPUT_*` from
 /// `with`/defaults; `GITHUB_OUTPUT` is added by the backend's `runStep`
 /// itself, same as any other step).
 ///
-/// SCOPE CUT (explicit, logged, never silent): JS actions run on the NATIVE
-/// and NIX backends (host `node`), and on the DOCKER backend only when the
-/// action is local to the workspace (a `./`-prefixed `uses:` ref) — its
-/// files are already inside the bind-mounted workspace, so no extra copy is
-/// needed. A *remote* (github-fetched) action's directory lives in jalan's
-/// host-side cache, outside the container entirely; making it visible would
-/// need `putArchive`-ing the whole action directory into the container on
-/// every step, which is phase 2.1 scope. Remote JS actions on the docker
-/// backend warn and skip (exit 0) instead of failing the job outright.
+/// JS actions run on the NATIVE and NIX backends via host `node`. On the
+/// DOCKER backend, a local action (a `./`-prefixed `uses:` ref) is already
+/// inside the bind-mounted workspace, so `resolveMainPath` builds its
+/// container path directly. A *remote* (github-fetched) action's directory
+/// lives in jalan's host-side cache, outside the container entirely — it
+/// gets staged in first via the backend's `stageActionDir` (tar the whole
+/// cached directory, `putArchive` it into `/tmp/jalan-actions`) and runs
+/// from there. Backends that can't stage a directory (only
+/// `DockerBackend` implements `stageActionDir`; this is otherwise
+/// unreachable since `ref != .local` only matters for `.docker`, but the
+/// check stays explicit rather than asserting) warn and skip (exit 0) instead
+/// of failing the job outright.
 fn runNodeAction(
     alloc: std.mem.Allocator,
     meta: ActionMeta,
@@ -350,8 +364,9 @@ fn runNodeAction(
     opts_log: ?backend.LogFn,
     err_msg: *?[]const u8,
 ) !backend.StepOutcome {
-    if (b.kind == .docker and ref != .local) {
-        if (opts_log) |l| l("remote JS actions inside containers land in phase 2.1 — run with --backend native for this workflow");
+    const remote_on_docker = b.kind == .docker and ref != .local;
+    if (remote_on_docker and b.vtable.stageActionDir == null) {
+        if (opts_log) |l| l("this backend cannot stage remote JS actions — skipping");
         return .{ .exit_code = 0, .stdout = "", .stderr = "", .outputs = &.{} };
     }
     if (meta.main.len == 0) {
@@ -359,7 +374,16 @@ fn runNodeAction(
         return error.SpawnFailed;
     }
 
-    const abs_main = resolveMainPath(alloc, b, dir, meta.main) catch |e| {
+    const abs_main = if (remote_on_docker) blk: {
+        const gh = ref.github;
+        // Subpath is part of the identity: two actions from one monorepo
+        // (`owner/repo/a@v1`, `owner/repo/b@v1`) must not stage into the
+        // same container directory.
+        const raw_name = try std.fmt.allocPrint(alloc, "{s}-{s}-{s}-{s}", .{ gh.owner, gh.repo, gh.subpath, gh.ref });
+        const name = try sanitizeName(alloc, raw_name);
+        const staged = b.stageActionDir(alloc, handle, dir, name, err_msg) catch |e| return e;
+        break :blk try std.fmt.allocPrint(alloc, "{s}/{s}", .{ staged, meta.main });
+    } else resolveMainPath(alloc, b, dir, meta.main) catch |e| {
         err_msg.* = try std.fmt.allocPrint(alloc, "resolving action main '{s}/{s}' failed: {s}", .{ dir, meta.main, @errorName(e) });
         return error.SpawnFailed;
     };
@@ -373,12 +397,13 @@ fn runNodeAction(
 }
 
 /// Resolves `runs.main` to the path `node` should be invoked with. On
-/// native/nix, `node` runs on the host — a real host-filesystem realpath.
-/// On docker (only reached for a local, workspace-relative action; see
-/// `runNodeAction`'s scope-cut comment), `node` runs *inside* the container,
-/// where the workspace is bind-mounted at `/github/workspace` — so the path
-/// is built by hand from the (already-verified-local) `./`-relative `dir`,
-/// not resolved against the host filesystem at all.
+/// native/nix, `node` runs on the host — a real host-filesystem realpath. On
+/// docker, only reached for a local, workspace-relative action (a remote
+/// action's path is built by `runNodeAction` itself from what
+/// `stageActionDir` returns) — `node` runs *inside* the container, where the
+/// workspace is bind-mounted at `/github/workspace`, so the path is built by
+/// hand from the (already-verified-local) `./`-relative `dir`, not resolved
+/// against the host filesystem at all.
 fn resolveMainPath(alloc: std.mem.Allocator, b: backend.Backend, dir: []const u8, main: []const u8) ![]const u8 {
     if (b.kind == .docker) {
         const rel = if (std.mem.startsWith(u8, dir, "./")) dir[2..] else dir;
