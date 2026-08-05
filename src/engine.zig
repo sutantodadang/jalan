@@ -426,6 +426,130 @@ test "snapshots off by default: no store writes" {
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(store_root, .{}));
 }
 
+test "isolated workspaces: two parallel jobs each get their own copy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/engisolate-parallel";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const ws = try std.fmt.allocPrint(a, "{s}/ws", .{base});
+    try std.fs.cwd().makePath(ws);
+    try std.fs.cwd().writeFile(.{ .sub_path = try std.fmt.allocPrint(a, "{s}/data.txt", .{ws}), .data = "orig" });
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, ws);
+
+    // Each job writes its own file into `github.workspace` — if isolation is
+    // working, that write lands in a private copy, never in the shared
+    // source `ws_abs`.
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  a:
+        \\    steps:
+        \\      - run: echo A >> out-a.txt
+        \\        shell: sh
+        \\        working-directory: ${{ github.workspace }}
+        \\  b:
+        \\    steps:
+        \\      - run: echo B >> out-b.txt
+        \\        shell: sh
+        \\        working-directory: ${{ github.workspace }}
+    );
+    const report = try run(a, p, .{
+        .workspace_abs = ws_abs,
+        .max_parallel = 2,
+        .isolate_workspaces = true,
+    });
+    try std.testing.expect(report.ok());
+
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(try std.fmt.allocPrint(a, "{s}/out-a.txt", .{ws_abs}), .{}));
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(try std.fmt.allocPrint(a, "{s}/out-b.txt", .{ws_abs}), .{}));
+    const data = try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/data.txt", .{ws_abs}), 1024);
+    try std.testing.expectEqualStrings("orig", data);
+}
+
+test "isolation auto-disables with snapshots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = ".jalan/tmp/engisolate-cache-shared";
+    std.fs.cwd().deleteTree(base) catch {};
+    defer std.fs.cwd().deleteTree(base) catch {};
+    const ws = try std.fmt.allocPrint(a, "{s}/ws", .{base});
+    try std.fs.cwd().makePath(ws);
+    const store_root = try std.fmt.allocPrint(a, "{s}/store", .{base});
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, ws);
+
+    // `.cache = true` forces isolation off (Phase 3 needs one shared,
+    // serialized workspace) even though `isolate_workspaces` is left null
+    // (the auto rule would otherwise turn isolation on for 2 jobs).
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  a:
+        \\    steps:
+        \\      - run: echo A >> marker.txt
+        \\        shell: sh
+        \\        working-directory: ${{ github.workspace }}
+        \\  b:
+        \\    steps:
+        \\      - run: echo B >> marker.txt
+        \\        shell: sh
+        \\        working-directory: ${{ github.workspace }}
+    );
+    const report = try run(a, p, .{
+        .workspace_abs = ws_abs,
+        .cache = true,
+        .store_root = store_root,
+        .max_parallel = 2,
+    });
+    try std.testing.expect(report.ok());
+
+    const marker = try std.fs.cwd().readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/marker.txt", .{ws_abs}), 1024);
+    try std.testing.expect(std.mem.indexOf(u8, marker, "A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, marker, "B") != null);
+}
+
+/// Test-only: a real OS temp directory outside jalan's own git working tree
+/// (unlike `.jalan/tmp/...`, which is gitignored and would make
+/// `git ls-files` "succeed" with zero matches rather than genuinely fail —
+/// not the git-less path this test means to exercise).
+fn testSystemTempDir(alloc: std.mem.Allocator) ![]const u8 {
+    if (@import("builtin").os.tag == .windows) {
+        return std.process.getEnvVarOwned(alloc, "TEMP") catch std.process.getEnvVarOwned(alloc, "TMP");
+    }
+    return std.process.getEnvVarOwned(alloc, "TMPDIR") catch alloc.dupe(u8, "/tmp");
+}
+
+test "git-less fallback copies workspace" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tmp_root = try testSystemTempDir(a);
+    var rand_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&rand_bytes);
+    const hex = std.fmt.bytesToHex(rand_bytes, .lower);
+    const ws = try std.fs.path.join(a, &.{ tmp_root, try std.fmt.allocPrint(a, "jalan-isolate-test-{s}", .{&hex}) });
+    std.fs.cwd().deleteTree(ws) catch {};
+    defer std.fs.cwd().deleteTree(ws) catch {};
+    try std.fs.cwd().makePath(try std.fs.path.join(a, &.{ ws, "nested" }));
+    try std.fs.cwd().writeFile(.{ .sub_path = try std.fs.path.join(a, &.{ ws, "nested", "file.txt" }), .data = "hello-isolated" });
+    const ws_abs = try std.fs.cwd().realpathAlloc(a, ws);
+
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - run: cat nested/file.txt
+        \\        shell: sh
+        \\        working-directory: ${{ github.workspace }}
+    );
+    const report = try run(a, p, .{
+        .workspace_abs = ws_abs,
+        .isolate_workspaces = true,
+    });
+    try std.testing.expect(report.ok());
+    try std.testing.expect(std.mem.indexOf(u8, report.jobs[0].steps[0].stdout, "hello-isolated") != null);
+}
+
 test "cache: second run replays without re-executing, outputs still flow" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1472,6 +1596,90 @@ test "debug defaults (step_all off, on_failure shell): only the failing step pro
     try std.testing.expectEqual(StepStatus.skipped, report.jobs[0].steps[2].status);
 }
 
+// `RunOptions.progress` is also a bare `*const fn(ProgressEvent) void` — no
+// closure context — so capturing events in a test needs the same
+// module-level sink as `testLogCapture` above. Event payload strings are
+// duped into the capture allocator since the contract says they're only
+// valid for the callback's duration.
+var test_progress_mutex: std.Thread.Mutex = .{};
+var test_progress_events: std.ArrayList(ProgressEvent) = .empty;
+var test_progress_alloc: std.mem.Allocator = undefined;
+
+fn testProgressReset(alloc: std.mem.Allocator) void {
+    test_progress_mutex.lock();
+    defer test_progress_mutex.unlock();
+    test_progress_alloc = alloc;
+    test_progress_events = .empty;
+}
+
+fn testProgressCapture(ev: ProgressEvent) void {
+    test_progress_mutex.lock();
+    defer test_progress_mutex.unlock();
+    const a = test_progress_alloc;
+    const dup: ProgressEvent = switch (ev) {
+        .job_started => |e| .{ .job_started = .{ .job = a.dupe(u8, e.job) catch e.job, .index = e.index, .total = e.total } },
+        .step_started => |e| .{ .step_started = .{ .job = a.dupe(u8, e.job) catch e.job, .step = a.dupe(u8, e.step) catch e.step, .idx = e.idx, .count = e.count } },
+        .step_finished => |e| .{ .step_finished = .{ .job = a.dupe(u8, e.job) catch e.job, .step = a.dupe(u8, e.step) catch e.step, .ms = e.ms, .ok = e.ok } },
+        .job_finished => |e| .{ .job_finished = .{ .job = a.dupe(u8, e.job) catch e.job, .status = e.status, .wall_ms = e.wall_ms } },
+    };
+    test_progress_events.append(a, dup) catch {};
+}
+
+test "progress events: job_started -> step_started/finished x2 -> job_finished, wall_ms > 0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    testProgressReset(a);
+
+    const Fake = struct {
+        fn setup(_: *anyopaque, _: std.mem.Allocator, _: ir.Job, workspace: []const u8, _: ?backend_mod.LogFn) anyerror!backend_mod.JobHandle {
+            return .{ .workspace = workspace };
+        }
+        fn runStep(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, _: ir.Step, _: []const ir.EnvPair, _: ?[]const u8, _: *?[]const u8) anyerror!backend_mod.StepOutcome {
+            // A tiny sleep guarantees a nonzero measured duration below —
+            // without it two back-to-back milliTimestamp() calls around a
+            // no-op step can land in the same tick and read 0ms.
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+            return .{ .exit_code = 0, .stdout = "", .stderr = "", .outputs = &.{} };
+        }
+        fn teardown(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle) void {}
+        fn openShell(_: *anyopaque, _: std.mem.Allocator, _: *backend_mod.JobHandle, _: ?[]const u8, _: []const ir.EnvPair) anyerror!void {}
+    };
+    const fake_vtable = backend_mod.Backend.VTable{ .setupJob = Fake.setup, .runStep = Fake.runStep, .teardownJob = Fake.teardown, .openShell = Fake.openShell };
+    var fake = Fake{};
+    const fake_backend = backend_mod.Backend{ .ctx = @ptrCast(&fake), .vtable = &fake_vtable, .kind = .native };
+
+    const p = try parseFixture(a,
+        \\jobs:
+        \\  j:
+        \\    steps:
+        \\      - id: one
+        \\        name: one
+        \\        run: echo one
+        \\      - id: two
+        \\        name: two
+        \\        run: echo two
+    );
+    const report = try run(a, p, .{ .exec_backend = fake_backend, .progress = &testProgressCapture });
+    try std.testing.expect(report.ok());
+    try std.testing.expect(report.jobs[0].wall_ms > 0);
+
+    const events = test_progress_events.items;
+    try std.testing.expectEqual(@as(usize, 6), events.len);
+    try std.testing.expect(events[0] == .job_started);
+    try std.testing.expect(events[1] == .step_started);
+    try std.testing.expect(events[2] == .step_finished);
+    try std.testing.expect(events[3] == .step_started);
+    try std.testing.expect(events[4] == .step_finished);
+    try std.testing.expect(events[5] == .job_finished);
+    try std.testing.expectEqualStrings("one", events[1].step_started.step);
+    try std.testing.expectEqualStrings("two", events[3].step_started.step);
+    try std.testing.expect(events[2].step_finished.ok);
+    try std.testing.expect(events[4].step_finished.ok);
+    try std.testing.expectEqual(JobStatus.success, events[5].job_finished.status);
+    try std.testing.expect(events[5].job_finished.wall_ms > 0);
+}
+
 pub const StepStatus = enum { success, failed, skipped };
 pub const JobStatus = enum { success, failed, skipped };
 
@@ -1494,7 +1702,26 @@ pub const JobResult = struct {
     // explanation at all). Carries `@errorName(e)` plus whatever the backend
     // itself reported via `log`.
     infra_reason: ?[]const u8 = null,
+    // Wall time from just before backend setupJob to teardown, in ms. Unlike
+    // the sum of step durations, this includes setup/teardown overhead (e.g.
+    // a docker image pull) — the CLI summary prefers this when nonzero.
+    // Zero for jobs that never reached setup (filtered/skipped/needs-failed).
+    wall_ms: u64 = 0,
 };
+
+/// Live progress events fired from worker threads during `run`/`runJob` —
+/// no locking here, the consumer (e.g. cli.zig's status renderer)
+/// synchronizes. Payload strings (`job`/`step`) point at engine-owned memory
+/// (pipeline arena or a per-job thread arena) and are only valid for the
+/// duration of the callback; copy them if you keep them past the call.
+pub const ProgressEvent = union(enum) {
+    job_started: struct { job: []const u8, index: usize, total: usize },
+    step_started: struct { job: []const u8, step: []const u8, idx: usize, count: usize },
+    step_finished: struct { job: []const u8, step: []const u8, ms: u64, ok: bool },
+    job_finished: struct { job: []const u8, status: JobStatus, wall_ms: u64 },
+};
+
+pub const ProgressFn = *const fn (ev: ProgressEvent) void;
 
 pub const Report = struct {
     jobs: []JobResult,
@@ -1515,6 +1742,10 @@ pub const RunOptions = struct {
     matrix_filter: []const ir.EnvPair = &.{},
     // Called from worker threads under parallel job execution — must be thread-safe.
     log: ?*const fn (line: []const u8) void = null,
+    // Live job/step lifecycle events for progress UIs (spinner, heartbeat).
+    // Same bare-fn-pointer, thread-safety contract as `log` above; null ->
+    // no progress tracking (existing behavior unchanged).
+    progress: ?ProgressFn = null,
     // null -> backend_mod.native(). Lets callers swap in container/other backends
     // without touching runJob's step-loop logic.
     exec_backend: ?backend_mod.Backend = null,
@@ -1535,6 +1766,14 @@ pub const RunOptions = struct {
     // Snapshot/cache walk root. null -> process cwd (the CLI's behavior);
     // tests point this at a temp fixture so the walk doesn't scan the repo.
     workspace_abs: ?[]const u8 = null,
+    // Give each job its own copy of the workspace instead of sharing one
+    // directory, so parallel jobs (e.g. matrix shards) stop racing on the
+    // same build caches (`.zig-cache`, `zig-out`, ...). null -> auto: on when
+    // more than one job can run and none of snapshot/cache/breakpoints/
+    // debug_all_steps/resume_from is active (those need one shared,
+    // serialized workspace — see `run`, which always forces this off in that
+    // case regardless of what's set here).
+    isolate_workspaces: ?bool = null,
     // Phase 3 time-travel: resume a recorded run at a step boundary.
     // Implies snapshot behavior (the resumed run keeps writing its record).
     resume_from: ?ResumePoint = null,
@@ -1717,6 +1956,12 @@ const Shared = struct {
     record_mutex: std.Thread.Mutex = .{},
     snapshot_ok: bool = true,
     workspace_abs: []const u8 = "",
+    // Per-job workspace isolation (see `RunOptions.isolate_workspaces`).
+    // Decided once in `run` for the whole run; `run_token` names this run's
+    // subdirectory under the isolated-workspace root and is stable across
+    // all of the run's jobs so their copies land as siblings.
+    isolate_workspaces: bool = false,
+    run_token: []const u8 = "",
     // Resume state: the target step's pre-step manifest (env + workspace
     // tree), loaded once in run() before any job starts.
     resume_manifest: ?snap_manifest.Manifest = null,
@@ -1765,6 +2010,31 @@ pub fn run(alloc: std.mem.Allocator, p: ir.Pipeline, opts: RunOptions) error{ Ou
     // Phase 3: workspace walk root for snapshots and/or cache.
     if (eff_opts.snapshot or eff_opts.cache or eff_opts.breakpoints.len > 0 or eff_opts.debug_all_steps or eff_opts.workspace_abs != null) {
         shared.workspace_abs = eff_opts.workspace_abs orelse (std.fs.cwd().realpathAlloc(alloc, ".") catch ".");
+    }
+
+    // Per-job workspace isolation. Phase 3 machinery (snapshot/cache/
+    // breakpoints/debug_all_steps/resume) walks and serializes access to ONE
+    // shared workspace (see the warning a few lines up and `workspace_mutex`
+    // below) — isolation is out of scope there and always forced off, even
+    // if the caller explicitly asked for it (with a one-line warning so the
+    // ask isn't silently dropped).
+    const phase3_active = eff_opts.snapshot or eff_opts.cache or eff_opts.breakpoints.len > 0 or eff_opts.debug_all_steps or eff_opts.resume_from != null;
+    if (phase3_active) {
+        if (eff_opts.isolate_workspaces orelse false) {
+            if (eff_opts.log) |l| l("warning: workspace isolation disabled — snapshot/cache/breakpoints/debug/resume require one shared workspace");
+        }
+        shared.isolate_workspaces = false;
+    } else {
+        shared.isolate_workspaces = eff_opts.isolate_workspaces orelse (p.jobs.len > 1);
+    }
+    if (shared.isolate_workspaces) {
+        shared.run_token = blk: {
+            if (eff_opts.run_id) |rid| if (rid.len > 0) break :blk rid;
+            var rand_bytes: [8]u8 = undefined;
+            std.crypto.random.bytes(&rand_bytes);
+            const hex = std.fmt.bytesToHex(rand_bytes, .lower);
+            break :blk std.fmt.allocPrint(alloc, "{s}", .{&hex}) catch "run";
+        };
     }
 
     // Phase 3 resume: load the record, validate the target, restore the
@@ -2331,6 +2601,7 @@ fn copyResult(alloc: std.mem.Allocator, r: JobResult) !JobResult {
         .status = r.status,
         .steps = steps,
         .infra_reason = if (r.infra_reason) |reason| try alloc.dupe(u8, reason) else null,
+        .wall_ms = r.wall_ms,
     };
 }
 
@@ -2635,6 +2906,142 @@ fn handleStepFailure(
     }
 }
 
+// --- Per-job workspace isolation -------------------------------------------
+//
+// When `Shared.isolate_workspaces` is on, each job runs against its own copy
+// of the source workspace instead of the one shared directory, so parallel
+// jobs (matrix shards especially) stop racing on the same build caches. The
+// copy lives under a root that is a sibling of the actions cache
+// (`action_resolve.cacheRoot()`'s parent + "ws", e.g.
+// `%LOCALAPPDATA%\jalan\ws` on Windows) rather than under the pipeline's own
+// `.jalan/`, so it survives independent of any one repo's ignore rules and
+// is easy to bulk-clean out-of-band.
+
+/// Isolated-workspace root: sibling of the actions cache directory.
+fn isolatedWorkspaceRoot(alloc: std.mem.Allocator) ![]const u8 {
+    const cache_root = try action_resolve.cacheRoot(alloc);
+    const parent = std.fs.path.dirname(cache_root) orelse cache_root;
+    return std.fs.path.join(alloc, &.{ parent, "ws" });
+}
+
+/// Replaces every byte outside `[A-Za-z0-9_-]` with `-` so a run token or job
+/// instance id is always exactly one safe path segment.
+fn sanitizePathSegment(alloc: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const out = try alloc.dupe(u8, s);
+    for (out) |*c| {
+        const ok = (c.* >= 'a' and c.* <= 'z') or (c.* >= 'A' and c.* <= 'Z') or (c.* >= '0' and c.* <= '9') or c.* == '_' or c.* == '-';
+        if (!ok) c.* = '-';
+    }
+    return out;
+}
+
+/// `<isolatedWorkspaceRoot>/<run_token>/<job_instance_id>`, both segments
+/// sanitized so arbitrary job ids/matrix hashes can't escape the root.
+fn isolatedWorkspaceDir(alloc: std.mem.Allocator, run_token: []const u8, job_instance_id: []const u8) ![]const u8 {
+    const root = try isolatedWorkspaceRoot(alloc);
+    const safe_run = try sanitizePathSegment(alloc, run_token);
+    const safe_job = try sanitizePathSegment(alloc, job_instance_id);
+    return std.fs.path.join(alloc, &.{ root, safe_run, safe_job });
+}
+
+/// Best-effort recursive copy of `source` into `dest` (both must already
+/// resolve; `dest` is created). Skips anything that isn't a plain file or
+/// directory (symlinks, etc.) — acceptable for a best-effort workspace copy.
+fn copyDirRecursiveAll(alloc: std.mem.Allocator, source: []const u8, dest: []const u8) !void {
+    try std.fs.cwd().makePath(dest);
+    var src_dir = try std.fs.cwd().openDir(source, .{ .iterate = true });
+    defer src_dir.close();
+    var it = src_dir.iterate();
+    while (try it.next()) |entry| {
+        const src_path = try std.fs.path.join(alloc, &.{ source, entry.name });
+        const dst_path = try std.fs.path.join(alloc, &.{ dest, entry.name });
+        switch (entry.kind) {
+            .directory => try copyDirRecursiveAll(alloc, src_path, dst_path),
+            .file => try std.fs.cwd().copyFile(src_path, std.fs.cwd(), dst_path, .{}),
+            else => {},
+        }
+    }
+}
+
+/// Fallback copy for a `source` that isn't (or can't be inspected as) a git
+/// checkout: a full recursive copy, skipping the given top-level entry
+/// names. Best-effort fidelity only — untracked build output and ignored
+/// files come along unless named here.
+fn copyTreeExcludingTopLevel(alloc: std.mem.Allocator, source: []const u8, dest: []const u8, exclude: []const []const u8) !void {
+    try std.fs.cwd().makePath(dest);
+    var src_dir = try std.fs.cwd().openDir(source, .{ .iterate = true });
+    defer src_dir.close();
+    var it = src_dir.iterate();
+    entry_loop: while (try it.next()) |entry| {
+        for (exclude) |ex| if (std.mem.eql(u8, entry.name, ex)) continue :entry_loop;
+        const src_path = try std.fs.path.join(alloc, &.{ source, entry.name });
+        const dst_path = try std.fs.path.join(alloc, &.{ dest, entry.name });
+        switch (entry.kind) {
+            .directory => try copyDirRecursiveAll(alloc, src_path, dst_path),
+            .file => try std.fs.cwd().copyFile(src_path, std.fs.cwd(), dst_path, .{}),
+            else => {},
+        }
+    }
+}
+
+/// True when `path` can be opened as a directory (used to probe for `.git`
+/// before mirroring it — a `.git` *file*, as in a git worktree, is skipped:
+/// best effort only).
+fn isOpenableDir(path: []const u8) bool {
+    var d = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return false;
+    d.close();
+    return true;
+}
+
+/// Runs `git -C <source> ls-files -z -co --exclude-standard` and copies every
+/// listed path (tracked + untracked-but-not-ignored — what a fresh
+/// `actions/checkout` would leave behind) from `source` into `dest`. Returns
+/// `false` on any spawn failure or nonzero exit (not a git repo, `git` not on
+/// PATH, ...) so the caller can fall back to a plain recursive copy. A file
+/// that disappears between `ls-files` and the copy is silently skipped —
+/// best effort, not a transactional snapshot.
+fn copyViaGitLsFiles(alloc: std.mem.Allocator, source: []const u8, dest: []const u8) bool {
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "git", "-C", source, "ls-files", "-z", "-co", "--exclude-standard" },
+        .max_output_bytes = 64 * 1024 * 1024,
+    }) catch return false;
+    switch (result.term) {
+        .Exited => |code| if (code != 0) return false,
+        else => return false,
+    }
+    var it = std.mem.splitScalar(u8, result.stdout, 0);
+    while (it.next()) |rel| {
+        if (rel.len == 0) continue;
+        const src_file = std.fs.path.join(alloc, &.{ source, rel }) catch continue;
+        const dst_file = std.fs.path.join(alloc, &.{ dest, rel }) catch continue;
+        if (std.fs.path.dirname(dst_file)) |d| std.fs.cwd().makePath(d) catch continue;
+        std.fs.cwd().copyFile(src_file, std.fs.cwd(), dst_file, .{}) catch continue;
+    }
+    return true;
+}
+
+/// Populates `dest` (already-isolated, per-job directory) with a copy of
+/// `source`. Prefers `git ls-files` so untracked-but-not-ignored files come
+/// along like a real checkout, plus a recursive mirror of `.git` itself
+/// (skipped if `.git` isn't a real directory, e.g. a worktree file) so
+/// in-job `git` commands still work. Falls back to a full recursive copy
+/// (excluding `.git`, `.zig-cache`, `zig-out`) when `source` isn't a git
+/// checkout or `git` is unavailable.
+fn populateIsolatedWorkspace(alloc: std.mem.Allocator, source: []const u8, dest: []const u8, log: ?*const fn (line: []const u8) void) !void {
+    try std.fs.cwd().makePath(dest);
+    if (copyViaGitLsFiles(alloc, source, dest)) {
+        const src_git = try std.fs.path.join(alloc, &.{ source, ".git" });
+        if (isOpenableDir(src_git)) {
+            const dst_git = try std.fs.path.join(alloc, &.{ dest, ".git" });
+            copyDirRecursiveAll(alloc, src_git, dst_git) catch {};
+        }
+    } else {
+        if (log) |l| l("workspace: source is not a git checkout (or git is unavailable) — copying full tree");
+        try copyTreeExcludingTopLevel(alloc, source, dest, &.{ ".git", ".zig-cache", "zig-out" });
+    }
+}
+
 fn runJob(
     alloc: std.mem.Allocator,
     p: ir.Pipeline,
@@ -2687,10 +3094,36 @@ fn runJob(
 
     // Build base expression environment for this job.
     var env = expr.Env{};
-    const cwd = if (shared.workspace_abs.len > 0)
+    const base_cwd = if (shared.workspace_abs.len > 0)
         shared.workspace_abs
     else
         (std.fs.cwd().realpathAlloc(alloc, ".") catch ".");
+    // Isolation: give this job its own workspace copy instead of the shared
+    // one (see `Shared.isolate_workspaces`). Any failure along the way
+    // degrades to running in the shared workspace, with a warning — jobs
+    // never fail outright just because isolation didn't work.
+    var isolated_dir: ?[]const u8 = null;
+    const cwd: []const u8 = blk: {
+        if (!shared.isolate_workspaces) break :blk base_cwd;
+        const jid = jobInstanceId(alloc, job) catch job.id;
+        const dest = isolatedWorkspaceDir(alloc, shared.run_token, jid) catch |e| {
+            logJob(opts, shared, alloc, job, std.fmt.allocPrint(alloc, "warning: workspace isolation unavailable ({s}) — running in shared workspace", .{@errorName(e)}) catch "warning: workspace isolation unavailable — running in shared workspace");
+            break :blk base_cwd;
+        };
+        populateIsolatedWorkspace(alloc, base_cwd, dest, opts.log) catch |e| {
+            logJob(opts, shared, alloc, job, std.fmt.allocPrint(alloc, "warning: workspace isolation failed ({s}) — running in shared workspace", .{@errorName(e)}) catch "warning: workspace isolation failed — running in shared workspace");
+            std.fs.cwd().deleteTree(dest) catch {};
+            break :blk base_cwd;
+        };
+        isolated_dir = dest;
+        logJob(opts, shared, alloc, job, std.fmt.allocPrint(alloc, "workspace: isolated copy at {s}", .{dest}) catch "workspace: isolated copy created");
+        break :blk dest;
+    };
+    defer if (isolated_dir) |d| {
+        std.fs.cwd().deleteTree(d) catch |e| {
+            logJob(opts, shared, alloc, job, std.fmt.allocPrint(alloc, "warning: failed to remove isolated workspace {s}: {s}", .{ d, @errorName(e) }) catch "warning: failed to remove isolated workspace");
+        };
+    };
     var merged_env: std.ArrayList(ir.EnvPair) = .empty;
     if (resume_m) |m| {
         env = try expr.envFromPairs(alloc, m.env);
@@ -2743,6 +3176,11 @@ fn runJob(
     }
 
     const b = opts.exec_backend orelse backend_mod.native();
+    // Job-wall-clock start: taken right before setup so `wall_ms` captures
+    // setup + steps + teardown (e.g. a slow docker image pull), unlike the
+    // per-step duration sum the CLI summary previously had to fall back on.
+    const t_job = std.time.milliTimestamp();
+    fireProgress(opts, .{ .job_started = .{ .job = job.display_name, .index = index, .total = p.jobs.len } });
     var handle = b.setupJob(alloc, job, cwd, opts.log) catch |e| {
         if (e == error.OutOfMemory) return error.OutOfMemory;
         // infra failure: whole job fails before any step runs. The backend
@@ -2753,7 +3191,9 @@ fn runJob(
         const reason = @errorName(e);
         const msg = std.fmt.allocPrint(alloc, "backend setup failed for job: {s}", .{reason}) catch "backend setup failed for job";
         logJob(opts, shared, alloc, job, msg);
-        return .{ .job_index = index, .display_name = job.display_name, .status = .failed, .steps = steps, .infra_reason = reason };
+        const setup_wall_ms: u64 = @intCast(@max(std.time.milliTimestamp() - t_job, 0));
+        fireProgress(opts, .{ .job_finished = .{ .job = job.display_name, .status = .failed, .wall_ms = setup_wall_ms } });
+        return .{ .job_index = index, .display_name = job.display_name, .status = .failed, .steps = steps, .infra_reason = reason, .wall_ms = setup_wall_ms };
     };
     defer b.teardownJob(alloc, &handle);
 
@@ -2791,6 +3231,11 @@ fn runJob(
             continue;
         }
 
+        // Fired once cond/dry-run skips are behind us — everything from here
+        // on is this step actually executing (workspace lock, breakpoint
+        // pause, the run/uses dispatch below).
+        fireProgress(opts, .{ .step_started = .{ .job = job.display_name, .step = step.name, .idx = si, .count = job.steps.len } });
+
         const lock_workspace = opts.snapshot or opts.cache;
         if (lock_workspace) shared.workspace_mutex.lock();
         defer if (lock_workspace) shared.workspace_mutex.unlock();
@@ -2807,6 +3252,7 @@ fn runJob(
             .skip => continue,
             .abort => {
                 steps[si] = .{ .name = step.name, .status = .failed, .exit_code = 1, .duration_ms = 0, .stdout = "", .stderr = "aborted at breakpoint" };
+                fireStepFinished(opts, job, step, t0, false);
                 job_status = .failed;
                 shared.halt.store(true, .release);
                 break :step_loop;
@@ -2829,6 +3275,7 @@ fn runJob(
                     const msg = try std.fmt.allocPrint(alloc, "warning: expression error in with {s}, step failed", .{w.name});
                     logLine(opts, shared, alloc, job, step, msg);
                     steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+                    fireStepFinished(opts, job, step, t0, false);
                     if (!step.continue_on_error) job_status = .failed;
                     continue :step_loop;
                 };
@@ -2846,6 +3293,7 @@ fn runJob(
                     const msg = try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, step failed", .{e.name});
                     logLine(opts, shared, alloc, job, step, msg);
                     steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+                    fireStepFinished(opts, job, step, t0, false);
                     if (!step.continue_on_error) job_status = .failed;
                     continue :step_loop;
                 };
@@ -2872,7 +3320,7 @@ fn runJob(
             );
             if (cb.hit) |entry| {
                 const cached_outcome = backend_mod.StepOutcome{ .exit_code = entry.exit_code, .stdout = entry.stdout, .stderr = entry.stderr, .outputs = entry.outputs };
-                const cok = try applyStepOutcome(alloc, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
+                const cok = try applyStepOutcome(alloc, opts, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
                 logLine(opts, shared, alloc, job, step, "(cached)");
                 if (!cok and !step.continue_on_error) job_status = .failed;
                 continue;
@@ -2895,9 +3343,10 @@ fn runJob(
                         }
                         job_status = .failed;
                     }
+                    fireStepFinished(opts, job, step, t0, false);
                     break :uses_attempt;
                 };
-                const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
+                const ok = try applyStepOutcome(alloc, opts, step, si, t0, outcome, steps, job, shared, mutex, &env);
                 if (ok) {
                     if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, outcome);
                     break :uses_attempt;
@@ -2930,6 +3379,7 @@ fn runJob(
             const msg = "warning: expression error in script, step failed";
             logLine(opts, shared, alloc, job, step, msg);
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+            fireStepFinished(opts, job, step, t0, false);
             if (!step.continue_on_error) job_status = .failed;
             continue;
         };
@@ -2941,6 +3391,7 @@ fn runJob(
                 const msg = try std.fmt.allocPrint(alloc, "warning: expression error in env {s}, step failed", .{e.name});
                 logLine(opts, shared, alloc, job, step, msg);
                 steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+                fireStepFinished(opts, job, step, t0, false);
                 if (!step.continue_on_error) job_status = .failed;
                 continue :step_loop;
             };
@@ -2954,6 +3405,7 @@ fn runJob(
             const msg = "warning: expression error in working-directory, step failed";
             logLine(opts, shared, alloc, job, step, msg);
             steps[si] = .{ .name = step.name, .status = .failed, .exit_code = -1, .duration_ms = 0, .stdout = "", .stderr = msg };
+            fireStepFinished(opts, job, step, t0, false);
             if (!step.continue_on_error) job_status = .failed;
             continue;
         } else null;
@@ -2961,7 +3413,7 @@ fn runJob(
         const cb = cacheBegin(alloc, opts, shared, job, b, &handle, step, patched, spawn_env.items, shared.workspace_abs, snapshot_cap, true);
         if (cb.hit) |entry| {
             const cached_outcome = backend_mod.StepOutcome{ .exit_code = entry.exit_code, .stdout = entry.stdout, .stderr = entry.stderr, .outputs = entry.outputs };
-            const cok = try applyStepOutcome(alloc, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
+            const cok = try applyStepOutcome(alloc, opts, step, si, t0, cached_outcome, steps, job, shared, mutex, &env);
             logLine(opts, shared, alloc, job, step, "(cached)");
             if (!cok and !step.continue_on_error) job_status = .failed;
             continue;
@@ -2985,9 +3437,10 @@ fn runJob(
                     }
                     job_status = .failed;
                 }
+                fireStepFinished(opts, job, step, t0, false);
                 break :run_attempt;
             };
-            const ok = try applyStepOutcome(alloc, step, si, t0, outcome, steps, job, shared, mutex, &env);
+            const ok = try applyStepOutcome(alloc, opts, step, si, t0, outcome, steps, job, shared, mutex, &env);
             if (ok) {
                 if (cb.hex) |hex| cacheCommit(alloc, opts, shared.workspace_abs, hex, cb.pre, outcome);
                 break :run_attempt;
@@ -3014,7 +3467,9 @@ fn runJob(
     // most steps skipped misleads; only jobs that finished (or failed) before
     // the halt keep their real status.
     if (halted and job_status == .success) job_status = .skipped;
-    return .{ .job_index = index, .display_name = job.display_name, .status = job_status, .steps = steps };
+    const wall_ms: u64 = @intCast(@max(std.time.milliTimestamp() - t_job, 0));
+    fireProgress(opts, .{ .job_finished = .{ .job = job.display_name, .status = job_status, .wall_ms = wall_ms } });
+    return .{ .job_index = index, .display_name = job.display_name, .status = job_status, .steps = steps, .wall_ms = wall_ms };
 }
 
 /// Shared `.run`/`.uses` outcome plumbing: fills in the step's `StepResult`
@@ -3025,6 +3480,7 @@ fn runJob(
 /// that means for `job_status` (continue-on-error is a per-branch concern).
 fn applyStepOutcome(
     alloc: std.mem.Allocator,
+    opts: RunOptions,
     step: ir.Step,
     si: usize,
     t0: i64,
@@ -3045,6 +3501,7 @@ fn applyStepOutcome(
         .stdout = outcome.stdout,
         .stderr = outcome.stderr,
     };
+    fireProgress(opts, .{ .step_finished = .{ .job = job.display_name, .step = step.name, .ms = dur, .ok = ok } });
     if (ok) try publishStepOutputs(alloc, step, outcome.outputs, job, shared, mutex, env);
     return ok;
 }
@@ -3074,6 +3531,22 @@ fn publishStepOutputs(
 
 fn key2(alloc: std.mem.Allocator, root: []const u8, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(alloc, "{s}.{s}", .{ root, name });
+}
+
+/// Fire a progress event if the caller registered one. See `ProgressEvent`
+/// for the string-lifetime contract.
+fn fireProgress(opts: RunOptions, ev: ProgressEvent) void {
+    if (opts.progress) |f| f(ev);
+}
+
+/// `step_finished` for terminal failure branches that bail out of the step
+/// loop before reaching `applyStepOutcome` (expression errors, spawn
+/// failures that exhausted retries, breakpoint abort) — `applyStepOutcome`
+/// fires its own event for the normal execute/cache-hit/retry-success path.
+fn fireStepFinished(opts: RunOptions, job: ir.Job, step: ir.Step, t0: i64, ok: bool) void {
+    if (opts.progress == null) return;
+    const ms: u64 = @intCast(@max(std.time.milliTimestamp() - t0, 0));
+    fireProgress(opts, .{ .step_finished = .{ .job = job.display_name, .step = step.name, .ms = ms, .ok = ok } });
 }
 
 fn logLine(opts: RunOptions, shared: *Shared, alloc: std.mem.Allocator, job: ir.Job, step: ir.Step, msg: []const u8) void {

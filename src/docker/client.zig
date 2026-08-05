@@ -419,31 +419,125 @@ pub fn putArchive(alloc: std.mem.Allocator, c: Client, id: []const u8, path_in_c
     }, err);
 }
 
-/// Builds a minimal ustar archive containing a single file: a 512-byte
-/// header (name, octal mode/uid/gid/size/mtime, checksum, typeflag '0' for
-/// regular file, ustar magic), the content padded to a 512-byte boundary,
-/// and two trailing 512-byte zero blocks (end-of-archive marker).
-pub fn tarSingleFile(alloc: std.mem.Allocator, name: []const u8, contents: []const u8, mode: u32) ![]u8 {
-    const n_blocks = (contents.len + 511) / 512;
-    const total = 512 + n_blocks * 512 + 1024;
-    const buf = try alloc.alloc(u8, total);
-    @memset(buf, 0);
-    const hdr = buf[0..512];
-    @memcpy(hdr[0..name.len], name);
+/// Writes one 512-byte ustar header into `hdr` for an entry named `name`
+/// with the given `mode`, `size`, and `typeflag` ('0' regular file, '5'
+/// directory). Fields: octal mode/uid/gid/size/mtime, a space-blanked
+/// checksum field while the checksum itself is computed, then ustar magic
+/// ("ustar\x00" + version "00"). Names up to 100 bytes go straight into the
+/// name field (bytes 0..100). Longer names use ustar's ``prefix`` extension:
+/// split at the '/' that leaves the smallest possible tail (so the tail is
+/// as close to the 100-byte limit as the split allows, keeping the head —
+/// which must fit in the 155-byte prefix field at bytes 345..500 — as short
+/// as possible); reconstructed by readers as `prefix + "/" + name`. Returns
+/// `error.TarNameTooLong` when no split satisfies both field limits (e.g. a
+/// path segment longer than 100 bytes on its own).
+fn tarWriteHeader(hdr: *[512]u8, name: []const u8, mode: u32, size: usize, typeflag: u8) !void {
+    @memset(hdr, 0);
+    if (name.len <= 100) {
+        @memcpy(hdr[0..name.len], name);
+    } else {
+        // Smallest slash index that still keeps the tail (everything after
+        // it) within the 100-byte name field.
+        const min_slash: usize = if (name.len > 101) name.len - 101 else 0;
+        var chosen: ?usize = null;
+        var search_from: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, name, search_from, '/')) |slash| {
+            if (slash >= min_slash) {
+                chosen = slash;
+                break;
+            }
+            search_from = slash + 1;
+        }
+        const slash = chosen orelse return error.TarNameTooLong;
+        const head = name[0..slash];
+        const tail = name[slash + 1 ..];
+        if (head.len > 155 or tail.len > 100) return error.TarNameTooLong;
+        @memcpy(hdr[0..tail.len], tail);
+        @memcpy(hdr[345 .. 345 + head.len], head);
+    }
     _ = std.fmt.bufPrint(hdr[100..108], "{o:0>7}", .{mode}) catch unreachable;
     _ = std.fmt.bufPrint(hdr[108..116], "{o:0>7}", .{0}) catch unreachable; // uid
     _ = std.fmt.bufPrint(hdr[116..124], "{o:0>7}", .{0}) catch unreachable; // gid
-    _ = std.fmt.bufPrint(hdr[124..136], "{o:0>11}", .{contents.len}) catch unreachable;
+    _ = std.fmt.bufPrint(hdr[124..136], "{o:0>11}", .{size}) catch unreachable;
     _ = std.fmt.bufPrint(hdr[136..148], "{o:0>11}", .{0}) catch unreachable; // mtime
     @memset(hdr[148..156], ' '); // checksum placeholder
-    hdr[156] = '0'; // typeflag: regular file
+    hdr[156] = typeflag;
     @memcpy(hdr[257..263], "ustar\x00");
     @memcpy(hdr[263..265], "00");
     var sum: usize = 0;
     for (hdr) |b| sum += b;
     _ = std.fmt.bufPrint(hdr[148..155], "{o:0>6}\x00", .{sum}) catch unreachable;
+}
+
+/// Builds a minimal ustar archive containing a single file: a 512-byte
+/// header, the content padded to a 512-byte boundary, and two trailing
+/// 512-byte zero blocks (end-of-archive marker).
+pub fn tarSingleFile(alloc: std.mem.Allocator, name: []const u8, contents: []const u8, mode: u32) ![]u8 {
+    const n_blocks = (contents.len + 511) / 512;
+    const total = 512 + n_blocks * 512 + 1024;
+    const buf = try alloc.alloc(u8, total);
+    @memset(buf, 0);
+    try tarWriteHeader(buf[0..512], name, mode, contents.len, '0');
     @memcpy(buf[512 .. 512 + contents.len], contents);
     return buf;
+}
+
+/// Builds a ustar archive of an entire directory tree, rooted under
+/// `root_name` — extracting the result into `/tmp/jalan-actions` (see
+/// `stageActionDir` in `backend/docker.zig`) produces
+/// `/tmp/jalan-actions/<root_name>/...`, mirroring the action's own on-disk
+/// layout so its `runs.main` path resolves the same way it would on a real
+/// GitHub-hosted runner. Emits a leading directory entry for `root_name`
+/// itself, then one entry per walked file/directory (tar entry names always
+/// use '/' regardless of the host path separator — tar is a Unix format, and
+/// `std.fs.path.join`'s walker output uses the host separator on Windows).
+/// Files are capped at 50MB each (action distributions don't ship anything
+/// larger; a runaway read shouldn't exhaust host memory) — exceeding that
+/// surfaces `error.FileTooBig`. Symlinks and other non-file/non-directory
+/// entries are skipped silently: action dists don't rely on them, and
+/// preserving them through Docker's archive-extract endpoint has its own
+/// portability quirks not worth taking on here.
+pub fn tarDirectory(alloc: std.mem.Allocator, abs_dir: []const u8, root_name: []const u8) ![]u8 {
+    const max_file_bytes: usize = 50 * 1024 * 1024;
+    const zero_block = [_]u8{0} ** 512;
+
+    var out: std.ArrayList(u8) = .empty;
+    var hdr: [512]u8 = undefined;
+
+    try tarWriteHeader(&hdr, root_name, 0o755, 0, '5');
+    try out.appendSlice(alloc, &hdr);
+
+    var dir = try std.fs.openDirAbsolute(abs_dir, .{ .iterate = true });
+    defer dir.close();
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        switch (entry.kind) {
+            .file, .directory => {},
+            else => continue,
+        }
+        const rel = try alloc.alloc(u8, entry.path.len);
+        for (entry.path, 0..) |ch, i| rel[i] = if (ch == '\\') '/' else ch;
+        const tar_name = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_name, rel });
+
+        if (entry.kind == .directory) {
+            try tarWriteHeader(&hdr, tar_name, 0o755, 0, '5');
+            try out.appendSlice(alloc, &hdr);
+            continue;
+        }
+
+        const contents = try entry.dir.readFileAlloc(alloc, entry.basename, max_file_bytes);
+        try tarWriteHeader(&hdr, tar_name, 0o755, contents.len, '0');
+        try out.appendSlice(alloc, &hdr);
+        try out.appendSlice(alloc, contents);
+        const pad = (512 - (contents.len % 512)) % 512;
+        if (pad > 0) try out.appendSlice(alloc, zero_block[0..pad]);
+    }
+
+    try out.appendSlice(alloc, &zero_block);
+    try out.appendSlice(alloc, &zero_block);
+    return out.toOwnedSlice(alloc);
 }
 
 /// Appends a JSON-quoted, escaped copy of `s` to `out`. Copied from
@@ -875,6 +969,89 @@ test "tarSingleFile produces valid ustar header" {
     for (tar[0..512], 0..) |b, i| sum += if (i >= 148 and i < 156) @as(usize, ' ') else b;
     const stored = try std.fmt.parseInt(usize, std.mem.trim(u8, std.mem.sliceTo(tar[148..156], 0), " "), 8);
     try std.testing.expectEqual(sum, stored);
+}
+
+test "tarWriteHeader splits long names into ustar prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 4 path segments of 40 bytes each (plus separators) puts the name over
+    // 100 bytes but well within the 100+155 ustar-prefix budget.
+    const seg = "a" ** 40;
+    const name = try std.fmt.allocPrint(a, "{s}/{s}/{s}/{s}", .{ seg, seg, seg, seg });
+    try std.testing.expect(name.len > 100);
+    var hdr: [512]u8 = undefined;
+    try tarWriteHeader(&hdr, name, 0o755, 0, '0');
+    const tail = std.mem.sliceTo(hdr[0..100], 0);
+    const head = std.mem.sliceTo(hdr[345..500], 0);
+    try std.testing.expect(tail.len <= 100);
+    try std.testing.expect(head.len <= 155);
+    const rebuilt = try std.fmt.allocPrint(a, "{s}/{s}", .{ head, tail });
+    try std.testing.expectEqualStrings(name, rebuilt);
+    // checksum must not be left at zero (it's computed over real header bytes).
+    var sum: usize = 0;
+    for (hdr) |b| sum += b;
+    try std.testing.expect(sum != 0);
+}
+
+test "tarWriteHeader: name over the ustar prefix budget errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A single 200-byte segment (no '/' to split on within the tail budget)
+    // can never fit name(100)+prefix(155).
+    const name = try alloc0(a, 200);
+    var hdr: [512]u8 = undefined;
+    try std.testing.expectError(error.TarNameTooLong, tarWriteHeader(&hdr, name, 0o755, 0, '0'));
+}
+
+fn alloc0(alloc: std.mem.Allocator, n: usize) ![]u8 {
+    const buf = try alloc.alloc(u8, n);
+    @memset(buf, 'x');
+    return buf;
+}
+
+test "tarDirectory emits dir+file entries and ends with two zero blocks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("sub");
+    try tmp.dir.writeFile(.{ .sub_path = "sub/hello.txt", .data = "hi\n" });
+    const abs_dir = try tmp.dir.realpathAlloc(a, ".");
+
+    const tar = try tarDirectory(a, abs_dir, "root");
+
+    // End-of-archive marker: last two 512-byte blocks are all zero.
+    try std.testing.expect(tar.len >= 1024);
+    const trailer = tar[tar.len - 1024 ..];
+    for (trailer) |b| try std.testing.expectEqual(@as(u8, 0), b);
+
+    // Walk 512-byte headers until the zero trailer, collecting entry names.
+    var found_root_dir = false;
+    var found_sub_dir = false;
+    var found_file = false;
+    var i: usize = 0;
+    while (i + 512 <= tar.len - 1024) {
+        const hdr = tar[i .. i + 512];
+        const name = std.mem.sliceTo(hdr[0..100], 0);
+        const typeflag = hdr[156];
+        const size_str = std.mem.trim(u8, std.mem.sliceTo(hdr[124..136], 0), " ");
+        const size = std.fmt.parseInt(usize, size_str, 8) catch 0;
+        if (std.mem.eql(u8, name, "root") and typeflag == '5') found_root_dir = true;
+        if (std.mem.eql(u8, name, "root/sub") and typeflag == '5') found_sub_dir = true;
+        if (std.mem.eql(u8, name, "root/sub/hello.txt") and typeflag == '0') {
+            found_file = true;
+            try std.testing.expectEqual(@as(usize, 3), size);
+        }
+        const n_blocks = (size + 511) / 512;
+        i += 512 + n_blocks * 512;
+    }
+    try std.testing.expect(found_root_dir);
+    try std.testing.expect(found_sub_dir);
+    try std.testing.expect(found_file);
 }
 
 test "docker end-to-end: pull tiny image, create, start, wait, remove (skips without daemon)" {
